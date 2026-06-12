@@ -686,20 +686,16 @@ class MultiChannelParser:
 
             start_ts = time.monotonic()
             async with self._db_session() as db_session:
-                # Создаём лог
-                log = ParseLog(started_at=_now())
-                db_session.add(log)
-                await db_session.flush()
-
                 result: ParseResult
+                channel: Optional[Channel] = None
+
                 try:
-                    # Синхронизируем канал
+                    # Синхронизируем канал СНАЧАЛА (нужен channel.id для лога)
                     channel = await self._with_retry(
                         lambda: self.sync_channel(db_session, username),
                         channel_name=username,
                         operation="sync_channel",
                     )
-                    log.channel_id = channel.id
 
                     # Проверяем, не деактивирован ли канал
                     if not channel.is_active:
@@ -709,40 +705,39 @@ class MultiChannelParser:
                         result = ParseResult(
                             error_message="Канал деактивирован"
                         )
-                        log.error_message = result.error_message
                     else:
                         # Парсим канал
                         result = await self.parse_single_channel(
                             db_session, channel, limit=limit, history=history
                         )
-                        log.posts_parsed = result.posts_parsed
-                        log.posts_new = result.posts_new
-                        log.error_message = result.error_message
 
                 except ValueError:
-                    # Канал не существует — создаём запись и деактивируем
                     result = ParseResult(
                         error_message="Канал не существует или недоступен"
                     )
-                    log.error_message = result.error_message
                     logger.error("[%s] %s", username, result.error_message)
 
                 except Exception as e:
                     result = ParseResult(
                         error_message=f"{type(e).__name__}: {e}"
                     )
-                    log.error_message = result.error_message
                     logger.exception(
                         "[%s] Ошибка на этапе синхронизации: %s",
                         username,
                         e,
                     )
 
-                # Завершаем лог
-                log.finished_at = _now()
-                log.duration_ms = int(
-                    (time.monotonic() - start_ts) * 1000
+                # Создаём лог ТОЛЬКО после получения channel.id
+                log = ParseLog(
+                    started_at=_now(),
+                    channel_id=channel.id if channel else None,
+                    posts_parsed=result.posts_parsed,
+                    posts_new=result.posts_new,
+                    error_message=result.error_message,
+                    finished_at=_now(),
+                    duration_ms=int((time.monotonic() - start_ts) * 1000),
                 )
+                db_session.add(log)
                 await db_session.commit()
 
                 return username, result

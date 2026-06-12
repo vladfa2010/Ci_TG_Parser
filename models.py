@@ -377,10 +377,10 @@ class ParseLog(Base):
     __tablename__ = "parse_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    channel_id: Mapped[int] = mapped_column(
+    channel_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("channels.id", ondelete="CASCADE"),
-        nullable=False,
-        comment="FK to channels.id",
+        nullable=True,
+        comment="FK to channels.id (NULL if channel sync failed)",
     )
     posts_parsed: Mapped[int] = mapped_column(
         Integer,
