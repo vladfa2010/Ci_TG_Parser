@@ -33,14 +33,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create sessions directory with proper permissions
-RUN mkdir -p /app/sessions
+RUN mkdir -p /app/sessions && chmod +x entrypoint.sh
 
 # Expose port (used in web mode)
 EXPOSE 8000
 
+# Healthcheck for web mode (Render will ignore for cron/worker)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD if [ "$APP_MODE" = "web" ]; then \
+            curl -f http://localhost:${PORT:-10000}/api/stats || exit 1; \
+        else \
+            exit 0; \
+        fi
+
 # Entrypoint: choose mode based on APP_MODE env variable
-CMD if [ "$APP_MODE" = "web" ]; then \
-        uvicorn web:app --host 0.0.0.0 --port "${PORT:-10000}"; \
-    else \
-        python parser.py; \
-    fi
+CMD ["./entrypoint.sh"]
