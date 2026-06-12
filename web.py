@@ -1866,7 +1866,7 @@ async function addChannel(){
   btn.disabled=true;
   msg.textContent='Добавление...';msg.className='add-msg';
   try{
-    var data=await api('/channel-add?identifier='+encodeURIComponent(id));
+    var data=await api('/channel/add?identifier='+encodeURIComponent(id));
     if(data.success){
       msg.textContent='Канал добавлен: '+(data.channel.title||data.channel.username||data.channel.numeric_id);msg.className='add-msg ok';
       input.value='';
@@ -1884,7 +1884,7 @@ async function addChannel(){
 // Toggle channel active
 async function toggleChannel(id){
   try{
-    var data=await api('/channel-toggle/'+id);
+    var data=await api('/channel/toggle/'+id);
     if(data.success) loadAll();
   }catch(e){console.error(e);}
 }
@@ -1893,7 +1893,7 @@ async function toggleChannel(id){
 async function deleteChannel(id){
   if(!confirm('Удалить канал и все его посты?')) return;
   try{
-    var r=await fetch('/api/channel-delete/'+id,{method:'DELETE',cache:'no-store'});
+    var r=await fetch('/api/channel/delete/'+id,{method:'DELETE',cache:'no-store'});
     var data=await r.json();
     if(data.success){var el=$('ch-'+id);if(el)el.remove();}
   }catch(e){console.error(e);}
@@ -2230,9 +2230,26 @@ async def api_channels():
         return json_response({"channels": [], "error": str(e)}, 500)
 
 
+# ─── API: Debug routes (diagnostic) ──────────────────────────
+@app.get("/api/debug/routes")
+async def api_debug_routes():
+    """Return all registered API routes for debugging."""
+    routes = []
+    for r in app.routes:
+        if hasattr(r, "methods"):
+            routes.append({"path": r.path, "methods": list(r.methods)})
+    return {"routes": routes}
+
+
+# ─── API: Test endpoint ──────────────────────────────────────
+@app.get("/api/test")
+async def api_test():
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
 # ─── API: Add channel ────────────────────────────────────────
-@app.get("/api/channel-add")
-async def api_channels_add(identifier: str = Query(..., description="Username, numeric ID или ссылка на канал")):
+@app.get("/api/channel/add")
+async def api_channel_add(identifier: str = Query(..., description="Username, numeric ID или ссылка на канал")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
     Args:
@@ -2324,7 +2341,7 @@ async def api_channels_add(identifier: str = Query(..., description="Username, n
 
 
 # ─── API: Toggle channel active ──────────────────────────────
-@app.get("/api/channel-toggle/{channel_id}")
+@app.get("/api/channel/toggle/{channel_id}")
 async def api_channels_toggle(channel_id: int):
     """Включает/выключает канал (is_active)."""
     try:
@@ -2348,7 +2365,7 @@ async def api_channels_toggle(channel_id: int):
 
 
 # ─── API: Delete channel ─────────────────────────────────────
-@app.delete("/api/channel-delete/{channel_id}")
+@app.delete("/api/channel/delete/{channel_id}")
 async def api_channels_delete(channel_id: int):
     """Удаляет канал и все его посты из БД."""
     try:
