@@ -2332,8 +2332,10 @@ async def login_post(request: Request, username: str = Form(...), password: str 
         user = result.scalar_one_or_none()
         if not user or not user.is_active or not user.check_password(password):
             # Return login page with error
-            error_html = LOGIN_HTML.replace('id="msg"', 'id="msg" style="display:block;color:#f87171;text-align:center;margin-top:12px"')
-            error_html = error_html.replace('id="msg">', 'id="msg">Invalid credentials')
+            error_html = LOGIN_HTML.replace(
+                '<div id="msg"></div>',
+                '<div id="msg" style="display:block;color:#f87171;text-align:center;margin-top:12px;font-size:13px">Invalid credentials</div>'
+            )
             return HTMLResponse(content=error_html, status_code=401)
 
         # Create session
