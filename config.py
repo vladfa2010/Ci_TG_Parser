@@ -62,12 +62,12 @@ class Settings(BaseSettings):
     # --- Обязательные поля ---
 
     TG_API_ID: int = Field(
-        ...,
+        0,
         description="Telegram API ID (положительное целое число)",
-        gt=0,
+        ge=0,
     )
     TG_API_HASH: str = Field(
-        ...,
+        "",
         description="Telegram API hash",
         min_length=1,
     )
