@@ -1845,7 +1845,7 @@ async function addChannel(){
   btn.disabled=true;
   msg.textContent='Добавление...';msg.className='add-msg';
   try{
-    var data=await api('/channels/add?identifier='+encodeURIComponent(id));
+    var data=await api('/channel-add?identifier='+encodeURIComponent(id));
     if(data.success){
       msg.textContent='Канал добавлен: '+(data.channel.title||data.channel.username||data.channel.numeric_id);msg.className='add-msg ok';
       input.value='';
@@ -1863,7 +1863,7 @@ async function addChannel(){
 // Toggle channel active
 async function toggleChannel(id){
   try{
-    var data=await api('/channels/'+id+'/toggle');
+    var data=await api('/channel-toggle/'+id);
     if(data.success) loadAll();
   }catch(e){console.error(e);}
 }
@@ -1872,7 +1872,7 @@ async function toggleChannel(id){
 async function deleteChannel(id){
   if(!confirm('Удалить канал и все его посты?')) return;
   try{
-    var r=await fetch('/api/channels/'+id,{method:'DELETE',cache:'no-store'});
+    var r=await fetch('/api/channel-delete/'+id,{method:'DELETE',cache:'no-store'});
     var data=await r.json();
     if(data.success){var el=$('ch-'+id);if(el)el.remove();}
   }catch(e){console.error(e);}
@@ -2210,7 +2210,7 @@ async def api_channels():
 
 
 # ─── API: Add channel ────────────────────────────────────────
-@app.get("/api/channels/add")
+@app.get("/api/channel-add")
 async def api_channels_add(identifier: str = Query(..., description="Username или numeric ID канала")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
@@ -2291,7 +2291,7 @@ async def api_channels_add(identifier: str = Query(..., description="Username и
 
 
 # ─── API: Toggle channel active ──────────────────────────────
-@app.get("/api/channels/{channel_id}/toggle")
+@app.get("/api/channel-toggle/{channel_id}")
 async def api_channels_toggle(channel_id: int):
     """Включает/выключает канал (is_active)."""
     try:
@@ -2315,7 +2315,7 @@ async def api_channels_toggle(channel_id: int):
 
 
 # ─── API: Delete channel ─────────────────────────────────────
-@app.delete("/api/channels/{channel_id}")
+@app.delete("/api/channel-delete/{channel_id}")
 async def api_channels_delete(channel_id: int):
     """Удаляет канал и все его посты из БД."""
     try:
