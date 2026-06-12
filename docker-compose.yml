@@ -1,0 +1,61 @@
+version: "3.8"
+
+services:
+  # ─── PostgreSQL ──────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: mt_postgres
+    environment:
+      POSTGRES_USER: tgparser
+      POSTGRES_PASSWORD: tgparser_secret
+      POSTGRES_DB: tgparser
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tgparser -d tgparser"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── Parser (одиночный запуск) ──────────────────────────
+  parser:
+    build: .
+    container_name: mt_parser
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_SESSION: /app/sessions/markettwits_session
+      DATABASE_URL: postgresql+asyncpg://tgparser:tgparser_secret@postgres/tgparser
+      # История целиком при первом запуске: HISTORY=1
+      HISTORY: ${HISTORY:-0}
+      # Лимит постов (None = все)
+      LIMIT: ${LIMIT:-}
+    volumes:
+      - ./sessions:/app/sessions
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ─── Scheduler (периодический парсинг каждые 5 мин) ─────
+  scheduler:
+    build: .
+    container_name: mt_scheduler
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_SESSION: /app/sessions/markettwits_session
+      DATABASE_URL: postgresql+asyncpg://tgparser:tgparser_secret@postgres/tgparser
+      SCHEDULE_MODE: "1"
+      INTERVAL_SEC: "300"  # 5 минут
+    volumes:
+      - ./sessions:/app/sessions
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - scheduler  # docker compose --profile scheduler up
+
+volumes:
+  postgres_data:
