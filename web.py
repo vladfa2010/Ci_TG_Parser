@@ -1836,12 +1836,24 @@ async function loadAll(){
 }
 
 // Add channel
+function _extractChannelId(raw){
+  raw=raw.trim();
+  // Full URL: https://t.me/c/3147415698/1997 or https://t.me/markettwits
+  var m=raw.match(/t\.me\/(?:c\/)?([^\/]+)/);
+  if(m)return m[1];
+  // web.telegram.org: https://web.telegram.org/a/#-1003147415698
+  m=raw.match(/-100(\d+)/);
+  if(m)return m[1];
+  // Plain number or username
+  return raw.replace(/^@/,'');
+}
+
 async function addChannel(){
   var input=$('ch-input');
   var btn=$('ch-add-btn');
   var msg=$('add-msg');
-  var id=input.value.trim();
-  if(!id){msg.textContent='Введите username или numeric ID';msg.className='add-msg err';return;}
+  var id=_extractChannelId(input.value);
+  if(!id){msg.textContent='Введите username, numeric ID или ссылку на канал';msg.className='add-msg err';return;}
   btn.disabled=true;
   msg.textContent='Добавление...';msg.className='add-msg';
   try{
@@ -2211,12 +2223,24 @@ async def api_channels():
 
 # ─── API: Add channel ────────────────────────────────────────
 @app.get("/api/channel-add")
-async def api_channels_add(identifier: str = Query(..., description="Username или numeric ID канала")):
+async def api_channels_add(identifier: str = Query(..., description="Username, numeric ID или ссылка на канал")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
     Args:
         identifier: @username или numeric_id канала (без @).
     """
+    # Парсим URL если передана ссылка
+    raw = identifier.strip()
+    url_match = re.search(r't\.me/(?:c/)?([^/]+)', raw)
+    if url_match:
+        identifier = url_match.group(1)
+    else:
+        web_match = re.search(r'-100(\d+)', raw)
+        if web_match:
+            identifier = web_match.group(1)
+        else:
+            identifier = raw.lstrip('@')
+
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
