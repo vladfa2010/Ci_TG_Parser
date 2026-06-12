@@ -2515,62 +2515,113 @@ async def api_test():
 async def api_channel_add(identifier: str = Query(..., description="Username, numeric ID или ссылка на канал")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
-    Args:
-        identifier: @username или numeric_id канала (без @).
+    Supports:
+      - https://t.me/c/3147415698/1997
+      - https://t.me/markettwits
+      - https://web.telegram.org/a/#-1003147415698
+      - 3147415698 (bare numeric ID)
+      - @markettwits
     """
-    # Парсим URL если передана ссылка
+    # ── 1. Parse/extract clean identifier ─────────────────────
     raw = identifier.strip()
     url_match = re.search(r't\.me/(?:c/)?([^/]+)', raw)
     if url_match:
-        identifier = url_match.group(1)
+        clean_id = url_match.group(1)
+    elif re.search(r'-100(\d+)', raw):
+        clean_id = re.search(r'-100(\d+)', raw).group(1)
     else:
-        web_match = re.search(r'-100(\d+)', raw)
-        if web_match:
-            identifier = web_match.group(1)
-        else:
-            identifier = raw.lstrip('@')
+        clean_id = raw.lstrip('@')
 
+    if not clean_id:
+        return json_response({"success": False, "error": "Empty identifier"}, 400)
+
+    logger.info(f"[channel/add] raw='{identifier}' → clean='{clean_id}'")
+
+    # ── 2. Validate Telegram credentials ──────────────────────
+    if cfg.TG_API_ID <= 0 or not cfg.TG_API_HASH:
+        logger.error(f"[channel/add] TG_API_ID={cfg.TG_API_ID} TG_API_HASH={'set' if cfg.TG_API_HASH else 'empty'}")
+        return json_response({"success": False, "error": "Telegram API credentials not configured on server"}, 500)
+
+    if not cfg.TG_STRING_SESSION and not cfg.TG_SESSION:
+        return json_response({"success": False, "error": "Telegram session not configured"}, 500)
+
+    # ── 3. Check duplicates in DB ─────────────────────────────
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
+        from telethon.tl.types import PeerChannel
         from telethon.errors import FloodWaitError
 
         async with async_session() as session:
-            # Проверяем, нет ли уже такого канала
+            # Build duplicate check
+            dup_where = [Channel.username == clean_id]
+            if clean_id.isdigit():
+                num_id = int(clean_id)
+                dup_where.append(Channel.numeric_id == num_id)
+                dup_where.append(Channel.telegram_id == (-100_000_000_0000 + num_id))
+
+            from sqlalchemy import or_
             existing = await session.execute(
-                select(Channel).where(
-                    (Channel.username == identifier) |
-                    (Channel.numeric_id == int(identifier) if identifier.isdigit() else False) |
-                    (Channel.telegram_id == int(identifier) if identifier.lstrip('-').isdigit() else False)
-                )
+                select(Channel).where(or_(*dup_where))
             )
             if existing.scalar_one_or_none():
                 return json_response({"success": False, "error": "Канал уже существует"}, 409)
 
-            # Подключаемся к Telegram и получаем метаданные
+            # ── 4. Connect to Telegram ──────────────────────────
+            session_str = cfg.TG_STRING_SESSION
+            session_file = cfg.TG_SESSION or "/app/sessions/citg_session"
             client = TelegramClient(
-                StringSession(cfg.TG_STRING_SESSION) if cfg.TG_STRING_SESSION else cfg.TG_SESSION or "/app/sessions/citg_session",
-                cfg.TG_API_ID, cfg.TG_API_HASH,
+                StringSession(session_str) if session_str else session_file,
+                cfg.TG_API_ID,
+                cfg.TG_API_HASH,
             )
             await client.connect()
-            try:
-                entity = await client.get_entity(identifier)
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                return json_response({"success": False, "error": "Telegram session unauthorized. Regenerate TG_STRING_SESSION."}, 500)
 
+            try:
+                # ── 5. Resolve entity ─────────────────────────
+                # Try as numeric ID first (private channels), then as username
+                entity = None
+                if clean_id.isdigit():
+                    try:
+                        # Full telegram ID with -100 prefix
+                        full_id = int(f"-100{clean_id}")
+                        logger.info(f"[channel/add] Trying numeric ID: {full_id}")
+                        entity = await client.get_entity(full_id)
+                    except Exception as e1:
+                        logger.info(f"[channel/add] Numeric ID failed: {e1}, trying PeerChannel")
+                        try:
+                            entity = await client.get_entity(PeerChannel(int(clean_id)))
+                        except Exception as e2:
+                            logger.info(f"[channel/add] PeerChannel failed: {e2}, trying as username")
+
+                # Fallback: try as username/string
+                if entity is None:
+                    logger.info(f"[channel/add] Trying username/peer: {clean_id}")
+                    entity = await client.get_entity(clean_id)
+
+                # ── 6. Extract metadata ───────────────────────
                 has_username = bool(getattr(entity, "username", None))
                 channel_type = "public" if has_username else "private"
                 telegram_id = entity.id
-                numeric_id = None
+
+                # Compute numeric_id (without -100 prefix)
                 if telegram_id < 0:
                     numeric_id = abs(telegram_id) % 1_000_000_000_000
                 else:
                     numeric_id = telegram_id
 
+                logger.info(f"[channel/add] Resolved: tid={telegram_id} numeric={numeric_id} type={channel_type} title='{entity.title}'")
+
+                # ── 7. Save to DB ─────────────────────────────
                 channel = Channel(
                     telegram_id=telegram_id,
                     numeric_id=numeric_id,
                     channel_type=channel_type,
                     username=entity.username if has_username else None,
-                    title=entity.title,
+                    title=entity.title or "Unknown",
                     description=getattr(entity, "about", None),
                     subscriber_count=getattr(entity, "participants_count", 0),
                     is_active=True,
@@ -2595,12 +2646,15 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 await client.disconnect()
 
     except FloodWaitError as e:
-        return json_response({"success": False, "error": f"FloodWait: подождите {e.seconds} секунд"}, 429)
+        logger.warning(f"[channel/add] FloodWait: {e.seconds}s")
+        return json_response({"success": False, "error": f"Telegram rate limit. Wait {e.seconds}s."}, 429)
     except ValueError as e:
-        return json_response({"success": False, "error": f"Канал не найден или недоступен: {e}"}, 404)
+        logger.error(f"[channel/add] ValueError: {e}")
+        return json_response({"success": False, "error": f"Cannot find channel. Make sure you're a member and the ID is correct. Raw: '{identifier}' → Clean: '{clean_id}'"}, 404)
     except Exception as e:
-        logger.error(f"/channels/add error: {e}"); traceback.print_exc()
-        return json_response({"success": False, "error": str(e)}, 500)
+        logger.error(f"[channel/add] Exception: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return json_response({"success": False, "error": f"{type(e).__name__}: {e}"}, 500)
 
 
 # ─── API: Toggle channel active ──────────────────────────────
