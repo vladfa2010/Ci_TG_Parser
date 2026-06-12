@@ -143,8 +143,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 AUTH_SECRET_KEY = cfg.DATABASE_URL or "citg-secret-change-me"  # используем DB URL как секрет (уникальный per-instance)
-SESSION_COOKIE_NAME = "citg_session"
+SESSION_COOKIE_NAME = "citg_auth_v2"  # CHANGED to invalidate old sessions
 SESSION_MAX_AGE = 86400 * 7  # 7 days
+
+# Map of path -> requires auth (for debugging)
+_AUTH_DEBUG = False
 
 
 def _sign_session(username: str) -> str:
@@ -206,20 +209,33 @@ async def add_no_cache_headers(request, call_next):
 # Auth middleware: protect HTML pages with session cookie
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    
     # Public paths that don't require auth
     public_paths = {"/login", "/favicon.ico"}
-    if request.url.path in public_paths:
+    if path in public_paths:
         return await call_next(request)
 
-    # API paths use Basic Auth instead of cookies
-    if request.url.path.startswith("/api/") or request.url.path == "/rss":
+    # API paths use universal auth (checked by endpoint dependencies)
+    if path.startswith("/api/") or path == "/rss":
         return await call_next(request)
 
     # HTML pages require session cookie
     token = request.cookies.get(SESSION_COOKIE_NAME)
     user = _verify_session(token) if token else None
+    
+    if _AUTH_DEBUG:
+        logger.info(f"[AUTH] path={path} token={'present' if token else 'missing'} user={user}")
+    
     if not user:
-        return RedirectResponse(url="/login", status_code=302)
+        response = RedirectResponse(url="/login", status_code=302)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        # Delete any stale cookies
+        response.delete_cookie("citg_session")  # old cookie name
+        response.delete_cookie(SESSION_COOKIE_NAME)
+        return response
 
     return await call_next(request)
 
@@ -2364,6 +2380,7 @@ async def login_post(request: Request, username: str = Form(...), password: str 
 async def logout():
     response = RedirectResponse(url="/login", status_code=302)
     response.delete_cookie(SESSION_COOKIE_NAME)
+    response.delete_cookie("citg_session")  # old cookie name
     return response
 
 
