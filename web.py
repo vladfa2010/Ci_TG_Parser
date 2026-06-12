@@ -16,6 +16,7 @@ import re
 import hashlib
 import secrets
 import hmac
+from contextlib import asynccontextmanager
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -122,7 +123,24 @@ DATABASE_URL = cfg.database_url_async
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: create tables and default admin user if needed."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    # Ensure admin user exists
+    async with async_session() as session:
+        result = await session.execute(select(User))
+        if result.scalars().first() is None:
+            admin = User(username="vlad", is_active=True)
+            admin.set_password("!1234567890")
+            session.add(admin)
+            await session.commit()
+            logger.info("Default admin user 'vlad' created")
+    yield
+    # Shutdown cleanup if needed
+
+app = FastAPI(lifespan=lifespan)
 
 AUTH_SECRET_KEY = cfg.DATABASE_URL or "citg-secret-change-me"  # используем DB URL как секрет (уникальный per-instance)
 SESSION_COOKIE_NAME = "citg_session"
