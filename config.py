@@ -69,7 +69,6 @@ class Settings(BaseSettings):
     TG_API_HASH: str = Field(
         "",
         description="Telegram API hash",
-        min_length=1,
     )
     DATABASE_URL: str = Field(
         ...,
