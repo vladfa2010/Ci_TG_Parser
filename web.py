@@ -1989,10 +1989,12 @@ function _extractChannelId(raw){
   // Full URL: https://t.me/c/3147415698/1997 or https://t.me/markettwits
   var m=raw.match(/t\.me\/(?:c\/)?([^\/]+)/);
   if(m)return m[1];
-  // web.telegram.org: https://web.telegram.org/a/#-1003147415698
-  m=raw.match(/-100(\d+)/);
+  // web.telegram.org: https://web.telegram.org/a/#-1003147415698 or #-740684703
+  m=raw.match(/web\.telegram\.org\/a\/#(-?\d+)/);
   if(m)return m[1];
-  // Plain number or username
+  // Bare number (positive user ID, negative group ID, or -100... channel ID)
+  if(/^-?\d+$/.test(raw))return raw;
+  // @username
   return raw.replace(/^@/,'');
 }
 
@@ -2556,9 +2558,15 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
             # Build duplicate check
             dup_where = [Channel.username == clean_id]
             if clean_id.isdigit():
+                # Positive ID like 3147415698 → telegram_id = -1003147415698
                 num_id = int(clean_id)
                 dup_where.append(Channel.numeric_id == num_id)
-                dup_where.append(Channel.telegram_id == (-100_000_000_0000 + num_id))
+                dup_where.append(Channel.telegram_id == int(f"-100{clean_id}"))
+            elif clean_id.startswith('-') and clean_id[1:].isdigit():
+                # Negative ID like -740684703 → telegram_id = -740684703
+                int_id = int(clean_id)
+                dup_where.append(Channel.telegram_id == int_id)
+                dup_where.append(Channel.numeric_id == abs(int_id))
 
             from sqlalchemy import or_
             existing = await session.execute(
@@ -2582,22 +2590,32 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
 
             try:
                 # ── 5. Resolve entity ─────────────────────────
-                # Try as numeric ID first (private channels), then as username
                 entity = None
-                if clean_id.isdigit():
+
+                # Case A: bare negative ID like -740684703 (basic group/chat)
+                if clean_id.startswith('-') and clean_id[1:].isdigit():
+                    try:
+                        int_id = int(clean_id)
+                        logger.info(f"[channel/add] Trying bare negative ID: {int_id}")
+                        entity = await client.get_entity(int_id)
+                    except Exception as e_neg:
+                        logger.info(f"[channel/add] Bare negative ID failed: {e_neg}")
+
+                # Case B: positive digit like 3147415698 (channel without -100 prefix)
+                elif clean_id.isdigit():
                     try:
                         # Full telegram ID with -100 prefix
                         full_id = int(f"-100{clean_id}")
-                        logger.info(f"[channel/add] Trying numeric ID: {full_id}")
+                        logger.info(f"[channel/add] Trying -100 prefixed ID: {full_id}")
                         entity = await client.get_entity(full_id)
                     except Exception as e1:
-                        logger.info(f"[channel/add] Numeric ID failed: {e1}, trying PeerChannel")
+                        logger.info(f"[channel/add] -100 ID failed: {e1}, trying PeerChannel")
                         try:
                             entity = await client.get_entity(PeerChannel(int(clean_id)))
                         except Exception as e2:
-                            logger.info(f"[channel/add] PeerChannel failed: {e2}, trying as username")
+                            logger.info(f"[channel/add] PeerChannel failed: {e2}")
 
-                # Fallback: try as username/string
+                # Case C: Fallback to username/string
                 if entity is None:
                     logger.info(f"[channel/add] Trying username/peer: {clean_id}")
                     entity = await client.get_entity(clean_id)
