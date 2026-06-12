@@ -2210,7 +2210,7 @@ async def api_channels():
 
 
 # ─── API: Add channel ────────────────────────────────────────
-@app.post("/api/channels/add")
+@app.get("/api/channels/add")
 async def api_channels_add(identifier: str = Query(..., description="Username или numeric ID канала")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
@@ -2291,7 +2291,7 @@ async def api_channels_add(identifier: str = Query(..., description="Username и
 
 
 # ─── API: Toggle channel active ──────────────────────────────
-@app.post("/api/channels/{channel_id}/toggle")
+@app.get("/api/channels/{channel_id}/toggle")
 async def api_channels_toggle(channel_id: int):
     """Включает/выключает канал (is_active)."""
     try:
