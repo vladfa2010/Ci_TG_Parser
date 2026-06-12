@@ -48,7 +48,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
 from config import settings
-from models import Base, Channel, ChannelError, ParseLog, Post
+from models import Base, Channel, ChannelError, ParseLog, Post, User
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +200,25 @@ class MultiChannelParser:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("База данных инициализирована")
+        # Create default admin user if not exists
+        await self._ensure_admin_user()
+
+    async def _ensure_admin_user(self) -> None:
+        """Create default admin 'vlad' if no users exist."""
+        async with self._db_session() as session:
+            result = await session.execute(select(User))
+            if result.scalars().first() is None:
+                # No users yet — create default admin
+                admin = User(
+                    username="vlad",
+                    is_active=True,
+                )
+                admin.set_password("!1234567890")
+                session.add(admin)
+                await session.commit()
+                logger.info("Default admin user 'vlad' created")
+            else:
+                logger.debug("Users already exist, skipping default admin creation")
 
     @asynccontextmanager
     async def _db_session(self):

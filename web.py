@@ -13,16 +13,20 @@ import csv
 import io
 import json
 import re
+import hashlib
+import secrets
+import hmac
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, Depends, Request, Form, status, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-from models import Base, Channel, Post, ParseLog, ChannelError
+from models import Base, Channel, Post, ParseLog, ChannelError, User
 from config import settings, settings as cfg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -120,6 +124,57 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 app = FastAPI()
 
+AUTH_SECRET_KEY = cfg.DATABASE_URL or "citg-secret-change-me"  # используем DB URL как секрет (уникальный per-instance)
+SESSION_COOKIE_NAME = "citg_session"
+SESSION_MAX_AGE = 86400 * 7  # 7 days
+
+
+def _sign_session(username: str) -> str:
+    """Create signed session token."""
+    timestamp = str(int(datetime.now(timezone.utc).timestamp()))
+    payload = f"{username}:{timestamp}"
+    sig = hmac.new(AUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}:{sig}"
+
+
+def _verify_session(token: str) -> str | None:
+    """Verify session token, return username or None."""
+    if not token or ":" not in token:
+        return None
+    parts = token.rsplit(":", 1)
+    if len(parts) != 2:
+        return None
+    payload, sig = parts
+    expected = hmac.new(AUTH_SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    if not secrets.compare_digest(sig, expected):
+        return None
+    # Check expiry
+    try:
+        username, timestamp_str = payload.rsplit(":", 1)
+        timestamp = int(timestamp_str)
+        if int(datetime.now(timezone.utc).timestamp()) - timestamp > SESSION_MAX_AGE:
+            return None
+        return username
+    except (ValueError, IndexError):
+        return None
+
+
+async def _get_current_user(request: Request) -> str | None:
+    """Get username from session cookie."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    return _verify_session(token)
+
+
+async def _require_auth(request: Request):
+    """Dependency: require authenticated user."""
+    user = await _get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
+
 # Disable caching for all responses (prevent stale JS/HTML after deploy)
 @app.middleware("http")
 async def add_no_cache_headers(request, call_next):
@@ -128,6 +183,27 @@ async def add_no_cache_headers(request, call_next):
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
+
+
+# Auth middleware: protect HTML pages with session cookie
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # Public paths that don't require auth
+    public_paths = {"/login", "/favicon.ico"}
+    if request.url.path in public_paths:
+        return await call_next(request)
+
+    # API paths use Basic Auth instead of cookies
+    if request.url.path.startswith("/api/") or request.url.path == "/rss":
+        return await call_next(request)
+
+    # HTML pages require session cookie
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    user = _verify_session(token) if token else None
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+
+    return await call_next(request)
 
 
 def json_response(data, status=200):
@@ -146,6 +222,20 @@ def _channel_where_clause(channel: Optional[str]) -> tuple[str, dict]:
     if channel:
         return "AND c.username = :channel", {"channel": channel}
     return "", {}
+
+
+# ─── Authentication ──────────────────────────────────────────
+security = HTTPBasic(auto_error=False)
+
+async def api_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.username == credentials.username))
+        user = result.scalar_one_or_none()
+        if not user or not user.is_active or not user.check_password(credentials.password):
+            raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
 
 
 async def get_since(session, delta):
@@ -2118,8 +2208,129 @@ loadAll();
 
 
 # ═══════════════════════════════════════════════════════════════
+# LOGIN PAGE
+# ═══════════════════════════════════════════════════════════════
+LOGIN_HTML = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CITG — Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  background:#0a0a1a;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  display:flex;align-items:center;justify-content:center;
+  min-height:100vh;color:#e2e8f0;
+}
+.login-box{
+  background:#0f172a;
+  border:1px solid #1e293b;
+  border-radius:12px;
+  padding:40px 32px;
+  width:100%;max-width:380px;
+  box-shadow:0 20px 60px rgba(0,0,0,.4);
+}
+.login-box h2{
+  text-align:center;
+  margin-bottom:24px;
+  font-size:22px;
+  font-weight:600;
+  color:#f8fafc;
+  letter-spacing:.5px;
+}
+.login-box h2 span{color:#00d4aa}
+.field{margin-bottom:16px}
+.field label{
+  display:block;
+  margin-bottom:6px;
+  font-size:13px;
+  color:#64748b;
+  font-weight:500;
+}
+.field input{
+  width:100%;
+  padding:10px 14px;
+  border:1px solid #1e293b;
+  border-radius:8px;
+  background:#1e293b;
+  color:#f1f5f9;
+  font-size:14px;
+  outline:none;
+  transition:border-color .2s;
+}
+.field input:focus{border-color:#00d4aa}
+.btn{
+  width:100%;
+  padding:11px;
+  border:none;
+  border-radius:8px;
+  background:#00d4aa;
+  color:#0a0a1a;
+  font-size:14px;
+  font-weight:600;
+  cursor:pointer;
+  transition:opacity .2s;
+  margin-top:8px;
+}
+.btn:hover{opacity:.85}
+#msg{display:none}
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h2><span>CI</span>TG</h2>
+  <form method="POST" action="/login">
+    <div class="field">
+      <label>Username</label>
+      <input type="text" name="username" required autofocus autocomplete="username">
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input type="password" name="password" required autocomplete="current-password">
+    </div>
+    <button class="btn" type="submit">Login</button>
+    <div id="msg"></div>
+  </form>
+</div>
+</body>
+</html>'''
+
+
+# ═══════════════════════════════════════════════════════════════
 # PAGE ROUTES
 # ═══════════════════════════════════════════════════════════════
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return HTMLResponse(content=LOGIN_HTML)
+
+
+@app.post("/login")
+async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.username == username))
+        user = result.scalar_one_or_none()
+        if not user or not user.is_active or not user.check_password(password):
+            # Return login page with error
+            error_html = LOGIN_HTML.replace('id="msg"', 'id="msg" style="display:block;color:#f87171;text-align:center;margin-top:12px"')
+            error_html = error_html.replace('id="msg">', 'id="msg">Invalid credentials')
+            return HTMLResponse(content=error_html, status_code=401)
+
+        # Create session
+        token = _sign_session(user.username)
+        response = RedirectResponse(url="/", status_code=302)
+        response.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, max_age=SESSION_MAX_AGE, samesite="lax")
+        return response
+
+
+@app.get("/logout")
+async def logout():
+    response = RedirectResponse(url="/login", status_code=302)
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -2183,7 +2394,7 @@ async def crosschannel_page():
 # ═══════════════════════════════════════════════════════════════
 
 # ─── API: Channels list (v2) ─────────────────────────────────
-@app.get("/api/channels")
+@app.get("/api/channels", dependencies=[Depends(api_auth)])
 async def api_channels():
     """Return all channels with computed metrics."""
     try:
@@ -2231,7 +2442,7 @@ async def api_channels():
 
 
 # ─── API: Debug routes (diagnostic) ──────────────────────────
-@app.get("/api/debug/routes")
+@app.get("/api/debug/routes", dependencies=[Depends(api_auth)])
 async def api_debug_routes():
     """Return all registered API routes for debugging."""
     routes = []
@@ -2242,13 +2453,13 @@ async def api_debug_routes():
 
 
 # ─── API: Test endpoint ──────────────────────────────────────
-@app.get("/api/test")
+@app.get("/api/test", dependencies=[Depends(api_auth)])
 async def api_test():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
 # ─── API: Add channel ────────────────────────────────────────
-@app.get("/api/channel/add")
+@app.get("/api/channel/add", dependencies=[Depends(api_auth)])
 async def api_channel_add(identifier: str = Query(..., description="Username, numeric ID или ссылка на канал")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
@@ -2341,7 +2552,7 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
 
 
 # ─── API: Toggle channel active ──────────────────────────────
-@app.get("/api/channel/toggle/{channel_id}")
+@app.get("/api/channel/toggle/{channel_id}", dependencies=[Depends(api_auth)])
 async def api_channels_toggle(channel_id: int):
     """Включает/выключает канал (is_active)."""
     try:
@@ -2365,7 +2576,7 @@ async def api_channels_toggle(channel_id: int):
 
 
 # ─── API: Delete channel ─────────────────────────────────────
-@app.delete("/api/channel/delete/{channel_id}")
+@app.delete("/api/channel/delete/{channel_id}", dependencies=[Depends(api_auth)])
 async def api_channels_delete(channel_id: int):
     """Удаляет канал и все его посты из БД."""
     try:
@@ -2386,7 +2597,7 @@ async def api_channels_delete(channel_id: int):
 
 
 # ─── API: Cross-Channel comparison (v2) ──────────────────────
-@app.get("/api/channels/comparison")
+@app.get("/api/channels/comparison", dependencies=[Depends(api_auth)])
 async def api_channels_comparison(days: int = Query(7, ge=1, le=90)):
     """Compare channels by activity: posts, views, timeline."""
     try:
@@ -2455,7 +2666,7 @@ async def api_channels_comparison(days: int = Query(7, ge=1, le=90)):
 
 
 # ─── API: Stats (with optional channel filter) ───────────────
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(api_auth)])
 async def api_stats(channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2512,7 +2723,7 @@ async def api_stats(channel: Optional[str] = Query(None)):
 
 
 # ─── API: Posts (with optional channel filter) ───────────────
-@app.get("/api/posts")
+@app.get("/api/posts", dependencies=[Depends(api_auth)])
 async def api_posts(
     page: int = 1, limit: int = 20,
     search: str = "", sort: str = "new",
@@ -2558,7 +2769,7 @@ async def api_posts(
 
 
 # ─── API: Tags (parametric, with channel filter) ─────────────
-@app.get("/api/tags")
+@app.get("/api/tags", dependencies=[Depends(api_auth)])
 async def api_tags(
     hours: int = Query(24, ge=1, le=720),
     channel: Optional[str] = Query(None)
@@ -2608,13 +2819,13 @@ async def api_tags(
 
 
 # Backward compatibility: /api/tags/24h -> /api/tags?hours=24
-@app.get("/api/tags/24h")
+@app.get("/api/tags/24h", dependencies=[Depends(api_auth)])
 async def api_tags_24h_compat():
     return await api_tags(hours=24)
 
 
 # ─── Charts API (all with channel filter) ────────────────────
-@app.get("/api/charts/tags")
+@app.get("/api/charts/tags", dependencies=[Depends(api_auth)])
 async def chart_tags(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2653,7 +2864,7 @@ async def chart_tags(days: int = Query(7, ge=1, le=90), channel: Optional[str] =
         return json_response({"tags": [], "total_posts": 0, "avg_reach": 0, "error": str(e)}, 500)
 
 
-@app.get("/api/charts/activity")
+@app.get("/api/charts/activity", dependencies=[Depends(api_auth)])
 async def chart_activity(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2682,7 +2893,7 @@ async def chart_activity(days: int = Query(7, ge=1, le=90), channel: Optional[st
         return json_response({"hours": [0]*168, "peak_hour": 0, "error": str(e)}, 500)
 
 
-@app.get("/api/charts/views")
+@app.get("/api/charts/views", dependencies=[Depends(api_auth)])
 async def chart_views(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2711,7 +2922,7 @@ async def chart_views(days: int = Query(7, ge=1, le=90), channel: Optional[str] 
         return json_response({"bins": [], "error": str(e)}, 500)
 
 
-@app.get("/api/charts/timeline")
+@app.get("/api/charts/timeline", dependencies=[Depends(api_auth)])
 async def chart_timeline(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2755,7 +2966,7 @@ async def chart_timeline(days: int = Query(7, ge=1, le=90), channel: Optional[st
         return json_response({"tags": [], "error": str(e)}, 500)
 
 
-@app.get("/api/charts/pairs")
+@app.get("/api/charts/pairs", dependencies=[Depends(api_auth)])
 async def chart_pairs(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2785,7 +2996,7 @@ async def chart_pairs(days: int = Query(7, ge=1, le=90), channel: Optional[str] 
 
 
 # ─── Analytics API (all with channel filter) ─────────────────
-@app.get("/api/analytics/alltime-tags")
+@app.get("/api/analytics/alltime-tags", dependencies=[Depends(api_auth)])
 async def analytics_alltime_tags(limit: int = Query(100, ge=1, le=500), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2814,7 +3025,7 @@ async def analytics_alltime_tags(limit: int = Query(100, ge=1, le=500), channel:
         return json_response({"tags": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/trends")
+@app.get("/api/analytics/trends", dependencies=[Depends(api_auth)])
 async def analytics_trends(channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2874,7 +3085,7 @@ async def analytics_trends(channel: Optional[str] = Query(None)):
         return json_response({"trends": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/posts-by-tag")
+@app.get("/api/analytics/posts-by-tag", dependencies=[Depends(api_auth)])
 async def analytics_posts_by_tag(
     tag: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=50),
     channel: Optional[str] = Query(None)
@@ -2898,7 +3109,7 @@ async def analytics_posts_by_tag(
         return json_response({"posts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/tag-daily")
+@app.get("/api/analytics/tag-daily", dependencies=[Depends(api_auth)])
 async def analytics_tag_daily(tag: str = Query(...), days: int = Query(90, ge=1, le=365), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2930,7 +3141,7 @@ async def analytics_tag_daily(tag: str = Query(...), days: int = Query(90, ge=1,
         return json_response({"tag": tag, "days": [], "counts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/tag-posts-by-day")
+@app.get("/api/analytics/tag-posts-by-day", dependencies=[Depends(api_auth)])
 async def analytics_tag_posts_by_day(tag: str = Query(...), date: str = Query(...), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2952,7 +3163,7 @@ async def analytics_tag_posts_by_day(tag: str = Query(...), date: str = Query(..
         return json_response({"posts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/export-csv")
+@app.get("/api/analytics/export-csv", dependencies=[Depends(api_auth)])
 async def analytics_export_csv(channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2992,7 +3203,7 @@ async def analytics_export_csv(channel: Optional[str] = Query(None)):
 
 
 # ─── Stock Price API (MOEX proxy) ────────────────────────────
-@app.get("/api/stock/price")
+@app.get("/api/stock/price", dependencies=[Depends(api_auth)])
 async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=365)):
     try:
         import urllib.request
@@ -3022,7 +3233,7 @@ async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=3
         return json_response({"ticker": ticker, "days": [], "ohlc": [], "error": str(e)}, 500)
 
 
-@app.get("/api/stock/intraday")
+@app.get("/api/stock/intraday", dependencies=[Depends(api_auth)])
 async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
     try:
         import urllib.request
@@ -3051,7 +3262,7 @@ async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
 # ═══ Sentiment & Intelligence API (with channel filter) ══
 # ═══════════════════════════════════════════════════════════
 
-@app.get("/api/sentiment/timeline")
+@app.get("/api/sentiment/timeline", dependencies=[Depends(api_auth)])
 async def sentiment_timeline(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Daily sentiment scores: positive / negative / neutral / total"""
     try:
@@ -3103,7 +3314,7 @@ async def sentiment_timeline(days: int = Query(7, ge=1, le=30), channel: Optiona
         return json_response({"days": [], "positive": [], "negative": [], "neutral": [], "error": str(e)}, 500)
 
 
-@app.get("/api/sentiment/top-words")
+@app.get("/api/sentiment/top-words", dependencies=[Depends(api_auth)])
 async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str = Query("positive"), channel: Optional[str] = Query(None)):
     """Most frequent words from posts with given sentiment"""
     try:
@@ -3140,7 +3351,7 @@ async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str 
         return json_response({"words": [], "error": str(e)}, 500)
 
 
-@app.get("/api/velocity/alerts")
+@app.get("/api/velocity/alerts", dependencies=[Depends(api_auth)])
 async def velocity_alerts(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Tickers with anomalous mention growth vs previous period"""
     try:
@@ -3200,7 +3411,7 @@ async def velocity_alerts(days: int = Query(7, ge=1, le=30), channel: Optional[s
         return json_response({"alerts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/correlation/matrix")
+@app.get("/api/correlation/matrix", dependencies=[Depends(api_auth)])
 async def correlation_matrix(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Correlation matrix: which tags appear together in same posts"""
     try:
@@ -3252,7 +3463,7 @@ async def correlation_matrix(days: int = Query(7, ge=1, le=30), channel: Optiona
         return json_response({"tags": [], "matrix": [], "error": str(e)}, 500)
 
 
-@app.get("/api/premarket/intel")
+@app.get("/api/premarket/intel", dependencies=[Depends(api_auth)])
 async def premarket_intel(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Posts segmented by time: pre-market / market hours / after-hours (MOEX: 10:00-18:45 MSK = 07:00-15:45 UTC)"""
     try:
@@ -3304,7 +3515,7 @@ async def premarket_intel(days: int = Query(7, ge=1, le=30), channel: Optional[s
 # ═══ Viral & Cross-Market API (with channel filter) ══════
 # ═══════════════════════════════════════════════════════════
 
-@app.get("/api/viral/posts")
+@app.get("/api/viral/posts", dependencies=[Depends(api_auth)])
 async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, ge=1, le=20), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3336,7 +3547,7 @@ async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, 
         return json_response({"posts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/sector/rotation")
+@app.get("/api/sector/rotation", dependencies=[Depends(api_auth)])
 async def sector_rotation(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """NO json_array_elements -- fetch hashtags json, parse in Python"""
     try:
@@ -3376,7 +3587,7 @@ async def sector_rotation(days: int = Query(7, ge=1, le=30), channel: Optional[s
         return json_response({"sectors": [], "total": 0, "error": str(e)}, 500)
 
 
-@app.get("/api/wordcloud")
+@app.get("/api/wordcloud", dependencies=[Depends(api_auth)])
 async def wordcloud_data(days: int = Query(7, ge=1, le=30), limit: int = Query(50, ge=1, le=100), channel: Optional[str] = Query(None)):
     """NO json_array_elements -- fetch hashtags json, count in Python"""
     try:
@@ -3406,7 +3617,7 @@ async def wordcloud_data(days: int = Query(7, ge=1, le=30), limit: int = Query(5
         return json_response({"words": [], "error": str(e)}, 500)
 
 
-@app.get("/api/crossmarket/links")
+@app.get("/api/crossmarket/links", dependencies=[Depends(api_auth)])
 async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Fetch recent posts, filter in Python -- no ILIKE on text columns"""
     try:
@@ -3462,7 +3673,7 @@ async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional
 _RSS_CHANNELS = [c.strip() for c in cfg.CHANNELS.split(",") if c.strip()] if hasattr(cfg, 'CHANNELS') and cfg.CHANNELS else ["markettwits"]
 
 
-@app.get("/rss")
+@app.get("/rss", dependencies=[Depends(api_auth)])
 async def rss_feed(
     limit: int = Query(50, ge=1, le=200),
     channel: str = Query("", description="Filter by channel username(s), comma-separated"),

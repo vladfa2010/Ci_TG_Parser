@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, List, Optional
+import hashlib
+import secrets
 
 from sqlalchemy import (
     BigInteger,
@@ -579,3 +581,75 @@ class ChannelGroupMember(Base):
             f"<ChannelGroupMember(channel_id={self.channel_id}, "
             f"group_id={self.group_id}, added_at={self.added_at})>"
         )
+
+
+# ---------------------------------------------------------------------------
+# User
+# ---------------------------------------------------------------------------
+
+class User(Base):
+    """User account for dashboard authentication.
+
+    No registration endpoint — users are created via code/console only.
+    Passwords are hashed with PBKDF2-HMAC-SHA256 + random salt.
+    """
+
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_username", "username", unique=True),
+        {"comment": "Dashboard users (created via code only, no registration)"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        comment="Internal surrogate PK",
+    )
+    username: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        unique=True,
+        comment="Login username",
+    )
+    password_hash: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        comment="PBKDF2-HMAC-SHA256 hash",
+    )
+    password_salt: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment="Random hex salt",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Account enabled flag",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        comment="When the user was created (UTC)",
+    )
+
+    def set_password(self, plain_password: str) -> None:
+        """Hash and store a new password."""
+        salt = secrets.token_hex(32)
+        pwd_hash = hashlib.pbkdf2_hmac(
+            "sha256", plain_password.encode("utf-8"), salt.encode("ascii"), 100_000
+        ).hex()
+        self.password_salt = salt
+        self.password_hash = pwd_hash
+
+    def check_password(self, plain_password: str) -> bool:
+        """Verify a plain password against the stored hash."""
+        pwd_hash = hashlib.pbkdf2_hmac(
+            "sha256", plain_password.encode("utf-8"), self.password_salt.encode("ascii"), 100_000
+        ).hex()
+        return secrets.compare_digest(pwd_hash, self.password_hash)
+
+    def __repr__(self) -> str:
+        return f"<User(id={self.id}, username='{self.username}', is_active={self.is_active})>"
