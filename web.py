@@ -1878,6 +1878,11 @@ async function deleteChannel(id){
   }catch(e){console.error(e);}
 }
 
+// Export functions for onclick handlers
+window.addChannel=addChannel;
+window.toggleChannel=toggleChannel;
+window.deleteChannel=deleteChannel;
+
 loadAll();
 })();
 </script>
