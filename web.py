@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 """
-TG Parser Dashboard — Production SPA with Charts.
-Unified: posts, tags, analytics. ECharts, dark theme, error recovery.
+TG Parser Dashboard v2 — Multi-Channel FastAPI Dashboard.
+Channel-aware SPA with Charts. ECharts, dark theme, error recovery.
+
+Imports models from models.py (SQLAlchemy 2.0 async) and config from config.py.
 """
-import os
+from __future__ import annotations
+
 import logging
 import traceback
 import csv
 import io
 import json
+import re
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import JSON as JSONCol, BigInteger, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint
+
+from models import Base, Channel, Post, ParseLog, ChannelError
+from config import settings, settings as cfg
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -107,47 +114,29 @@ STOP_WORDS = frozenset({
 })
 
 # ─── Database ────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-Base = declarative_base()
-engine = create_async_engine(DATABASE_URL)
+DATABASE_URL = cfg.database_url_async
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-
-class Post(Base):
-    __tablename__ = "posts"
-    id = Column(Integer, primary_key=True)
-    channel_id = Column(Integer, index=True)
-    telegram_message_id = Column(BigInteger)
-    text = Column(Text)
-    views_count = Column(Integer, default=0)
-    forwards_count = Column(Integer, default=0)
-    replies_count = Column(Integer, default=0)
-    hashtags = Column(JSONCol, default=list)
-    forward_from = Column(String(255))
-    published_at = Column(DateTime(timezone=True))
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-
-
-class ParseLog(Base):
-    __tablename__ = "parse_logs"
-    id = Column(Integer, primary_key=True)
-    posts_parsed = Column(Integer, default=0)
-    posts_new = Column(Integer, default=0)
-    duration_ms = Column(Integer)
-    error_message = Column(Text)
-    started_at = Column(DateTime(timezone=True))
-
 
 app = FastAPI()
 
 
 def json_response(data, status=200):
     return JSONResponse(content=data, status_code=status)
+
+
+def _channel_filter_clause(channel: Optional[str]) -> tuple[str, dict]:
+    """Build SQL channel filter clause and params for JOIN with channels table."""
+    if channel:
+        return "AND c.username = :channel", {"channel": channel}
+    return "", {}
+
+
+def _channel_where_clause(channel: Optional[str]) -> tuple[str, dict]:
+    """Build SQL channel filter for WHERE clauses with channels table."""
+    if channel:
+        return "AND c.username = :channel", {"channel": channel}
+    return "", {}
 
 
 async def get_since(session, delta):
@@ -158,7 +147,11 @@ async def get_since(session, delta):
     return since
 
 
-# ─── SPA: Posts + Tags ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# HTML TEMPLATES
+# ═══════════════════════════════════════════════════════════════
+
+# ─── SPA: Posts + Tags (Updated with channel filter) ─────────
 INDEX_HTML = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -177,6 +170,12 @@ nav button:hover{color:#e2e8f0;background:#1e293b}
 nav button.on{color:#0a0a1a;background:#00d4aa;font-weight:600}
 nav a{color:#64748b;text-decoration:none;padding:10px 20px;border-radius:8px;font-size:14px;font-weight:500;display:flex;align-items:center;gap:6px}
 nav a:hover{color:#e2e8f0;background:#1e293b}
+
+/* Channel selector */
+.ch-sel{display:flex;align-items:center;gap:8px;margin-bottom:16px;background:#0f172a;padding:8px 16px;border-radius:10px;border:1px solid #1e293b;width:fit-content}
+.ch-sel label{color:#64748b;font-size:13px;font-weight:500}
+.ch-sel select{background:#0a0a1a;border:1px solid #1e293b;color:#e2e8f0;padding:8px 14px;border-radius:8px;font-size:14px;outline:none;cursor:pointer;min-width:180px}
+.ch-sel select:focus{border-color:#00d4aa}
 
 /* Loader */
 #loader{position:fixed;inset:0;background:#0a0a1a;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity .4s}
@@ -208,6 +207,8 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 .post{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px}
 .post:hover{border-color:#334155}
 .post-head{display:flex;gap:16px;margin-bottom:8px;font-size:13px;color:#64748b;flex-wrap:wrap}
+.post-ch{color:#00d4aa;font-weight:600;text-decoration:none}
+.post-ch:hover{text-decoration:underline}
 .post-body{color:#e2e8f0;white-space:pre-wrap;word-break:break-word;line-height:1.6}
 .post-tags{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
 .tag{background:#1e293b;color:#00d4aa;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500}
@@ -237,7 +238,7 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading dashboard...</div><div id="loader-sub">Connecting to database</div></div>
 
 <div class="wrap">
-<header><h1>TG Parser Dashboard</h1><p class="sub" id="subtitle">Loading...</p></header>
+<header><h1><a href="/">TG Parser Dashboard</a></h1><p class="sub" id="subtitle">Loading...</p></header>
 <nav>
 <button class="on" data-tab="posts">Posts</button>
 <button data-tab="tags">Tags 24h</button>
@@ -249,7 +250,18 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 <a href="/sectors">&#127775; Sectors</a>
 <a href="/wordcloud">&#9729;&#65039; Words</a>
 <a href="/crossmarket">&#127758; Macro</a>
+<a href="/channels">&#128226; Channels</a>
+<a href="/crosschannel">&#128200; Cross-Ch</a>
 </nav>
+
+<!-- Channel Filter -->
+<div class="ch-sel">
+<label>Channel:</label>
+<select id="ch-filter" onchange="page=1;loadPosts();loadChannelStats();">
+<option value="">All channels</option>
+</select>
+<span id="ch-info" style="color:#64748b;font-size:12px"></span>
+</div>
 
 <section id="tab-posts">
 <div class="stats" id="p-stats"><div class="sk" style="height:60px"></div><div class="sk" style="height:60px"></div><div class="sk" style="height:60px"></div><div class="sk" style="height:60px"></div><div class="sk" style="height:60px"></div></div>
@@ -279,6 +291,7 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 'use strict';
 var page=1,loading={posts:false,tags:false};
 var $=function(id){return document.getElementById(id)};
+var currentChannel='';
 
 function hideLoader(){var el=$('loader');if(el&&!el.classList.contains('done'))el.classList.add('done')}
 setTimeout(hideLoader,6000);
@@ -289,21 +302,53 @@ function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 
 async function api(path,attempt){attempt=attempt||1;try{var r=await fetch('/api'+path,{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.error)throw new Error(d.error);return d}catch(e){if(attempt<3){await new Promise(function(r){setTimeout(r,1000*attempt)});return api(path,attempt+1)}throw e}}
 
+// Load channel list into dropdown
+async function loadChannels(){
+try{
+var data=await api('/channels');
+var chs=data.channels||[];
+var sel=$('ch-filter');
+chs.forEach(function(ch){
+var opt=document.createElement('option');
+opt.value=ch.username||'';
+opt.textContent=(ch.title||ch.username)+(ch.is_active?'':' [off]');
+sel.appendChild(opt);
+});
+}catch(e){console.error('channels load error:',e);}
+}
+
+// Load stats for selected channel
+async function loadChannelStats(){
+try{
+var ch=$('ch-filter').value;
+var q=ch?'?channel='+encodeURIComponent(ch):'';
+var stats=await api('/stats'+q);
+$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');
+$('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';
+if(stats.channel_title){
+$('ch-info').textContent='('+esc(stats.channel_title)+')';
+}else{
+$('ch-info').textContent='';
+}
+}catch(e){console.error('stats error:',e);}
+}
+
 // Nav
 document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListener('click',function(){var tab=btn.dataset.tab;document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');$('tab-posts').style.display=tab==='posts'?'':'none';$('tab-tags').style.display=tab==='tags'?'':'none';if(tab==='tags')loadTags()})});
 
 // Posts
-async function loadPosts(){if(loading.posts)return;loading.posts=true;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value;try{var data=await api('/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort),stats=await api('/stats');$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');$('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span><span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){console.error(e);showError('p-list',e.message)}finally{loading.posts=false}}
+async function loadPosts(){if(loading.posts)return;loading.posts=true;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value,ch=$('ch-filter').value;try{var chQ=ch?'&channel='+encodeURIComponent(ch):'';var data=await api('/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+chQ);var stats=await api('/stats'+(ch?'?channel='+encodeURIComponent(ch):''));$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');$('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');var chLink=p.channel_username?'<a class="post-ch" href="https://t.me/'+esc(p.channel_username)+'/'+p.id+'" target="_blank">@'+esc(p.channel_username)+'</a>':'';return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span>'+chLink+'<span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){console.error(e);showError('p-list',e.message)}finally{loading.posts=false}}
 window.goPage=function(p){page=p;loadPosts()};
 
-// Tags — period selector state
+// Tags -- period selector state
 var tagHours=24;
 
-async function loadTags(hours){hours=hours||tagHours;if(loading.tags)return;loading.tags=true;$('loader-sub').textContent='Loading tags...';tagHours=hours;try{var data=await api('/tags?hours='+hours);var tags=data.tags||[];var periodLabel=hours>=720?(hours/720)+' month':hours>=24?(hours/24)+' day':'hour';periodLabel=hours===24?'24 hours':hours===72?'3 days':hours===168?'7 days':hours===720?'30 days':periodLabel;$('t-stats').innerHTML='<div class="stat"><div class="stat-v">'+tags.length+'</div><div class="stat-l">Tags</div></div><div class="stat"><div class="stat-v">'+(tags[0]?esc(tags[0].tag):'-')+'</div><div class="stat-l">Top</div></div><div class="stat"><div class="stat-v">'+fmt(tags.reduce(function(a,t){return a+t.count},0))+'</div><div class="stat-l">Tagged</div></div>';if(!tags.length){$('t-list').innerHTML='<div class="empty">No tags for selected period</div>';hideLoader();loading.tags=false;return}var maxC=Math.max.apply(null,tags.map(function(t){return t.count}));var colors=['#00d4aa','#00b894','#0984e3','#6c5ce7','#fd79a8','#e17055','#fdcb6e','#55efc4'];$('t-list').innerHTML='<div style="color:#64748b;font-size:13px;margin-bottom:16px">Last '+periodLabel+' — tag ranking by frequency</div>'+tags.map(function(t,i){var pct=Math.round((t.count/maxC)*100);return'<div style="display:flex;align-items:center;gap:15px;margin-bottom:10px;padding:14px 16px;background:#0f172a;border:1px solid #1e293b;border-radius:10px"><div style="min-width:160px;font-weight:600;color:#00d4aa;font-size:14px">'+esc(t.tag)+'</div><div style="flex:1;height:28px;background:#0a0a1a;border-radius:6px;overflow:hidden"><div style="height:100%;border-radius:6px;display:flex;align-items:center;padding:0 12px;font-size:12px;font-weight:600;color:#fff;transition:width .8s;width:'+pct+'%;background:'+colors[i%colors.length]+'">'+t.count+' posts</div></div><div style="min-width:90px;text-align:right;color:#64748b;font-size:12px">'+fmt(t.total_views)+' views<br>~'+fmt(t.avg_views)+'</div></div>'}).join('');hideLoader()}catch(e){console.error(e);showError('t-list',e.message)}finally{loading.tags=false}}
+async function loadTags(hours){hours=hours||tagHours;if(loading.tags)return;loading.tags=true;$('loader-sub').textContent='Loading tags...';tagHours=hours;try{var ch=$('ch-filter').value;var chQ=ch?'&channel='+encodeURIComponent(ch):'';var data=await api('/tags?hours='+hours+chQ);var tags=data.tags||[];var periodLabel=hours>=720?(hours/720)+' month':hours>=24?(hours/24)+' day':'hour';periodLabel=hours===24?'24 hours':hours===72?'3 days':hours===168?'7 days':hours===720?'30 days':periodLabel;$('t-stats').innerHTML='<div class="stat"><div class="stat-v">'+tags.length+'</div><div class="stat-l">Tags</div></div><div class="stat"><div class="stat-v">'+(tags[0]?esc(tags[0].tag):'-')+'</div><div class="stat-l">Top</div></div><div class="stat"><div class="stat-v">'+fmt(tags.reduce(function(a,t){return a+t.count},0))+'</div><div class="stat-l">Tagged</div></div>';if(!tags.length){$('t-list').innerHTML='<div class="empty">No tags for selected period</div>';hideLoader();loading.tags=false;return}var maxC=Math.max.apply(null,tags.map(function(t){return t.count}));var colors=['#00d4aa','#00b894','#0984e3','#6c5ce7','#fd79a8','#e17055','#fdcb6e','#55efc4'];$('t-list').innerHTML='<div style="color:#64748b;font-size:13px;margin-bottom:16px">Last '+periodLabel+' -- tag ranking by frequency</div>'+tags.map(function(t,i){var pct=Math.round((t.count/maxC)*100);return'<div style="display:flex;align-items:center;gap:15px;margin-bottom:10px;padding:14px 16px;background:#0f172a;border:1px solid #1e293b;border-radius:10px"><div style="min-width:160px;font-weight:600;color:#00d4aa;font-size:14px">'+esc(t.tag)+'</div><div style="flex:1;height:28px;background:#0a0a1a;border-radius:6px;overflow:hidden"><div style="height:100%;border-radius:6px;display:flex;align-items:center;padding:0 12px;font-size:12px;font-weight:600;color:#fff;transition:width .8s;width:'+pct+'%;background:'+colors[i%colors.length]+'">'+t.count+' posts</div></div><div style="min-width:90px;text-align:right;color:#64748b;font-size:12px">'+fmt(t.total_views)+' views<br>~'+fmt(t.avg_views)+'</div></div>'}).join('');hideLoader()}catch(e){console.error(e);showError('t-list',e.message)}finally{loading.tags=false}}
 
 // Tag period selector handlers
 document.querySelectorAll('#tag-period button').forEach(function(btn){btn.addEventListener('click',function(){document.querySelectorAll('#tag-period button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');loadTags(parseInt(btn.dataset.h))})});
 
+loadChannels();
 loadPosts();
 })();
 </script>
@@ -387,7 +432,7 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 </div>
 
 <div class="chart-box">
-<div class="chart-title">&#128172; Telegram News with #<span id="tag-label">LKOH</span> <span style="color:#64748b;font-size:13px">— click a bar to see posts</span></div>
+<div class="chart-title">&#128172; Telegram News with #<span id="tag-label">LKOH</span> <span style="color:#64748b;font-size:13px">-- click a bar to see posts</span></div>
 <div class="chart" id="tag-chart"></div>
 </div>
 
@@ -439,34 +484,29 @@ async function showPostsForDay(idx){
   try{
     var data=await api('/analytics/tag-posts-by-day?tag='+encodeURIComponent(currentTag)+'&date='+encodeURIComponent(date));
     var posts=data.posts||[];
-    // Load intraday in parallel
     var intra=await api('/stock/intraday?ticker='+encodeURIComponent(currentTicker)+'&date='+encodeURIComponent(date));
     var times=intra.times||[];
     var ohlc=intra.ohlc||[];
-    // News markers: find time index in times array for category X-axis
     var timeIndex={};
     for(var i=0;i<times.length;i++)timeIndex[times[i]]=i;
-    // Build overlay data: null everywhere except news timestamp = high price
-    // Round post time to nearest 10-min candle (MOEX interval=10 = 10-min step)
     var overlayData=times.map(function(){return null;});
     var newsMap={};
     posts.filter(function(p){return p.published;}).forEach(function(p,pi){
       var h=parseInt(p.published.slice(11,13));
       var m=parseInt(p.published.slice(14,16));
-      h=(h+3)%24; // UTC→MSK
-      m=Math.round(m/10)*10; // round to nearest 10 min
+      h=(h+3)%24;
+      m=Math.round(m/10)*10;
       if(m===60){m=0;h=(h+1)%24;}
       var t=(h<10?'0':'')+h+':'+(m<10?'0':'')+m;
       var idx=timeIndex[t]!==undefined?timeIndex[t]:-1;
       console.log('POST',pi,'UTC='+p.published.slice(11,16),'MSK='+t,'idx='+idx,'text='+p.text.slice(0,30));
       if(idx>=0&&idx<ohlc.length){
-        overlayData[idx]=ohlc[idx][3]; // high price
+        overlayData[idx]=ohlc[idx][3];
         newsMap[idx]=p.text?p.text:'News';
         console.log('  -> placed at idx',idx);
       }
     });
     console.log('overlayData non-null:',overlayData.filter(function(x){return x!==null;}).length);
-    // Build scatter data: [index, high, text] for each news
     var scatterData=[];
     for(var i=0;i<overlayData.length;i++){
       if(overlayData[i]!==null)scatterData.push([i,overlayData[i],newsMap[i]]);
@@ -508,7 +548,6 @@ async function loadCharts(){
   $('s-change').textContent='...';
   $('s-total').textContent='...';
 
-  // Reset charts fresh — previous error may have destroyed DOM
   if(stockChart){try{stockChart.dispose();}catch(e){}stockChart=null;}
   if(tagChart){try{tagChart.dispose();}catch(e){}tagChart=null;}
   if(intradayChart){try{intradayChart.dispose();}catch(e){}intradayChart=null;}
@@ -519,21 +558,18 @@ async function loadCharts(){
   $('intraday-box').style.display='none';
 
   try{
-    // Fetch stock price + tag activity in parallel
     var s=await api('/stock/price?ticker='+encodeURIComponent(ticker)+'&days=90');
     var t=await api('/analytics/tag-daily?tag=%23'+encodeURIComponent(ticker)+'&days=90');
 
-    // Stock stats
     var ohlc=s.ohlc||[];
-    var latest=ohlc.length?ohlc[ohlc.length-1][1]:0;  // close
-    var first=ohlc.length?ohlc[0][0]:0;  // open of first day
+    var latest=ohlc.length?ohlc[ohlc.length-1][1]:0;
+    var first=ohlc.length?ohlc[0][0]:0;
     var pct=first?(((latest-first)/first)*100):0;
     $('s-price').textContent=latest?fmt(latest)+' RUB':'N/A';
     var chEl=$('s-change');
     chEl.textContent=pct?(pct>=0?'+':'')+pct.toFixed(1)+'%':'N/A';
     chEl.className='stat-v '+(pct>=0?'green':'red');
 
-    // Tag stats
     var counts=t.counts||[];
     currentFullDates=t.full_dates||t.days||[];
     currentDayLabels=t.days||[];
@@ -545,7 +581,6 @@ async function loadCharts(){
     $('s-total').textContent=fmt(total);
     $('s-days').textContent=nonzero;
 
-    // Render stock chart (OHLC candlestick)
     if(s.days&&s.days.length&&ohlc.length){
       getStockChart().setOption({
         backgroundColor:'transparent',
@@ -566,7 +601,6 @@ async function loadCharts(){
       },true);
     }else{$('stock-chart').innerHTML='<div class="empty">No stock data for '+esc(ticker)+'</div>';}
 
-    // Render tag chart
     if(t.days&&t.days.length){
       getTagChart().off('click');
       getTagChart().on('click',function(params){if(params.componentType==='series')showPostsForDay(params.dataIndex);});
@@ -586,7 +620,6 @@ async function loadCharts(){
     hideLoader();
   }catch(e){
     console.error(e);
-    // Render error inside charts without destroying DOM
     getStockChart().setOption({
       backgroundColor:'transparent',
       title:{text:'Error: '+esc(e.message),left:'center',top:'center',
@@ -690,8 +723,7 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 <header><h1>Tag Analytics</h1><a href="/" class="back">&larr; Back to Dashboard</a></header>
 
 <div class="search-box">
-<input type="text" id="tag-search" placeholder="Search tag (e.g. #россия)...
-" onkeydown="if(event.key==='Enter')searchTag()">
+<input type="text" id="tag-search" placeholder="Search tag (e.g. #россия)..." onkeydown="if(event.key==='Enter')searchTag()">
 <button onclick="searchTag()">Search Posts</button>
 <a href="/api/analytics/export-csv" class="export-btn" target="_blank">Export CSV</a>
 </div>
@@ -915,10 +947,8 @@ var days=1, charts={};
 var $=function(id){return document.getElementById(id)};
 
 function hideLoader(){var el=$('loader');if(el&&!el.classList.contains('done'))el.classList.add('done')}
-// FORCE hide after 5s no matter what
 setTimeout(hideLoader,5000);
 
-// Global error handler
 window.onerror=function(msg,url,line){console.error('JS ERROR:',msg,'line',line);hideLoader();try{getChart('c-bubble').setOption({backgroundColor:'transparent',title:{text:'JS Error: '+msg,left:'center',top:'center',textStyle:{color:'#f87171',fontSize:14}}},true);}catch(e){}return true};
 
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
@@ -963,7 +993,6 @@ function showChartsLoader(msg){
 
 async function loadAll(){
   console.log('loadAll() start, days='+days);
-  // Reset charts fresh — previous error may have destroyed DOM
   resetCharts();
   ['c-bubble','c-heat','c-hist','c-time','c-pair'].forEach(function(id){var el=$(id);if(el)el.innerHTML='';});
   showChartsLoader('Fetching data for '+days+'d...');
@@ -972,7 +1001,6 @@ async function loadAll(){
       throw new Error('ECharts not loaded. Check CDN connection.');
     }
     console.log('ECharts OK');
-    // Parallel fetch all APIs
     var t,a,v,tl,p;
     try{
       var results=await Promise.all([
@@ -985,9 +1013,7 @@ async function loadAll(){
       t=results[0];a=results[1];v=results[2];tl=results[3];p=results[4];
     }catch(pe){throw new Error('API: '+pe.message)}
     console.log('All API loaded, tags:',t.tags.length);
-    // Stats
     $('top-stats').innerHTML=[['Posts',fmt(t.total_posts)],['Tags',t.tags.length],['Top',t.tags[0]?t.tags[0].tag:'-'],['Avg',fmt(t.avg_reach)],['Peak',a.peak_hour+'h']].map(function(s){return'<div class="stat"><div class="stat-v">'+esc(s[1])+'</div><div class="stat-l">'+s[0]+'</div></div>'}).join('');
-    // Render each chart individually so one failure doesn't kill all
     try{renderBubble(t.tags);console.log('bubble OK')}catch(e){console.error('bubble:',e);try{getChart('c-bubble').setOption({backgroundColor:'transparent',title:{text:'Error: '+e.message,left:'center',top:'center',textStyle:{color:'#f87171',fontSize:14}}},true);}catch(e2){}}
     try{renderHeat(a.hours,a.peak_hour);console.log('heat OK')}catch(e){console.error('heat:',e);try{getChart('c-heat').setOption({backgroundColor:'transparent',title:{text:'Error: '+e.message,left:'center',top:'center',textStyle:{color:'#f87171',fontSize:14}}},true);}catch(e2){}}
     try{renderHist(v.bins);console.log('hist OK')}catch(e){console.error('hist:',e);try{getChart('c-hist').setOption({backgroundColor:'transparent',title:{text:'Error: '+e.message,left:'center',top:'center',textStyle:{color:'#f87171',fontSize:14}}},true);}catch(e2){}}
@@ -997,7 +1023,6 @@ async function loadAll(){
     console.log('all done');
   }catch(e){
     console.error('loadAll ERROR:',e);
-    // Re-init containers and show error via setOption (don't destroy DOM with innerHTML)
     resetCharts();
     ['c-bubble','c-heat','c-hist','c-time','c-pair'].forEach(function(id){var el=$(id);if(el)el.innerHTML='';});
     try{echarts.init($('c-bubble'),null,{renderer:'canvas'}).setOption({backgroundColor:'transparent',title:{text:'Error: '+esc(e.message),left:'center',top:'center',textStyle:{color:'#f87171',fontSize:14}}});}catch(e2){}
@@ -1196,25 +1221,25 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 
 <div class="grid grid-2">
 <div class="chart-box full">
-<div class="chart-title">📊 Sentiment Timeline</div>
+<div class="chart-title">Sentiment Timeline</div>
 <div class="chart-sub">Positive vs Negative vs Neutral posts per day</div>
 <div class="chart" id="s-timeline"></div>
 </div>
 
 <div class="chart-box">
-<div class="chart-title">🚀 News Velocity Alerts</div>
+<div class="chart-title">News Velocity Alerts</div>
 <div class="chart-sub">Tickers with anomalous mention growth</div>
 <div class="chart" id="s-alerts"></div>
 </div>
 
 <div class="chart-box">
-<div class="chart-title">🔗 Correlation Matrix</div>
+<div class="chart-title">Correlation Matrix</div>
 <div class="chart-sub">Tags that appear together in posts</div>
 <div class="chart" id="s-corr"></div>
 </div>
 
 <div class="chart-box full">
-<div class="chart-title">⏰ Pre-Market Intelligence</div>
+<div class="chart-title">Pre-Market Intelligence</div>
 <div class="chart-sub">MOEX: pre-market (before 10:00 MSK) / market hours / after-hours</div>
 <div class="chart" id="s-premarket"></div>
 </div>
@@ -1267,7 +1292,6 @@ async function loadAll(){
     var corr=await api('/correlation/matrix?days='+days);
     var pre=await api('/premarket/intel?days='+days);
 
-    // Stats
     var totalPos=st.positive.reduce(function(a,b){return a+b},0);
     var totalNeg=st.negative.reduce(function(a,b){return a+b},0);
     $('top-stats').innerHTML=[
@@ -1377,7 +1401,7 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 .empty{text-align:center;color:#64748b;padding:60px;font-size:14px}
 '''
 
-# ─── Page 1: Viral Posts ─────────────────────────────────────
+# ─── Page 1: Viral Posts (Updated with channel name) ─────────
 VIRAL_POSTS_HTML = '''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1388,6 +1412,7 @@ VIRAL_POSTS_HTML = '''<!DOCTYPE html>
 .vpost{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:12px;cursor:pointer;transition:.15s}
 .vpost:hover{border-color:#334155}
 .vpost-head{display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;color:#64748b}
+.vpost-ch{color:#00d4aa;font-weight:600;font-size:12px;margin-right:8px}
 .vpost-body{color:#e2e8f0;white-space:pre-wrap;word-break:break-word;max-height:80px;overflow:hidden;line-height:1.5;font-size:14px}
 .vpost-stats{display:flex;gap:20px;margin-top:10px;font-size:13px;color:#64748b}
 .vpost-stats span{color:#00d4aa;font-weight:600}
@@ -1396,7 +1421,7 @@ VIRAL_POSTS_HTML = '''<!DOCTYPE html>
 <body>
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading...</div></div>
 <div class="wrap">
-<header><h1>🔥 Viral Posts</h1>
+<header><h1>Viral Posts</h1>
 <div class="period">
 <button class="on" data-d="1">1d</button>
 <button data-d="3">3d</button>
@@ -1425,11 +1450,12 @@ async function load(){
     var posts=d.posts||[];
     if(!posts.length){$('content').innerHTML='<div class="empty">No viral posts</div>';hideLoader();return;}
     $('content').innerHTML=posts.map(function(p,i){
-      var link='https://t.me/markettwits/'+p.id;
+      var ch=p.channel_username||'markettwits';
+      var link='https://t.me/'+ch+'/'+p.id;
       return'<div class="vpost" onclick="window.open(\''+link+'\')">'+
-        '<div class="vpost-head"><span>#'+(i+1)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div>'+
+        '<div class="vpost-head"><span>#'+(i+1)+'</span><span class="vpost-ch">@'+esc(ch)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div>'+
         '<div class="vpost-body">'+esc((p.text||'(no text)').slice(0,250))+'</div>'+
-        '<div class="vpost-stats"><span>👁 '+fmt(p.views)+'</span><span>↗️ '+fmt(p.forwards)+'</span></div></div>';
+        '<div class="vpost-stats"><span>Views '+fmt(p.views)+'</span><span>Forwards '+fmt(p.forwards)+'</span></div></div>';
     }).join('');
   }catch(e){$('content').innerHTML='<div style="text-align:center;color:#f87171;padding:40px">Error: '+esc(e.message)+'</div>';}
   hideLoader();
@@ -1466,7 +1492,7 @@ SECTORS_HTML = '''<!DOCTYPE html>
 <body>
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading...</div></div>
 <div class="wrap">
-<header><h1>🏭 Sector Rotation</h1>
+<header><h1>Sector Rotation</h1>
 <div class="period">
 <button class="on" data-d="1">1d</button>
 <button data-d="3">3d</button>
@@ -1532,7 +1558,7 @@ WORDCLOUD_HTML = '''<!DOCTYPE html>
 <body>
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading...</div></div>
 <div class="wrap">
-<header><h1>☁️ Word Cloud</h1>
+<header><h1>Word Cloud</h1>
 <div class="period">
 <button class="on" data-d="1">1d</button>
 <button data-d="3">3d</button>
@@ -1599,7 +1625,7 @@ CROSSMARKET_HTML = '''<!DOCTYPE html>
 <body>
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading...</div></div>
 <div class="wrap">
-<header><h1>🌍 Cross-Market</h1>
+<header><h1>Cross-Market</h1>
 <div class="period">
 <button class="on" data-d="1">1d</button>
 <button data-d="3">3d</button>
@@ -1630,13 +1656,14 @@ async function load(){
     var posts=d.posts||[],tickers=d.tickers||[];
     if(!posts.length){$('content').innerHTML='<div class="empty">No cross-market posts</div>';hideLoader();return;}
     $('content').innerHTML=posts.slice(0,10).map(function(p){
-      var link='https://t.me/markettwits/'+p.id;
+      var ch=p.channel_username||'markettwits';
+      var link='https://t.me/'+ch+'/'+p.id;
       return'<div class="xpost" onclick="window.open(\''+link+'\')">'+
-        '<div class="xpost-head"><span>👁 '+fmt(p.views)+' | '+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div>'+
+        '<div class="xpost-head"><span>Views '+fmt(p.views)+' | '+(p.published?p.published.slice(0,16).replace('T',' '):'')+' | @'+esc(ch)+'</span></div>'+
         '<div class="xpost-body">'+esc((p.text||'(no text)').slice(0,250))+'</div></div>';
     }).join('');
     if(tickers.length){
-      $('tickers').innerHTML='<div style="color:#64748b;font-size:13px;margin-bottom:10px">📌 Co-mentioned tickers:</div>'+
+      $('tickers').innerHTML='<div style="color:#64748b;font-size:13px;margin-bottom:10px">Co-mentioned tickers:</div>'+
         tickers.map(function(t){return'<span class="xticker">'+esc(t.tag)+' ('+t.count+')</span>';}).join('');
     }
   }catch(e){$('content').innerHTML='<div style="text-align:center;color:#f87171;padding:40px">Error: '+esc(e.message)+'</div>';}
@@ -1655,6 +1682,344 @@ load();
 </body>
 </html>'''
 
+
+# ═══════════════════════════════════════════════════════════════
+# NEW HTML TEMPLATES (v2 — channel-aware)
+# ═══════════════════════════════════════════════════════════════
+
+# ─── Page: Channels List ─────────────────────────────────────
+CHANNELS_HTML = '''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channels — TG Parser</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
+.wrap{max-width:1400px;margin:0 auto;padding:24px}
+header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:24px}
+h1{color:#00d4aa;font-size:28px;font-weight:700}
+.back{color:#64748b;text-decoration:none;font-size:14px}
+.back:hover{color:#00d4aa}
+
+#loader{position:fixed;inset:0;background:#0a0a1a;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity .4s}
+#loader.done{opacity:0;pointer-events:none}
+.loader-ring{width:48px;height:48px;border:3px solid #1e293b;border-top-color:#00d4aa;border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loader-text{margin-top:16px;color:#64748b;font-size:14px}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:15px;margin-bottom:24px}
+.stat{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:20px;text-align:center}
+.stat-v{font-size:28px;font-weight:700;color:#00d4aa}
+.stat-l{font-size:12px;color:#64748b;margin-top:4px}
+
+.ch-row{display:flex;align-items:center;gap:16px;padding:16px;background:#0f172a;border:1px solid #1e293b;border-radius:12px;margin-bottom:10px;transition:.15s}
+.ch-row:hover{border-color:#334155}
+.ch-info{flex:1}
+.ch-title{font-size:15px;font-weight:600;color:#e2e8f0}
+.ch-user{font-size:12px;color:#64748b;margin-top:2px}
+.ch-meta{display:flex;gap:16px;font-size:12px;color:#64748b}
+.ch-meta span{color:#00d4aa;font-weight:600}
+.badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-active{background:#00d4aa20;color:#00d4aa;border:1px solid #00d4aa40}
+.badge-inactive{background:#f8717120;color:#f87171;border:1px solid #f8717140}
+.badge-error{background:#fdcb6e20;color:#fdcb6e;border:1px solid #fdcb6e40}
+.empty{text-align:center;color:#64748b;padding:60px;font-size:14px}
+.err{background:#0f172a;border:1px solid #7f1d1d;border-radius:12px;padding:24px;text-align:center}
+.err h3{color:#f87171;margin-bottom:8px}
+</style>
+</head>
+<body>
+<div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading channels...</div></div>
+<div class="wrap">
+<header><h1>Channels</h1><a href="/" class="back">&larr; Back</a></header>
+
+<div class="stats" id="top-stats">
+<div class="stat"><div class="stat-v" id="s-total">-</div><div class="stat-l">Total</div></div>
+<div class="stat"><div class="stat-v" id="s-active">-</div><div class="stat-l">Active</div></div>
+<div class="stat"><div class="stat-v" id="s-posts">-</div><div class="stat-l">Total Posts</div></div>
+<div class="stat"><div class="stat-v" id="s-errors">-</div><div class="stat-l">With Errors</div></div>
+</div>
+
+<div id="content"></div>
+</div>
+
+<script>
+(function(){
+var $=function(id){return document.getElementById(id)};
+function hideLoader(){var el=$('loader');if(el&&!el.classList.contains('done'))el.classList.add('done')}
+setTimeout(hideLoader,6000);
+function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
+
+async function api(path){
+  var r=await fetch('/api'+path,{cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  var d=await r.json();
+  if(d.error) throw new Error(d.error);
+  return d;
+}
+
+async function loadAll(){
+  try{
+    var data=await api('/channels');
+    var chs=data.channels||[];
+    if(!chs.length){$('content').innerHTML='<div class="empty">No channels configured</div>';hideLoader();return;}
+
+    var total=chs.length;
+    var active=chs.filter(function(c){return c.is_active}).length;
+    var posts=chs.reduce(function(a,c){return a+(c.posts_count||0)},0);
+    var errors=chs.filter(function(c){return c.parse_error_count>0}).length;
+
+    $('s-total').textContent=fmt(total);
+    $('s-active').textContent=fmt(active);
+    $('s-posts').textContent=fmt(posts);
+    $('s-errors').textContent=fmt(errors);
+
+    $('content').innerHTML=chs.map(function(c){
+      var badgeClass=c.is_active?'badge-active':'badge-inactive';
+      var badgeText=c.is_active?'active':'inactive';
+      if(c.parse_error_count>0){badgeClass='badge-error';badgeText='error('+c.parse_error_count+')';}
+      var lastParsed=c.last_parsed_at?c.last_parsed_at.slice(0,16).replace('T',' '):'never';
+      var chLink=c.username?'https://t.me/'+c.username:'#';
+      return'<div class="ch-row">'+
+        '<div class="ch-info">'+
+          '<div class="ch-title"><a href="'+chLink+'" target="_blank" style="color:inherit;text-decoration:none">'+esc(c.title||c.username||'Channel #'+c.id)+'</a></div>'+
+          '<div class="ch-user">@'+esc(c.username||'-')+' | ID:'+c.telegram_id+'</div>'+
+          '<div class="ch-meta">'+
+            '<span>'+fmt(c.posts_count||0)+' posts</span>'+
+            '<span>'+fmt(c.subscriber_count||0)+' subs</span>'+
+            '<span>parsed: '+lastParsed+'</span>'+
+            (c.last_error_message?'<span style="color:#f87171" title="'+esc(c.last_error_message)+'">error</span>':'')+
+          '</div>'+
+        '</div>'+
+        '<span class="badge '+badgeClass+'">'+badgeText+'</span>'+
+      '</div>';
+    }).join('');
+    hideLoader();
+  }catch(e){
+    console.error(e);
+    $('content').innerHTML='<div class="err"><h3>Error</h3><p>'+esc(e.message)+'</p></div>';
+    hideLoader();
+  }
+}
+loadAll();
+})();
+</script>
+</body>
+</html>'''
+
+# ─── Page: Cross-Channel Comparison ──────────────────────────
+CROSSCHANNEL_HTML = '''<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cross-Channel — TG Parser</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
+.wrap{max-width:1400px;margin:0 auto;padding:24px}
+header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:24px}
+h1{color:#00d4aa;font-size:28px;font-weight:700}
+.back{color:#64748b;text-decoration:none;font-size:14px}
+.back:hover{color:#00d4aa}
+.period{display:flex;gap:4px;background:#0f172a;padding:4px;border-radius:10px;border:1px solid #1e293b}
+.period button{background:none;border:none;color:#64748b;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer}
+.period button:hover{color:#e2e8f0;background:#1e293b}
+.period button.on{color:#0a0a1a;background:#00d4aa;font-weight:600}
+
+#loader{position:fixed;inset:0;background:#0a0a1a;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity .4s}
+#loader.done{opacity:0;pointer-events:none}
+.loader-ring{width:48px;height:48px;border:3px solid #1e293b;border-top-color:#00d4aa;border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loader-text{margin-top:16px;color:#64748b;font-size:14px}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(500px,1fr));gap:20px;margin-bottom:20px}
+.chart-box{background:#0f172a;border:1px solid #1e293b;border-radius:16px;padding:20px}
+.chart-title{font-size:16px;font-weight:600;margin-bottom:4px;color:#00d4aa}
+.chart-sub{font-size:13px;color:#64748b;margin-bottom:16px}
+.chart{min-height:360px}
+.full{grid-column:1/-1}
+
+.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;text-align:center}
+.stat-v{font-size:24px;font-weight:700;color:#00d4aa}
+.stat-l{font-size:11px;color:#64748b;margin-top:4px}
+.empty{text-align:center;color:#64748b;padding:60px;font-size:14px}
+.err-box{background:#0f172a;border:1px solid #7f1d1d;border-radius:12px;padding:24px;text-align:center}
+.err-box h3{color:#f87171;margin-bottom:8px}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+<div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading cross-channel data...</div></div>
+<div class="wrap">
+<header>
+<h1>Cross-Channel Comparison</h1>
+<div class="period">
+<button class="on" data-d="7">7d</button>
+<button data-d="30">30d</button>
+<button data-d="90">90d</button>
+</div>
+<a href="/" class="back">&larr; Back</a>
+</header>
+
+<div class="stats-bar" id="top-stats"></div>
+
+<div class="grid">
+<div class="chart-box full">
+<div class="chart-title">Posts per Channel</div>
+<div class="chart-sub">Number of posts per channel</div>
+<div class="chart" id="ch-posts-chart"></div>
+</div>
+
+<div class="chart-box full">
+<div class="chart-title">Total Views per Channel</div>
+<div class="chart-sub">Cumulative views per channel</div>
+<div class="chart" id="ch-views-chart"></div>
+</div>
+
+<div class="chart-box full">
+<div class="chart-title">Avg Views per Post</div>
+<div class="chart-sub">Average reach per channel</div>
+<div class="chart" id="ch-avg-chart"></div>
+</div>
+
+<div class="chart-box full">
+<div class="chart-title">Posts Timeline by Channel</div>
+<div class="chart-sub">Daily post count per channel</div>
+<div class="chart" id="ch-timeline-chart"></div>
+</div>
+</div>
+</div>
+
+<script>
+(function(){
+'use strict';
+var days=7,charts={};
+var $=function(id){return document.getElementById(id)};
+
+function hideLoader(){var el=$('loader');if(el&&!el.classList.contains('done'))el.classList.add('done')}
+setTimeout(hideLoader,6000);
+
+function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
+function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+async function api(path){
+  var r=await fetch('/api'+path,{cache:'no-store'});
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  var d=await r.json();
+  if(d.error) throw new Error(d.error);
+  return d;
+}
+
+function getChart(id){
+  if(!charts[id]){
+    var el=$(id);
+    if(!el) throw new Error('No #'+id);
+    charts[id]=echarts.init(el,null,{renderer:'canvas'});
+  }
+  return charts[id];
+}
+function resetCharts(){
+  Object.keys(charts).forEach(function(id){try{charts[id].dispose();}catch(e){}});
+  charts={};
+}
+
+document.querySelectorAll('.period button').forEach(function(btn){
+  btn.addEventListener('click',function(){
+    document.querySelectorAll('.period button').forEach(function(b){b.classList.remove('on')});
+    btn.classList.add('on');
+    days=parseInt(btn.dataset.d);
+    loadAll();
+  });
+});
+
+async function loadAll(){
+  resetCharts();
+  ['ch-posts-chart','ch-views-chart','ch-avg-chart','ch-timeline-chart'].forEach(function(id){var el=$(id);if(el)el.innerHTML='';});
+  try{
+    var data=await api('/channels/comparison?days='+days);
+    var chs=data.channels||[];
+    if(!chs.length){$('top-stats').innerHTML='<div class="empty">No channel data</div>';hideLoader();return;}
+
+    var totalPosts=chs.reduce(function(a,c){return a+(c.posts_count||0)},0);
+    var totalViews=chs.reduce(function(a,c){return a+(c.total_views||0)},0);
+    $('top-stats').innerHTML=[
+      ['Channels',chs.length],['Total Posts',fmt(totalPosts)],['Total Views',fmt(totalViews)]
+    ].map(function(s){return'<div class="stat"><div class="stat-v">'+esc(s[1])+'</div><div class="stat-l">'+s[0]+'</div></div>'}).join('');
+
+    var colors=['#00d4aa','#00b894','#0984e3','#6c5ce7','#fd79a8','#e17055','#fdcb6e','#55efc4','#00cec9','#81ecec','#a29bfe','#fab1a0'];
+
+    // Posts per channel
+    getChart('ch-posts-chart').setOption({
+      backgroundColor:'transparent',
+      tooltip:{trigger:'axis',formatter:function(p){return p[0].name+': '+fmt(p[0].value)+' posts';}},
+      grid:{left:120,right:30,top:20,bottom:30},
+      xAxis:{type:'value',splitLine:{lineStyle:{color:'#1e293b'}},axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#64748b'}},
+      yAxis:{type:'category',data:chs.map(function(c){return c.username||'ch-'+c.id}).reverse(),axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#94a3b8',fontSize:12}},
+      series:[{type:'bar',data:chs.map(function(c){return c.posts_count||0}).reverse(),itemStyle:{color:function(p){return colors[p.dataIndex%colors.length]},borderRadius:[0,4,4,0]}}]
+    },true);
+
+    // Views per channel
+    getChart('ch-views-chart').setOption({
+      backgroundColor:'transparent',
+      tooltip:{trigger:'axis',formatter:function(p){return p[0].name+': '+fmt(p[0].value)+' views';}},
+      grid:{left:120,right:30,top:20,bottom:30},
+      xAxis:{type:'value',splitLine:{lineStyle:{color:'#1e293b'}},axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#64748b',formatter:function(v){return v>=1000?(v/1000).toFixed(0)+'k':v;}}},
+      yAxis:{type:'category',data:chs.map(function(c){return c.username||'ch-'+c.id}).reverse(),axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#94a3b8',fontSize:12}},
+      series:[{type:'bar',data:chs.map(function(c){return c.total_views||0}).reverse(),itemStyle:{color:function(p){return colors[p.dataIndex%colors.length]},borderRadius:[0,4,4,0]}}]
+    },true);
+
+    // Avg views per channel
+    getChart('ch-avg-chart').setOption({
+      backgroundColor:'transparent',
+      tooltip:{trigger:'axis',formatter:function(p){return p[0].name+': '+fmt(p[0].value)+' avg views';}},
+      grid:{left:120,right:30,top:20,bottom:30},
+      xAxis:{type:'value',splitLine:{lineStyle:{color:'#1e293b'}},axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#64748b'}},
+      yAxis:{type:'category',data:chs.map(function(c){return c.username||'ch-'+c.id}).reverse(),axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#94a3b8',fontSize:12}},
+      series:[{type:'bar',data:chs.map(function(c){return c.avg_views||0}).reverse(),itemStyle:{color:function(p){return colors[p.dataIndex%colors.length]},borderRadius:[0,4,4,0]}}]
+    },true);
+
+    // Timeline
+    if(data.timeline && data.timeline.days && data.timeline.days.length){
+      var series=data.timeline.channels.map(function(ch,idx){
+        return{name:ch.username||'ch-'+ch.id,type:'line',smooth:true,symbol:'none',lineStyle:{width:2,color:colors[idx%colors.length]},areaStyle:{color:colors[idx%colors.length],opacity:.1},data:ch.series};
+      });
+      getChart('ch-timeline-chart').setOption({
+        backgroundColor:'transparent',
+        tooltip:{trigger:'axis'},
+        legend:{data:data.timeline.channels.map(function(c){return c.username||'ch-'+c.id}),textStyle:{color:'#94a3b8'},top:0},
+        grid:{left:60,right:30,top:50,bottom:40},
+        xAxis:{type:'category',data:data.timeline.days,axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#64748b',rotate:45}},
+        yAxis:{type:'value',name:'Posts',splitLine:{lineStyle:{color:'#1e293b'}},axisLine:{lineStyle:{color:'#334155'}},axisLabel:{color:'#64748b'}},
+        series:series
+      },true);
+    }else{
+      $('ch-timeline-chart').innerHTML='<div class="empty">No timeline data</div>';
+    }
+
+    hideLoader();
+  }catch(e){
+    console.error(e);
+    $('top-stats').innerHTML='<div class="err-box"><h3>Error</h3><p>'+esc(e.message)+'</p></div>';
+    hideLoader();
+  }
+}
+
+window.addEventListener('resize',function(){Object.values(charts).forEach(function(c){try{if(c)c.resize();}catch(e){}})});
+loadAll();
+})();
+</script>
+</body>
+</html>'''
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAGE ROUTES
+# ═══════════════════════════════════════════════════════════════
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -1701,73 +2066,280 @@ async def crossmarket_page():
     return HTMLResponse(content=CROSSMARKET_HTML)
 
 
-# ─── API: Stats ──────────────────────────────────────────────
-@app.get("/api/stats")
-async def api_stats():
+# ─── NEW: Channels page (v2) ─────────────────────────────────
+@app.get("/channels", response_class=HTMLResponse)
+async def channels_page():
+    return HTMLResponse(content=CHANNELS_HTML)
+
+
+# ─── NEW: Cross-Channel comparison page (v2) ─────────────────
+@app.get("/crosschannel", response_class=HTMLResponse)
+async def crosschannel_page():
+    return HTMLResponse(content=CROSSCHANNEL_HTML)
+
+
+# ═══════════════════════════════════════════════════════════════
+# API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+# ─── API: Channels list (v2) ─────────────────────────────────
+@app.get("/api/channels")
+async def api_channels():
+    """Return all channels with computed metrics."""
     try:
         async with async_session() as session:
-            total = (await session.execute(select(func.count()).select_from(Post))).scalar()
-            today = (await session.execute(select(func.count()).select_from(Post).where(Post.published_at > datetime.now(timezone.utc) - timedelta(days=1)))).scalar()
-            week = (await session.execute(select(func.count()).select_from(Post).where(Post.published_at > datetime.now(timezone.utc) - timedelta(days=7)))).scalar()
-            avg_views = int((await session.execute(select(func.avg(Post.views_count)).select_from(Post))).scalar() or 0)
-            parses = (await session.execute(select(func.count()).select_from(ParseLog))).scalar()
-            last = (await session.execute(select(ParseLog.started_at).order_by(ParseLog.started_at.desc()).limit(1))).scalar()
-            return {"total_posts": total, "today_posts": today, "week_posts": week, "avg_views": avg_views, "total_parses": parses, "last_parsed": last.strftime("%Y-%m-%d %H:%M") if last else None}
+            result = await session.execute(text("""
+                SELECT
+                    c.id, c.telegram_id, c.username, c.title,
+                    c.subscriber_count, c.is_active, c.last_parsed_at,
+                    c.total_posts_parsed, c.parse_error_count, c.last_error_message,
+                    (SELECT COUNT(*) FROM posts WHERE channel_id = c.id) as posts_count,
+                    (SELECT COALESCE(SUM(views_count), 0) FROM posts WHERE channel_id = c.id) as total_views,
+                    (SELECT COALESCE(AVG(views_count), 0)::int FROM posts WHERE channel_id = c.id) as avg_views,
+                    CASE WHEN c.parse_error_count > 0 THEN 'error'
+                         WHEN c.last_parsed_at IS NOT NULL THEN 'success'
+                         ELSE 'pending'
+                    END as last_parse_status
+                FROM channels c
+                ORDER BY c.is_active DESC, c.last_parsed_at DESC NULLS LAST
+            """))
+            rows = result.mappings().all()
+            channels = []
+            for r in rows:
+                channels.append({
+                    "id": r["id"],
+                    "telegram_id": r["telegram_id"],
+                    "username": r["username"],
+                    "title": r["title"],
+                    "subscriber_count": r["subscriber_count"] or 0,
+                    "is_active": r["is_active"],
+                    "last_parsed_at": r["last_parsed_at"].isoformat() if r["last_parsed_at"] else None,
+                    "total_posts_parsed": r["total_posts_parsed"] or 0,
+                    "parse_error_count": r["parse_error_count"] or 0,
+                    "last_error_message": r["last_error_message"],
+                    "posts_count": r["posts_count"] or 0,
+                    "total_views": r["total_views"] or 0,
+                    "avg_views": r["avg_views"] or 0,
+                    "last_parse_status": r["last_parse_status"],
+                })
+            return {"channels": channels}
+    except Exception as e:
+        logger.error(f"/channels error: {e}"); traceback.print_exc()
+        return json_response({"channels": [], "error": str(e)}, 500)
+
+
+# ─── API: Cross-Channel comparison (v2) ──────────────────────
+@app.get("/api/channels/comparison")
+async def api_channels_comparison(days: int = Query(7, ge=1, le=90)):
+    """Compare channels by activity: posts, views, timeline."""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            # Per-channel metrics
+            result = await session.execute(text("""
+                SELECT
+                    c.id, c.username, c.title,
+                    COUNT(p.id) as posts_count,
+                    COALESCE(SUM(p.views_count), 0) as total_views,
+                    COALESCE(AVG(p.views_count), 0)::int as avg_views
+                FROM channels c
+                LEFT JOIN posts p ON p.channel_id = c.id AND p.published_at > :since
+                GROUP BY c.id, c.username, c.title
+                ORDER BY posts_count DESC
+            """), {"since": since})
+            ch_rows = result.mappings().all()
+
+            # Timeline per channel per day
+            days_list = []
+            for i in range(days + 1):
+                dt = since + timedelta(days=i)
+                days_list.append(dt.strftime("%m-%d"))
+
+            timeline_channels = []
+            for ch in ch_rows:
+                if ch["posts_count"] == 0:
+                    continue
+                daily = await session.execute(text("""
+                    SELECT ((published_at AT TIME ZONE 'UTC')::date)::text as d, COUNT(*) as cnt
+                    FROM posts
+                    WHERE channel_id = :ch_id AND published_at > :since
+                    GROUP BY d ORDER BY d
+                """), {"ch_id": ch["id"], "since": since})
+                day_map = {r["d"]: r["cnt"] for r in daily.mappings().all()}
+                series = []
+                for i in range(days + 1):
+                    dt = since + timedelta(days=i)
+                    series.append(day_map.get(dt.strftime("%Y-%m-%d"), 0))
+                timeline_channels.append({
+                    "username": ch["username"],
+                    "title": ch["title"],
+                    "series": series,
+                })
+
+            return {
+                "channels": [
+                    {
+                        "id": r["id"],
+                        "username": r["username"],
+                        "title": r["title"],
+                        "posts_count": r["posts_count"] or 0,
+                        "total_views": r["total_views"] or 0,
+                        "avg_views": r["avg_views"] or 0,
+                    } for r in ch_rows
+                ],
+                "timeline": {
+                    "days": days_list,
+                    "channels": timeline_channels,
+                } if timeline_channels else None,
+            }
+    except Exception as e:
+        logger.error(f"/channels/comparison error: {e}"); traceback.print_exc()
+        return json_response({"channels": [], "error": str(e)}, 500)
+
+
+# ─── API: Stats (with optional channel filter) ───────────────
+@app.get("/api/stats")
+async def api_stats(channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            ch_filter, ch_params = _channel_where_clause(channel)
+            total = (await session.execute(text(f"""
+                SELECT COUNT(*) FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE 1=1 {ch_filter}
+            """), ch_params)).scalar()
+            today = (await session.execute(text(f"""
+                SELECT COUNT(*) FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since {ch_filter}
+            """), {"since": datetime.now(timezone.utc) - timedelta(days=1), **ch_params})).scalar()
+            week = (await session.execute(text(f"""
+                SELECT COUNT(*) FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since {ch_filter}
+            """), {"since": datetime.now(timezone.utc) - timedelta(days=7), **ch_params})).scalar()
+            avg_views = int((await session.execute(text(f"""
+                SELECT COALESCE(AVG(p.views_count), 0) FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE 1=1 {ch_filter}
+            """), ch_params)).scalar() or 0)
+            parses = (await session.execute(text(f"""
+                SELECT COUNT(*) FROM parse_logs pl
+                JOIN channels c ON pl.channel_id = c.id
+                WHERE 1=1 {ch_filter}
+            """), ch_params)).scalar()
+            last = (await session.execute(text(f"""
+                SELECT pl.started_at FROM parse_logs pl
+                JOIN channels c ON pl.channel_id = c.id
+                WHERE 1=1 {ch_filter}
+                ORDER BY pl.started_at DESC LIMIT 1
+            """), ch_params)).scalar()
+
+            channel_title = None
+            if channel:
+                ch_title = (await session.execute(
+                    text("SELECT title FROM channels WHERE username = :ch"),
+                    {"ch": channel}
+                )).scalar()
+                channel_title = ch_title
+
+            return {
+                "total_posts": total, "today_posts": today, "week_posts": week,
+                "avg_views": avg_views, "total_parses": parses,
+                "last_parsed": last.strftime("%Y-%m-%d %H:%M") if last else None,
+                "channel_title": channel_title,
+            }
     except Exception as e:
         logger.error(f"/stats error: {e}"); traceback.print_exc()
         return json_response({"error": str(e), "total_posts": 0, "today_posts": 0, "week_posts": 0, "avg_views": 0, "total_parses": 0}, 500)
 
 
-# ─── API: Posts ──────────────────────────────────────────────
+# ─── API: Posts (with optional channel filter) ───────────────
 @app.get("/api/posts")
-async def api_posts(page: int = 1, limit: int = 20, search: str = "", sort: str = "new"):
+async def api_posts(
+    page: int = 1, limit: int = 20,
+    search: str = "", sort: str = "new",
+    channel: Optional[str] = Query(None)
+):
     try:
         async with async_session() as session:
-            query = select(Post)
-            if search: query = query.where(Post.text.ilike(f"%{search}%"))
-            query = query.order_by(Post.views_count.desc() if sort == "views" else Post.published_at.desc())
-            query = query.offset((page - 1) * limit).limit(limit)
-            result = await session.execute(query)
-            posts = result.scalars().all()
-            return {"posts": [{"id": p.telegram_message_id, "text": p.text, "views": p.views_count, "hashtags": p.hashtags or [], "published": p.published_at.isoformat() if p.published_at else None} for p in posts]}
+            ch_filter, ch_params = _channel_where_clause(channel)
+            search_filter = ""
+            search_params = {}
+            if search:
+                search_filter = "AND p.text ILIKE :search"
+                search_params = {"search": f"%{search}%"}
+
+            order_col = "p.views_count DESC" if sort == "views" else "p.published_at DESC"
+
+            result = await session.execute(text(f"""
+                SELECT p.telegram_message_id, p.text, p.views_count,
+                       p.hashtags, p.published_at, c.username as channel_username
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE 1=1 {ch_filter} {search_filter}
+                ORDER BY {order_col}
+                LIMIT :limit OFFSET :offset
+            """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
+            rows = result.mappings().all()
+            return {"posts": [
+                {
+                    "id": r["telegram_message_id"],
+                    "text": r["text"],
+                    "views": r["views_count"],
+                    "hashtags": r["hashtags"] or [],
+                    "published": r["published_at"].isoformat() if r["published_at"] else None,
+                    "channel_username": r["channel_username"],
+                } for r in rows
+            ]}
     except Exception as e:
         logger.error(f"/posts error: {e}"); traceback.print_exc()
         return json_response({"error": str(e), "posts": []}, 500)
 
 
-# ─── API: Tags (parametric) ──────────────────────────────────
+# ─── API: Tags (parametric, with channel filter) ─────────────
 @app.get("/api/tags")
-async def api_tags(hours: int = Query(24, ge=1, le=720)):
+async def api_tags(
+    hours: int = Query(24, ge=1, le=720),
+    channel: Optional[str] = Query(None)
+):
     try:
         async with async_session() as session:
             since = await get_since(session, timedelta(hours=hours))
-            result = await session.execute(text("""
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
                 WITH tagged AS (
-                    SELECT * FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
+                    SELECT p.*, c.username as ch_name FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
                 )
                 SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt,
                        SUM(views_count) as total_views, AVG(views_count)::int as avg_views
                 FROM tagged
                 GROUP BY json_array_elements_text(hashtags)
                 ORDER BY cnt DESC LIMIT 50
-            """), {"since": since})
+            """), {"since": since, **ch_params})
             rows = result.mappings().all()
             if not rows:
-                result = await session.execute(text("""
+                result = await session.execute(text(f"""
                     WITH tagged AS (
-                        SELECT * FROM posts WHERE hashtags IS NOT NULL
-                          AND json_typeof(hashtags) = 'array'
-                          AND json_array_length(hashtags) > 0
+                        SELECT p.*, c.username as ch_name FROM posts p
+                        JOIN channels c ON p.channel_id = c.id
+                        WHERE p.hashtags IS NOT NULL
+                          AND json_typeof(p.hashtags) = 'array'
+                          AND json_array_length(p.hashtags) > 0
+                          {ch_filter}
                     )
                     SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt,
                            SUM(views_count) as total_views, AVG(views_count)::int as avg_views
                     FROM tagged
                     GROUP BY json_array_elements_text(hashtags)
                     ORDER BY cnt DESC LIMIT 50
-                """))
+                """), ch_params)
                 rows = result.mappings().all()
             return {"tags": [{"tag": r["hashtag"], "count": r["cnt"], "total_views": r["total_views"] or 0, "avg_views": r["avg_views"] or 0} for r in rows]}
     except Exception as e:
@@ -1775,34 +2347,46 @@ async def api_tags(hours: int = Query(24, ge=1, le=720)):
         return json_response({"tags": [], "error": str(e)}, 500)
 
 
-# Backward compatibility: /api/tags/24h → /api/tags?hours=24
+# Backward compatibility: /api/tags/24h -> /api/tags?hours=24
 @app.get("/api/tags/24h")
 async def api_tags_24h_compat():
     return await api_tags(hours=24)
 
 
-# ─── Charts API ──────────────────────────────────────────────
+# ─── Charts API (all with channel filter) ────────────────────
 @app.get("/api/charts/tags")
-async def chart_tags(days: int = Query(7, ge=1, le=90)):
+async def chart_tags(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
             since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
                 WITH tagged AS (
-                    SELECT * FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
                 )
                 SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt,
                        SUM(views_count) as total_views, AVG(views_count)::int as avg_views
                 FROM tagged
                 GROUP BY json_array_elements_text(hashtags)
                 ORDER BY cnt DESC LIMIT 50
-            """), {"since": since})
+            """), {"since": since, **ch_params})
             rows = result.mappings().all()
-            total = (await session.execute(select(func.count()).select_from(Post).where(Post.published_at > since))).scalar()
-            avg_reach = int((await session.execute(select(func.avg(Post.views_count)).select_from(Post).where(Post.published_at > since))).scalar() or 0)
+            total = (await session.execute(text(f"""
+                SELECT COUNT(*) FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since {ch_filter}
+            """), {"since": since, **ch_params})).scalar()
+            avg_reach = int((await session.execute(text(f"""
+                SELECT COALESCE(AVG(p.views_count), 0) FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since {ch_filter}
+            """), {"since": since, **ch_params})).scalar() or 0)
             return {"tags": [{"tag": r["hashtag"], "count": r["cnt"], "total_views": r["total_views"] or 0, "avg_views": r["avg_views"] or 0} for r in rows], "total_posts": total, "avg_reach": avg_reach}
     except Exception as e:
         logger.error(f"/charts/tags error: {e}"); traceback.print_exc()
@@ -1810,17 +2394,20 @@ async def chart_tags(days: int = Query(7, ge=1, le=90)):
 
 
 @app.get("/api/charts/activity")
-async def chart_activity(days: int = Query(7, ge=1, le=90)):
+async def chart_activity(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
             since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT EXTRACT(DOW FROM published_at)::int as dow,
-                       EXTRACT(HOUR FROM published_at)::int as hr,
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT EXTRACT(DOW FROM p.published_at)::int as dow,
+                       EXTRACT(HOUR FROM p.published_at)::int as hr,
                        COUNT(*) as cnt
-                FROM posts WHERE published_at > :since
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since {ch_filter}
                 GROUP BY 1, 2 ORDER BY 1, 2
-            """), {"since": since})
+            """), {"since": since, **ch_params})
             hours = [0] * 168
             peak_hour, peak_val = 0, 0
             for r in result.mappings().all():
@@ -1836,22 +2423,25 @@ async def chart_activity(days: int = Query(7, ge=1, le=90)):
 
 
 @app.get("/api/charts/views")
-async def chart_views(days: int = Query(7, ge=1, le=90)):
+async def chart_views(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
             since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
                 SELECT CASE
-                    WHEN views_count < 1000 THEN '0-1K'
-                    WHEN views_count < 5000 THEN '1-5K'
-                    WHEN views_count < 10000 THEN '5-10K'
-                    WHEN views_count < 50000 THEN '10-50K'
-                    WHEN views_count < 100000 THEN '50-100K'
+                    WHEN p.views_count < 1000 THEN '0-1K'
+                    WHEN p.views_count < 5000 THEN '1-5K'
+                    WHEN p.views_count < 10000 THEN '5-10K'
+                    WHEN p.views_count < 50000 THEN '10-50K'
+                    WHEN p.views_count < 100000 THEN '50-100K'
                     ELSE '100K+'
                 END as bucket, COUNT(*) as cnt
-                FROM posts WHERE published_at > :since
-                GROUP BY bucket ORDER BY MIN(views_count)
-            """), {"since": since})
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since {ch_filter}
+                GROUP BY bucket ORDER BY MIN(p.views_count)
+            """), {"since": since, **ch_params})
             rows = result.mappings().all()
             order = ['0-1K', '1-5K', '5-10K', '10-50K', '50-100K', '100K+']
             by_label = {r["bucket"]: r["cnt"] for r in rows}
@@ -1862,33 +2452,39 @@ async def chart_views(days: int = Query(7, ge=1, le=90)):
 
 
 @app.get("/api/charts/timeline")
-async def chart_timeline(days: int = Query(7, ge=1, le=90)):
+async def chart_timeline(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
             since = await get_since(session, timedelta(days=days))
-            # Get top 8 tags
-            top = await session.execute(text("""
+            ch_filter, ch_params = _channel_where_clause(channel)
+            top = await session.execute(text(f"""
                 WITH tagged AS (
-                    SELECT * FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
                 )
                 SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt
                 FROM tagged GROUP BY json_array_elements_text(hashtags)
                 ORDER BY cnt DESC LIMIT 8
-            """), {"since": since})
+            """), {"since": since, **ch_params})
             top_tags = [r["hashtag"] for r in top.mappings().all()]
 
             days_list = [(since + timedelta(days=i)).strftime("%m-%d") for i in range(days+1)]
             tag_series = []
             for tag in top_tags:
-                daily = await session.execute(text("""
-                    SELECT ((published_at AT TIME ZONE 'UTC')::date)::text as d, COUNT(*) as cnt
-                    FROM posts WHERE published_at > :since
-                      AND (hashtags)::jsonb @> (:tag_json)::jsonb
+                daily = await session.execute(text(f"""
+                    SELECT ((p.published_at AT TIME ZONE 'UTC')::date)::text as d, COUNT(*) as cnt
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND (p.hashtags)::jsonb @> (:tag_json)::jsonb
+                      {ch_filter}
                     GROUP BY d ORDER BY d
-                """), {"since": since, "tag_json": f'["{tag}"]'})
+                """), {"since": since, "tag_json": f'["{tag}"]', **ch_params})
                 day_map = {r["d"]: r["cnt"] for r in daily.mappings().all()}
                 series = [day_map.get((since + timedelta(days=i)).strftime("%Y-%m-%d"), 0) for i in range(days+1)]
                 tag_series.append({"tag": tag, "series": series, "labels": days_list})
@@ -1900,23 +2496,27 @@ async def chart_timeline(days: int = Query(7, ge=1, le=90)):
 
 
 @app.get("/api/charts/pairs")
-async def chart_pairs(days: int = Query(7, ge=1, le=90)):
+async def chart_pairs(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
             since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
                 WITH post_tags AS (
-                    SELECT id, json_array_elements_text(hashtags) as tag
-                    FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 1
+                    SELECT p.id, json_array_elements_text(p.hashtags) as tag
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 1
+                      {ch_filter}
                 )
                 SELECT pt1.tag || ' + ' || pt2.tag as pair, COUNT(*) as cnt
                 FROM post_tags pt1
                 JOIN post_tags pt2 ON pt1.id = pt2.id AND pt1.tag < pt2.tag
                 GROUP BY pair ORDER BY cnt DESC LIMIT 20
-            """), {"since": since})
+            """), {"since": since, **ch_params})
             rows = result.mappings().all()
             return {"pairs": [{"pair": r["pair"], "count": r["cnt"]} for r in rows]}
     except Exception as e:
@@ -1924,10 +2524,678 @@ async def chart_pairs(days: int = Query(7, ge=1, le=90)):
         return json_response({"pairs": [], "error": str(e)}, 500)
 
 
+# ─── Analytics API (all with channel filter) ─────────────────
+@app.get("/api/analytics/alltime-tags")
+async def analytics_alltime_tags(limit: int = Query(100, ge=1, le=500), channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                WITH tagged AS (
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
+                )
+                SELECT json_array_elements_text(hashtags) as hashtag,
+                       COUNT(*) as cnt,
+                       SUM(views_count) as total_views,
+                       AVG(views_count)::int as avg_views
+                FROM tagged
+                GROUP BY json_array_elements_text(hashtags)
+                ORDER BY cnt DESC LIMIT :limit
+            """), {"limit": limit, **ch_params})
+            rows = result.mappings().all()
+            return {"tags": [{"tag": r["hashtag"], "count": r["cnt"], "total_views": r["total_views"] or 0, "avg_views": r["avg_views"] or 0} for r in rows]}
+    except Exception as e:
+        logger.error(f"/analytics/alltime-tags error: {e}"); traceback.print_exc()
+        return json_response({"tags": [], "error": str(e)}, 500)
+
+
+@app.get("/api/analytics/trends")
+async def analytics_trends(channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=1))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            # This week
+            this_week = await session.execute(text(f"""
+                WITH tagged AS (
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
+                )
+                SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt
+                FROM tagged GROUP BY json_array_elements_text(hashtags)
+                ORDER BY cnt DESC LIMIT 30
+            """), {"since": since, **ch_params})
+            this_map = {r["hashtag"]: r["cnt"] for r in this_week.mappings().all()}
+
+            # Last week (7-14 days ago)
+            last_since = since - timedelta(days=7)
+            last_week = await session.execute(text(f"""
+                WITH tagged AS (
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :last_since
+                      AND p.published_at <= :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
+                )
+                SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt
+                FROM tagged GROUP BY json_array_elements_text(hashtags)
+            """), {"last_since": last_since, "since": since, **ch_params})
+            last_map = {r["hashtag"]: r["cnt"] for r in last_week.mappings().all()}
+
+            trends = []
+            all_tags = set(list(this_map.keys()) + list(last_map.keys()))
+            for tag in all_tags:
+                this_c = this_map.get(tag, 0)
+                last_c = last_map.get(tag, 0)
+                if this_c + last_c < 3:
+                    continue
+                if last_c == 0:
+                    pct = 100
+                else:
+                    pct = int(((this_c - last_c) / last_c) * 100)
+                trends.append({"tag": tag, "this_week": this_c, "last_week": last_c, "pct": pct})
+            trends.sort(key=lambda x: abs(x["pct"]), reverse=True)
+            return {"trends": trends[:30]}
+    except Exception as e:
+        logger.error(f"/analytics/trends error: {e}"); traceback.print_exc()
+        return json_response({"trends": [], "error": str(e)}, 500)
+
+
+@app.get("/api/analytics/posts-by-tag")
+async def analytics_posts_by_tag(
+    tag: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=50),
+    channel: Optional[str] = Query(None)
+):
+    try:
+        async with async_session() as session:
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT p.telegram_message_id, p.text, p.views_count, p.published_at, c.username as channel_username
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE (p.hashtags)::jsonb @> (:tag_json)::jsonb
+                {ch_filter}
+                ORDER BY p.published_at DESC
+                LIMIT :limit OFFSET :offset
+            """), {"tag_json": f'["{tag}"]', "limit": limit, "offset": (page - 1) * limit, **ch_params})
+            rows = result.mappings().all()
+            return {"posts": [{"id": r["telegram_message_id"], "text": r["text"], "views": r["views_count"] or 0, "published": r["published_at"].isoformat() if r["published_at"] else None, "channel_username": r["channel_username"]} for r in rows]}
+    except Exception as e:
+        logger.error(f"/analytics/posts-by-tag error: {e}"); traceback.print_exc()
+        return json_response({"posts": [], "error": str(e)}, 500)
+
+
+@app.get("/api/analytics/tag-daily")
+async def analytics_tag_daily(tag: str = Query(...), days: int = Query(90, ge=1, le=365), channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT ((p.published_at AT TIME ZONE 'UTC')::date)::text as d, COUNT(*) as cnt
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                  AND (p.hashtags)::jsonb @> (:tag_json)::jsonb
+                  {ch_filter}
+                GROUP BY d ORDER BY d
+            """), {"since": since, "tag_json": f'["{tag}"]', **ch_params})
+            day_map = {r["d"]: r["cnt"] for r in result.mappings().all()}
+
+            labels = []
+            full_dates = []
+            counts = []
+            for i in range(days + 1):
+                dt = since + timedelta(days=i)
+                labels.append(dt.strftime("%m-%d"))
+                full_dates.append(dt.strftime("%Y-%m-%d"))
+                counts.append(day_map.get(dt.strftime("%Y-%m-%d"), 0))
+
+            return {"tag": tag, "days": labels, "full_dates": full_dates, "counts": counts}
+    except Exception as e:
+        logger.error(f"/analytics/tag-daily error: {e}"); traceback.print_exc()
+        return json_response({"tag": tag, "days": [], "counts": [], "error": str(e)}, 500)
+
+
+@app.get("/api/analytics/tag-posts-by-day")
+async def analytics_tag_posts_by_day(tag: str = Query(...), date: str = Query(...), channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT p.telegram_message_id, p.text, p.views_count, p.published_at, c.username as channel_username
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE (p.hashtags)::jsonb @> (:tag_json)::jsonb
+                  AND ((p.published_at AT TIME ZONE 'UTC')::date)::text = :date
+                  {ch_filter}
+                ORDER BY p.published_at DESC
+                LIMIT 50
+            """), {"tag_json": f'["{tag}"]', "date": date, **ch_params})
+            rows = result.mappings().all()
+            return {"posts": [{"id": r["telegram_message_id"], "text": r["text"], "views": r["views_count"] or 0, "published": r["published_at"].isoformat() if r["published_at"] else None, "channel_username": r["channel_username"]} for r in rows]}
+    except Exception as e:
+        logger.error(f"/analytics/tag-posts-by-day error: {e}"); traceback.print_exc()
+        return json_response({"posts": [], "error": str(e)}, 500)
+
+
+@app.get("/api/analytics/export-csv")
+async def analytics_export_csv(channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                WITH tagged AS (
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
+                )
+                SELECT json_array_elements_text(hashtags) as hashtag,
+                       COUNT(*) as cnt,
+                       SUM(views_count) as total_views,
+                       AVG(views_count)::int as avg_views
+                FROM tagged
+                GROUP BY json_array_elements_text(hashtags)
+                ORDER BY cnt DESC
+            """), ch_params)
+            rows = result.mappings().all()
+
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["hashtag", "count", "total_views", "avg_views"])
+            for r in rows:
+                writer.writerow([r["hashtag"], r["cnt"], r["total_views"] or 0, r["avg_views"] or 0])
+
+            return JSONResponse(
+                content={"csv": output.getvalue(), "rows": len(rows)},
+                headers={"Content-Type": "text/csv"}
+            )
+    except Exception as e:
+        logger.error(f"/analytics/export-csv error: {e}"); traceback.print_exc()
+        return json_response({"error": str(e)}, 500)
+
+
+# ─── Stock Price API (MOEX proxy) ────────────────────────────
+@app.get("/api/stock/price")
+async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=365)):
+    try:
+        import urllib.request
+        from datetime import datetime as _dt, timedelta as _td
+        ticker = ticker.upper()
+        till = _dt.now().strftime("%Y-%m-%d")
+        since = (_dt.now() - _td(days=days)).strftime("%Y-%m-%d")
+        moex_url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?from={since}&till={till}&interval=24"
+        req = urllib.request.Request(moex_url, headers={"User-Agent": "tgparser/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        candles = data.get("candles", {}).get("data", [])
+        if not candles:
+            return json_response({"ticker": ticker, "days": [], "closes": [], "error": "No data from MOEX"})
+
+        days_list = []
+        ohlc = []
+        for row in candles:
+            d = _dt.strptime(row[6], "%Y-%m-%d %H:%M:%S").strftime("%m-%d")
+            days_list.append(d)
+            ohlc.append([row[0], row[1], row[3], row[2]])
+
+        return {"ticker": ticker, "days": days_list, "ohlc": ohlc}
+    except Exception as e:
+        logger.error(f"/stock/price error: {e}"); traceback.print_exc()
+        return json_response({"ticker": ticker, "days": [], "ohlc": [], "error": str(e)}, 500)
+
+
+@app.get("/api/stock/intraday")
+async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
+    try:
+        import urllib.request
+        from datetime import datetime as _dt
+        ticker = ticker.upper()
+        moex_url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?from={date}&till={date}&interval=10"
+        req = urllib.request.Request(moex_url, headers={"User-Agent": "tgparser/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+
+        candles = data.get("candles", {}).get("data", [])
+        times = []
+        ohlc = []
+        for row in candles:
+            t = _dt.strptime(row[6], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+            times.append(t)
+            ohlc.append([row[0], row[1], row[3], row[2]])
+
+        return {"ticker": ticker, "date": date, "times": times, "ohlc": ohlc}
+    except Exception as e:
+        logger.error(f"/stock/intraday error: {e}"); traceback.print_exc()
+        return json_response({"ticker": ticker, "date": date, "times": [], "ohlc": [], "error": str(e)}, 500)
+
+
+# ═══════════════════════════════════════════════════════════
+# ═══ Sentiment & Intelligence API (with channel filter) ══
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/sentiment/timeline")
+async def sentiment_timeline(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """Daily sentiment scores: positive / negative / neutral / total"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT
+                    ((p.published_at AT TIME ZONE 'UTC')::date)::text as d,
+                    p.text
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since AND p.text IS NOT NULL AND p.text != ''
+                {ch_filter}
+                ORDER BY d
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            daily = defaultdict(lambda: {"pos": 0, "neg": 0, "neu": 0, "total": 0})
+
+            for r in rows:
+                txt = (r["text"] or "").lower()
+                pos_count = sum(1 for w in SENTIMENT_POSITIVE if w in txt)
+                neg_count = sum(1 for w in SENTIMENT_NEGATIVE if w in txt)
+                day = r["d"]
+                daily[day]["total"] += 1
+                if pos_count > neg_count:
+                    daily[day]["pos"] += 1
+                elif neg_count > pos_count:
+                    daily[day]["neg"] += 1
+                else:
+                    daily[day]["neu"] += 1
+
+            labels = []
+            pos_series = []
+            neg_series = []
+            neu_series = []
+            for i in range(days + 1):
+                dt = since + timedelta(days=i)
+                d_str = dt.strftime("%Y-%m-%d")
+                labels.append(dt.strftime("%m-%d"))
+                pos_series.append(daily[d_str]["pos"])
+                neg_series.append(daily[d_str]["neg"])
+                neu_series.append(daily[d_str]["neu"])
+
+            return {"days": labels, "positive": pos_series, "negative": neg_series, "neutral": neu_series}
+    except Exception as e:
+        logger.error(f"/sentiment/timeline error: {e}"); traceback.print_exc()
+        return json_response({"days": [], "positive": [], "negative": [], "neutral": [], "error": str(e)}, 500)
+
+
+@app.get("/api/sentiment/top-words")
+async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str = Query("positive"), channel: Optional[str] = Query(None)):
+    """Most frequent words from posts with given sentiment"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT p.text FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since AND p.text IS NOT NULL AND p.text != ''
+                {ch_filter}
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            lexicon = SENTIMENT_POSITIVE if sentiment == "positive" else SENTIMENT_NEGATIVE
+            word_counts = {}
+            for r in rows:
+                txt = (r["text"] or "").lower()
+                pos = sum(1 for w in SENTIMENT_POSITIVE if w in txt)
+                neg = sum(1 for w in SENTIMENT_NEGATIVE if w in txt)
+                if sentiment == "positive" and pos > neg:
+                    for w in SENTIMENT_POSITIVE:
+                        if w in txt:
+                            word_counts[w] = word_counts.get(w, 0) + 1
+                elif sentiment == "negative" and neg > pos:
+                    for w in SENTIMENT_NEGATIVE:
+                        if w in txt:
+                            word_counts[w] = word_counts.get(w, 0) + 1
+
+            top = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:30]
+            return {"words": [{"text": w, "count": c} for w, c in top]}
+    except Exception as e:
+        logger.error(f"/sentiment/top-words error: {e}"); traceback.print_exc()
+        return json_response({"words": [], "error": str(e)}, 500)
+
+
+@app.get("/api/velocity/alerts")
+async def velocity_alerts(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """Tickers with anomalous mention growth vs previous period"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            prev_since = since - timedelta(days=days)
+            ch_filter, ch_params = _channel_where_clause(channel)
+
+            curr = await session.execute(text(f"""
+                WITH tagged AS (
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
+                )
+                SELECT json_array_elements_text(hashtags) as tag, COUNT(*) as cnt
+                FROM tagged GROUP BY tag
+            """), {"since": since, **ch_params})
+            curr_map = {r["tag"]: r["cnt"] for r in curr.mappings().all()}
+
+            prev = await session.execute(text(f"""
+                WITH tagged AS (
+                    SELECT p.* FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :prev_since AND p.published_at <= :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 0
+                      {ch_filter}
+                )
+                SELECT json_array_elements_text(hashtags) as tag, COUNT(*) as cnt
+                FROM tagged GROUP BY tag
+            """), {"prev_since": prev_since, "since": since, **ch_params})
+            prev_map = {r["tag"]: r["cnt"] for r in prev.mappings().all()}
+
+            alerts = []
+            all_tags = set(curr_map.keys()) | set(prev_map.keys())
+            for tag in all_tags:
+                c = curr_map.get(tag, 0)
+                p = prev_map.get(tag, 0)
+                if c + p < 3:
+                    continue
+                if p == 0:
+                    pct = 100
+                else:
+                    pct = int(((c - p) / p) * 100)
+                if c > p and pct >= 50:
+                    alerts.append({"tag": tag, "current": c, "previous": p, "pct": pct})
+
+            alerts.sort(key=lambda x: x["pct"], reverse=True)
+            return {"alerts": alerts[:20]}
+    except Exception as e:
+        logger.error(f"/velocity/alerts error: {e}"); traceback.print_exc()
+        return json_response({"alerts": [], "error": str(e)}, 500)
+
+
+@app.get("/api/correlation/matrix")
+async def correlation_matrix(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """Correlation matrix: which tags appear together in same posts"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                WITH post_tags AS (
+                    SELECT p.id, json_array_elements_text(p.hashtags) as tag
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE p.published_at > :since
+                      AND p.hashtags IS NOT NULL
+                      AND json_typeof(p.hashtags) = 'array'
+                      AND json_array_length(p.hashtags) > 1
+                      {ch_filter}
+                )
+                SELECT pt1.tag as tag1, pt2.tag as tag2, COUNT(*) as cnt
+                FROM post_tags pt1
+                JOIN post_tags pt2 ON pt1.id = pt2.id AND pt1.tag < pt2.tag
+                GROUP BY pt1.tag, pt2.tag
+                HAVING COUNT(*) >= 2
+                ORDER BY cnt DESC
+                LIMIT 200
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            all_tags = set()
+            pairs = []
+            for r in rows:
+                all_tags.add(r["tag1"])
+                all_tags.add(r["tag2"])
+                pairs.append({"t1": r["tag1"], "t2": r["tag2"], "count": r["cnt"]})
+
+            tags = sorted(all_tags)[:30]
+            tag_idx = {t: i for i, t in enumerate(tags)}
+            n = len(tags)
+            matrix = [[0] * n for _ in range(n)]
+
+            for p in pairs:
+                if p["t1"] in tag_idx and p["t2"] in tag_idx:
+                    i, j = tag_idx[p["t1"]], tag_idx[p["t2"]]
+                    matrix[i][j] = p["count"]
+                    matrix[j][i] = p["count"]
+
+            return {"tags": tags, "matrix": matrix}
+    except Exception as e:
+        logger.error(f"/correlation/matrix error: {e}"); traceback.print_exc()
+        return json_response({"tags": [], "matrix": [], "error": str(e)}, 500)
+
+
+@app.get("/api/premarket/intel")
+async def premarket_intel(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """Posts segmented by time: pre-market / market hours / after-hours (MOEX: 10:00-18:45 MSK = 07:00-15:45 UTC)"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT
+                    ((p.published_at AT TIME ZONE 'UTC')::date)::text as d,
+                    CASE
+                        WHEN EXTRACT(HOUR FROM p.published_at)::int BETWEEN 7 AND 14
+                             THEN 'market'
+                        WHEN EXTRACT(HOUR FROM p.published_at)::int < 7
+                             THEN 'premarket'
+                        ELSE 'afterhours'
+                    END as segment,
+                    COUNT(*) as cnt,
+                    SUM(p.views_count) as total_views
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                {ch_filter}
+                GROUP BY d, segment
+                ORDER BY d, segment
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            labels = []
+            pre_series = []
+            market_series = []
+            after_series = []
+
+            for i in range(days + 1):
+                dt = since + timedelta(days=i)
+                d_str = dt.strftime("%Y-%m-%d")
+                labels.append(dt.strftime("%m-%d"))
+                day_data = {r["segment"]: r["cnt"] for r in rows if r["d"] == d_str}
+                pre_series.append(day_data.get("premarket", 0))
+                market_series.append(day_data.get("market", 0))
+                after_series.append(day_data.get("afterhours", 0))
+
+            return {"days": labels, "premarket": pre_series, "market": market_series, "afterhours": after_series}
+    except Exception as e:
+        logger.error(f"/premarket/intel error: {e}"); traceback.print_exc()
+        return json_response({"days": [], "premarket": [], "market": [], "afterhours": [], "error": str(e)}, 500)
+
+
+# ═══════════════════════════════════════════════════════════
+# ═══ Viral & Cross-Market API (with channel filter) ══════
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/viral/posts")
+async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, ge=1, le=20), channel: Optional[str] = Query(None)):
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT p.telegram_message_id, p.text, p.views_count, p.forwards_count, p.published_at,
+                       c.username as channel_username
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                {ch_filter}
+                LIMIT 500
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+            posts = sorted(rows, key=lambda r: r["views_count"] or 0, reverse=True)[:limit]
+            return {"posts": [{
+                "id": r["telegram_message_id"],
+                "text": r["text"],
+                "views": r["views_count"] or 0,
+                "forwards": r["forwards_count"] or 0,
+                "published": r["published_at"].isoformat() if r["published_at"] else None,
+                "channel_username": r["channel_username"] or "markettwits",
+            } for r in posts]}
+    except Exception as e:
+        logger.error(f"/viral/posts error: {e}")
+        return json_response({"posts": [], "error": str(e)}, 500)
+
+
+@app.get("/api/sector/rotation")
+async def sector_rotation(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """NO json_array_elements -- fetch hashtags json, parse in Python"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT p.hashtags FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                  AND p.hashtags IS NOT NULL
+                  AND json_typeof(p.hashtags) = 'array'
+                  AND json_array_length(p.hashtags) > 0
+                {ch_filter}
+                LIMIT 3000
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            tag_counter = Counter()
+            for r in rows:
+                for tag in (r["hashtags"] or []):
+                    tag_counter[tag] += 1
+
+            sector_counts = defaultdict(int)
+            for tag, cnt in tag_counter.most_common(100):
+                clean = tag.replace("#", "").upper()
+                sector = TICKER_TO_SECTOR.get(clean, "Other")
+                sector_counts[sector] += cnt
+
+            sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
+            return {
+                "sectors": [{"name": s, "count": c} for s, c in sectors],
+                "total": sum(c for _, c in sectors),
+            }
+    except Exception as e:
+        logger.error(f"/sector/rotation error: {e}")
+        return json_response({"sectors": [], "total": 0, "error": str(e)}, 500)
+
+
+@app.get("/api/wordcloud")
+async def wordcloud_data(days: int = Query(7, ge=1, le=30), limit: int = Query(50, ge=1, le=100), channel: Optional[str] = Query(None)):
+    """NO json_array_elements -- fetch hashtags json, count in Python"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT p.hashtags FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                  AND p.hashtags IS NOT NULL
+                  AND json_typeof(p.hashtags) = 'array'
+                  AND json_array_length(p.hashtags) > 0
+                {ch_filter}
+                LIMIT 3000
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            counter = Counter()
+            for r in rows:
+                for tag in (r["hashtags"] or []):
+                    counter[tag] += 1
+
+            return {"words": [{"text": w, "count": c} for w, c in counter.most_common(limit)]}
+    except Exception as e:
+        logger.error(f"/wordcloud error: {e}")
+        return json_response({"words": [], "error": str(e)}, 500)
+
+
+@app.get("/api/crossmarket/links")
+async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """Fetch recent posts, filter in Python -- no ILIKE on text columns"""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            macro_keywords = ["нефть", "brent", "usd", "доллар", "eur", "рубль", "ставка", "цб", "moex"]
+
+            result = await session.execute(text(f"""
+                SELECT p.telegram_message_id, p.text, p.views_count, p.published_at, p.hashtags,
+                       c.username as channel_username
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                {ch_filter}
+                LIMIT 500
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            ticker_counter = Counter()
+            posts_out = []
+            for r in rows:
+                text_lower = (r["text"] or "").lower()
+                hashtags = r["hashtags"] or []
+                match = False
+                for kw in macro_keywords:
+                    if kw in text_lower or any(kw in (t or "").lower() for t in hashtags):
+                        match = True
+                        break
+                if not match:
+                    continue
+                posts_out.append({
+                    "id": r["telegram_message_id"],
+                    "text": r["text"],
+                    "views": r["views_count"] or 0,
+                    "published": r["published_at"].isoformat() if r["published_at"] else None,
+                    "channel_username": r["channel_username"] or "markettwits",
+                })
+                for tag in hashtags:
+                    ticker_counter[tag] += 1
+
+            posts_out.sort(key=lambda p: p["views"], reverse=True)
+            tickers = [{"tag": t, "count": c} for t, c in ticker_counter.most_common(15)]
+            return {"posts": posts_out[:30], "tickers": tickers}
+    except Exception as e:
+        logger.error(f"/crossmarket/links error: {e}")
+        return json_response({"posts": [], "tickers": [], "error": str(e)}, 500)
+
+
 # ─── RSS Feed ────────────────────────────────────────────────
-# Optional comma-separated list of channel usernames to include.
-# Falls back to single "markettwits" if env not set.
-_RSS_CHANNELS = [c.strip() for c in os.getenv("RSS_CHANNELS", os.getenv("CHANNELS", "markettwits")).split(",") if c.strip()]
+_RSS_CHANNELS = [c.strip() for c in cfg.CHANNELS.split(",") if c.strip()] if hasattr(cfg, 'CHANNELS') and cfg.CHANNELS else ["markettwits"]
 
 
 @app.get("/rss")
@@ -1938,7 +3206,6 @@ async def rss_feed(
     try:
         from email.utils import format_datetime
 
-        # Build channel filter
         requested_channels = None
         if channel:
             requested_channels = [c.strip() for c in channel.split(",") if c.strip()]
@@ -1946,7 +3213,6 @@ async def rss_feed(
             requested_channels = _RSS_CHANNELS
 
         async with async_session() as session:
-            # Build query with optional channel filter
             if requested_channels:
                 placeholders = ", ".join([f":ch{i}" for i in range(len(requested_channels))])
                 channel_filter = f"AND c.username IN ({placeholders})"
@@ -1979,7 +3245,6 @@ async def rss_feed(
                 ch_username = row[3] or "markettwits"
                 ch_title = row[4] or ch_username
 
-                # Escape XML
                 title = body[:100].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 desc = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 link = f"https://t.me/{ch_username}/{msg_id}"
@@ -1993,7 +3258,6 @@ async def rss_feed(
 <source url="https://t.me/{ch_username}">{ch_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")}</source>
 </item>""")
 
-            # Build channel info for RSS header
             if len(requested_channels) == 1:
                 rss_title = requested_channels[0]
                 rss_link = f"https://t.me/{requested_channels[0]}"
@@ -2024,637 +3288,10 @@ async def rss_feed(
         return json_response({"error": str(e)}, 500)
 
 
-# ─── Stock Price API (MOEX proxy) ────────────────────────────
-@app.get("/api/stock/price")
-async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=365)):
-    try:
-        import urllib.request
-        from datetime import datetime, timedelta
-        ticker = ticker.upper()
-        till = datetime.now().strftime("%Y-%m-%d")
-        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        moex_url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?from={since}&till={till}&interval=24"
-        req = urllib.request.Request(moex_url, headers={"User-Agent": "tgparser/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-
-        candles = data.get("candles", {}).get("data", [])
-        if not candles:
-            return json_response({"ticker": ticker, "days": [], "closes": [], "error": "No data from MOEX"})
-
-        days_list = []
-        ohlc = []  # [open, close, low, high] for ECharts candlestick
-        for row in candles:
-            d = datetime.strptime(row[6], "%Y-%m-%d %H:%M:%S").strftime("%m-%d")
-            days_list.append(d)
-            ohlc.append([row[0], row[1], row[3], row[2]])  # [open, close, low, high]
-
-        return {"ticker": ticker, "days": days_list, "ohlc": ohlc}
-    except Exception as e:
-        logger.error(f"/stock/price error: {e}"); traceback.print_exc()
-        return json_response({"ticker": ticker, "days": [], "ohlc": [], "error": str(e)}, 500)
-
-
-@app.get("/api/stock/intraday")
-async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
-    try:
-        import urllib.request
-        from datetime import datetime
-        ticker = ticker.upper()
-        # MOEX: interval=10 = 5-minute candles (MOEX numbering convention)
-        moex_url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?from={date}&till={date}&interval=10"
-        req = urllib.request.Request(moex_url, headers={"User-Agent": "tgparser/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-
-        candles = data.get("candles", {}).get("data", [])
-        times = []
-        ohlc = []
-        for row in candles:
-            t = datetime.strptime(row[6], "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
-            times.append(t)
-            ohlc.append([row[0], row[1], row[3], row[2]])  # [open, close, low, high]
-
-        return {"ticker": ticker, "date": date, "times": times, "ohlc": ohlc}
-    except Exception as e:
-        logger.error(f"/stock/intraday error: {e}"); traceback.print_exc()
-        return json_response({"ticker": ticker, "date": date, "times": [], "ohlc": [], "error": str(e)}, 500)
-
-
-# ─── Analytics API ───────────────────────────────────────────
-@app.get("/api/analytics/alltime-tags")
-async def analytics_alltime_tags(limit: int = Query(100, ge=1, le=500)):
-    try:
-        async with async_session() as session:
-            result = await session.execute(text("""
-                WITH tagged AS (
-                    SELECT * FROM posts
-                    WHERE hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
-                )
-                SELECT json_array_elements_text(hashtags) as hashtag,
-                       COUNT(*) as cnt,
-                       SUM(views_count) as total_views,
-                       AVG(views_count)::int as avg_views
-                FROM tagged
-                GROUP BY json_array_elements_text(hashtags)
-                ORDER BY cnt DESC LIMIT :limit
-            """), {"limit": limit})
-            rows = result.mappings().all()
-            return {"tags": [{"tag": r["hashtag"], "count": r["cnt"], "total_views": r["total_views"] or 0, "avg_views": r["avg_views"] or 0} for r in rows]}
-    except Exception as e:
-        logger.error(f"/analytics/alltime-tags error: {e}"); traceback.print_exc()
-        return json_response({"tags": [], "error": str(e)}, 500)
-
-
-@app.get("/api/analytics/trends")
-async def analytics_trends():
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=1))
-            # This week
-            this_week = await session.execute(text("""
-                WITH tagged AS (
-                    SELECT * FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
-                )
-                SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt
-                FROM tagged GROUP BY json_array_elements_text(hashtags)
-                ORDER BY cnt DESC LIMIT 30
-            """), {"since": since})
-            this_map = {r["hashtag"]: r["cnt"] for r in this_week.mappings().all()}
-
-            # Last week (7-14 days ago)
-            last_since = since - timedelta(days=7)
-            last_week = await session.execute(text("""
-                WITH tagged AS (
-                    SELECT * FROM posts WHERE published_at > :last_since
-                      AND published_at <= :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
-                )
-                SELECT json_array_elements_text(hashtags) as hashtag, COUNT(*) as cnt
-                FROM tagged GROUP BY json_array_elements_text(hashtags)
-            """), {"last_since": last_since, "since": since})
-            last_map = {r["hashtag"]: r["cnt"] for r in last_week.mappings().all()}
-
-            # Calculate trends
-            trends = []
-            all_tags = set(list(this_map.keys()) + list(last_map.keys()))
-            for tag in all_tags:
-                this_c = this_map.get(tag, 0)
-                last_c = last_map.get(tag, 0)
-                if this_c + last_c < 3:
-                    continue
-                if last_c == 0:
-                    pct = 100
-                else:
-                    pct = int(((this_c - last_c) / last_c) * 100)
-                trends.append({"tag": tag, "this_week": this_c, "last_week": last_c, "pct": pct})
-            trends.sort(key=lambda x: abs(x["pct"]), reverse=True)
-            return {"trends": trends[:30]}
-    except Exception as e:
-        logger.error(f"/analytics/trends error: {e}"); traceback.print_exc()
-        return json_response({"trends": [], "error": str(e)}, 500)
-
-
-@app.get("/api/analytics/posts-by-tag")
-async def analytics_posts_by_tag(tag: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=50)):
-    try:
-        async with async_session() as session:
-            result = await session.execute(text("""
-                SELECT telegram_message_id, text, views_count, published_at
-                FROM posts
-                WHERE (hashtags)::jsonb @> (:tag_json)::jsonb
-                ORDER BY published_at DESC
-                LIMIT :limit OFFSET :offset
-            """), {"tag_json": f'["{tag}"]', "limit": limit, "offset": (page - 1) * limit})
-            rows = result.mappings().all()
-            return {"posts": [{"id": r["telegram_message_id"], "text": r["text"], "views": r["views_count"] or 0, "published": r["published_at"].isoformat() if r["published_at"] else None} for r in rows]}
-    except Exception as e:
-        logger.error(f"/analytics/posts-by-tag error: {e}"); traceback.print_exc()
-        return json_response({"posts": [], "error": str(e)}, 500)
-
-
-@app.get("/api/analytics/tag-daily")
-async def analytics_tag_daily(tag: str = Query(...), days: int = Query(90, ge=1, le=365)):
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT ((published_at AT TIME ZONE 'UTC')::date)::text as d, COUNT(*) as cnt
-                FROM posts WHERE published_at > :since
-                  AND (hashtags)::jsonb @> (:tag_json)::jsonb
-                GROUP BY d ORDER BY d
-            """), {"since": since, "tag_json": f'["{tag}"]'})
-            day_map = {r["d"]: r["cnt"] for r in result.mappings().all()}
-
-            labels = []
-            full_dates = []
-            counts = []
-            for i in range(days + 1):
-                dt = since + timedelta(days=i)
-                labels.append(dt.strftime("%m-%d"))
-                full_dates.append(dt.strftime("%Y-%m-%d"))
-                counts.append(day_map.get(dt.strftime("%Y-%m-%d"), 0))
-
-            return {"tag": tag, "days": labels, "full_dates": full_dates, "counts": counts}
-    except Exception as e:
-        logger.error(f"/analytics/tag-daily error: {e}"); traceback.print_exc()
-        return json_response({"tag": tag, "days": [], "counts": [], "error": str(e)}, 500)
-
-
-@app.get("/api/analytics/tag-posts-by-day")
-async def analytics_tag_posts_by_day(tag: str = Query(...), date: str = Query(...)):
-    try:
-        async with async_session() as session:
-            result = await session.execute(text("""
-                SELECT telegram_message_id, text, views_count, published_at
-                FROM posts
-                WHERE (hashtags)::jsonb @> (:tag_json)::jsonb
-                  AND ((published_at AT TIME ZONE 'UTC')::date)::text = :date
-                ORDER BY published_at DESC
-                LIMIT 50
-            """), {"tag_json": f'["{tag}"]', "date": date})
-            rows = result.mappings().all()
-            return {"posts": [{"id": r["telegram_message_id"], "text": r["text"], "views": r["views_count"] or 0, "published": r["published_at"].isoformat() if r["published_at"] else None} for r in rows]}
-    except Exception as e:
-        logger.error(f"/analytics/tag-posts-by-day error: {e}"); traceback.print_exc()
-        return json_response({"posts": [], "error": str(e)}, 500)
-
-
-@app.get("/api/analytics/export-csv")
-async def analytics_export_csv():
-    try:
-        async with async_session() as session:
-            result = await session.execute(text("""
-                WITH tagged AS (
-                    SELECT * FROM posts
-                    WHERE hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
-                )
-                SELECT json_array_elements_text(hashtags) as hashtag,
-                       COUNT(*) as cnt,
-                       SUM(views_count) as total_views,
-                       AVG(views_count)::int as avg_views
-                FROM tagged
-                GROUP BY json_array_elements_text(hashtags)
-                ORDER BY cnt DESC
-            """))
-            rows = result.mappings().all()
-
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(["hashtag", "count", "total_views", "avg_views"])
-            for r in rows:
-                writer.writerow([r["hashtag"], r["cnt"], r["total_views"] or 0, r["avg_views"] or 0])
-
-            return JSONResponse(
-                content={"csv": output.getvalue(), "rows": len(rows)},
-                headers={"Content-Type": "text/csv"}
-            )
-    except Exception as e:
-        logger.error(f"/analytics/export-csv error: {e}"); traceback.print_exc()
-        return json_response({"error": str(e)}, 500)
-
-# ═══════════════════════════════════════════════════════════
-# ═══ NEW: Sentiment & Intelligence API ═══════════════════
-# ═══════════════════════════════════════════════════════════
-
-@app.get("/api/sentiment/timeline")
-async def sentiment_timeline(days: int = Query(7, ge=1, le=30)):
-    """Daily sentiment scores: positive / negative / neutral / total"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT
-                    ((published_at AT TIME ZONE 'UTC')::date)::text as d,
-                    text
-                FROM posts
-                WHERE published_at > :since AND text IS NOT NULL AND text != ''
-                ORDER BY d
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            from collections import defaultdict
-            daily = defaultdict(lambda: {"pos": 0, "neg": 0, "neu": 0, "total": 0})
-
-            for r in rows:
-                txt = (r["text"] or "").lower()
-                pos_count = sum(1 for w in SENTIMENT_POSITIVE if w in txt)
-                neg_count = sum(1 for w in SENTIMENT_NEGATIVE if w in txt)
-                day = r["d"]
-                daily[day]["total"] += 1
-                if pos_count > neg_count:
-                    daily[day]["pos"] += 1
-                elif neg_count > pos_count:
-                    daily[day]["neg"] += 1
-                else:
-                    daily[day]["neu"] += 1
-
-            labels = []
-            pos_series = []
-            neg_series = []
-            neu_series = []
-            for i in range(days + 1):
-                dt = since + timedelta(days=i)
-                d_str = dt.strftime("%Y-%m-%d")
-                labels.append(dt.strftime("%m-%d"))
-                pos_series.append(daily[d_str]["pos"])
-                neg_series.append(daily[d_str]["neg"])
-                neu_series.append(daily[d_str]["neu"])
-
-            return {
-                "days": labels,
-                "positive": pos_series,
-                "negative": neg_series,
-                "neutral": neu_series,
-            }
-    except Exception as e:
-        logger.error(f"/sentiment/timeline error: {e}"); traceback.print_exc()
-        return json_response({"days": [], "positive": [], "negative": [], "neutral": [], "error": str(e)}, 500)
-
-
-@app.get("/api/sentiment/top-words")
-async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str = Query("positive")):
-    """Most frequent words from posts with given sentiment"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT text FROM posts
-                WHERE published_at > :since AND text IS NOT NULL AND text != ''
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            lexicon = SENTIMENT_POSITIVE if sentiment == "positive" else SENTIMENT_NEGATIVE
-            word_counts = {}
-            for r in rows:
-                txt = (r["text"] or "").lower()
-                pos = sum(1 for w in SENTIMENT_POSITIVE if w in txt)
-                neg = sum(1 for w in SENTIMENT_NEGATIVE if w in txt)
-                if sentiment == "positive" and pos > neg:
-                    for w in SENTIMENT_POSITIVE:
-                        if w in txt:
-                            word_counts[w] = word_counts.get(w, 0) + 1
-                elif sentiment == "negative" and neg > pos:
-                    for w in SENTIMENT_NEGATIVE:
-                        if w in txt:
-                            word_counts[w] = word_counts.get(w, 0) + 1
-
-            top = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)[:30]
-            return {"words": [{"text": w, "count": c} for w, c in top]}
-    except Exception as e:
-        logger.error(f"/sentiment/top-words error: {e}"); traceback.print_exc()
-        return json_response({"words": [], "error": str(e)}, 500)
-
-
-@app.get("/api/velocity/alerts")
-async def velocity_alerts(days: int = Query(7, ge=1, le=30)):
-    """Tickers with anomalous mention growth vs previous period"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            prev_since = since - timedelta(days=days)
-
-            # Current period mentions
-            curr = await session.execute(text("""
-                WITH tagged AS (
-                    SELECT * FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
-                )
-                SELECT json_array_elements_text(hashtags) as tag, COUNT(*) as cnt
-                FROM tagged GROUP BY tag
-            """), {"since": since})
-            curr_map = {r["tag"]: r["cnt"] for r in curr.mappings().all()}
-
-            # Previous period mentions
-            prev = await session.execute(text("""
-                WITH tagged AS (
-                    SELECT * FROM posts
-                    WHERE published_at > :prev_since AND published_at <= :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 0
-                )
-                SELECT json_array_elements_text(hashtags) as tag, COUNT(*) as cnt
-                FROM tagged GROUP BY tag
-            """), {"prev_since": prev_since, "since": since})
-            prev_map = {r["tag"]: r["cnt"] for r in prev.mappings().all()}
-
-            alerts = []
-            all_tags = set(curr_map.keys()) | set(prev_map.keys())
-            for tag in all_tags:
-                c = curr_map.get(tag, 0)
-                p = prev_map.get(tag, 0)
-                if c + p < 3:
-                    continue
-                if p == 0:
-                    pct = 100
-                else:
-                    pct = int(((c - p) / p) * 100)
-                if c > p and pct >= 50:  # Only positive anomalies
-                    alerts.append({"tag": tag, "current": c, "previous": p, "pct": pct})
-
-            alerts.sort(key=lambda x: x["pct"], reverse=True)
-            return {"alerts": alerts[:20]}
-    except Exception as e:
-        logger.error(f"/velocity/alerts error: {e}"); traceback.print_exc()
-        return json_response({"alerts": [], "error": str(e)}, 500)
-
-
-@app.get("/api/correlation/matrix")
-async def correlation_matrix(days: int = Query(7, ge=1, le=30)):
-    """Correlation matrix: which tags appear together in same posts"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                WITH post_tags AS (
-                    SELECT id, json_array_elements_text(hashtags) as tag
-                    FROM posts WHERE published_at > :since
-                      AND hashtags IS NOT NULL
-                      AND json_typeof(hashtags) = 'array'
-                      AND json_array_length(hashtags) > 1
-                )
-                SELECT pt1.tag as tag1, pt2.tag as tag2, COUNT(*) as cnt
-                FROM post_tags pt1
-                JOIN post_tags pt2 ON pt1.id = pt2.id AND pt1.tag < pt2.tag
-                GROUP BY pt1.tag, pt2.tag
-                HAVING COUNT(*) >= 2
-                ORDER BY cnt DESC
-                LIMIT 200
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            # Collect unique tags
-            all_tags = set()
-            pairs = []
-            for r in rows:
-                all_tags.add(r["tag1"])
-                all_tags.add(r["tag2"])
-                pairs.append({"t1": r["tag1"], "t2": r["tag2"], "count": r["cnt"]})
-
-            tags = sorted(all_tags)[:30]  # Limit for display
-            tag_idx = {t: i for i, t in enumerate(tags)}
-            n = len(tags)
-            matrix = [[0] * n for _ in range(n)]
-
-            for p in pairs:
-                if p["t1"] in tag_idx and p["t2"] in tag_idx:
-                    i, j = tag_idx[p["t1"]], tag_idx[p["t2"]]
-                    matrix[i][j] = p["count"]
-                    matrix[j][i] = p["count"]
-
-            return {"tags": tags, "matrix": matrix}
-    except Exception as e:
-        logger.error(f"/correlation/matrix error: {e}"); traceback.print_exc()
-        return json_response({"tags": [], "matrix": [], "error": str(e)}, 500)
-
-
-@app.get("/api/premarket/intel")
-async def premarket_intel(days: int = Query(7, ge=1, le=30)):
-    """Posts segmented by time: pre-market / market hours / after-hours (MOEX: 10:00-18:45 MSK = 07:00-15:45 UTC)"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT
-                    ((published_at AT TIME ZONE 'UTC')::date)::text as d,
-                    CASE
-                        WHEN EXTRACT(HOUR FROM published_at)::int BETWEEN 7 AND 14
-                             THEN 'market'
-                        WHEN EXTRACT(HOUR FROM published_at)::int < 7
-                             THEN 'premarket'
-                        ELSE 'afterhours'
-                    END as segment,
-                    COUNT(*) as cnt,
-                    SUM(views_count) as total_views
-                FROM posts
-                WHERE published_at > :since
-                GROUP BY d, segment
-                ORDER BY d, segment
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            labels = []
-            pre_series = []
-            market_series = []
-            after_series = []
-
-            for i in range(days + 1):
-                dt = since + timedelta(days=i)
-                d_str = dt.strftime("%Y-%m-%d")
-                labels.append(dt.strftime("%m-%d"))
-                day_data = {r["segment"]: r["cnt"] for r in rows if r["d"] == d_str}
-                pre_series.append(day_data.get("premarket", 0))
-                market_series.append(day_data.get("market", 0))
-                after_series.append(day_data.get("afterhours", 0))
-
-            return {
-                "days": labels,
-                "premarket": pre_series,
-                "market": market_series,
-                "afterhours": after_series,
-            }
-    except Exception as e:
-        logger.error(f"/premarket/intel error: {e}"); traceback.print_exc()
-        return json_response({"days": [], "premarket": [], "market": [], "afterhours": [], "error": str(e)}, 500)
-
-
-# ═══════════════════════════════════════════════════════════
-# ═══ Viral & Cross-Market API (NO json_array_elements!) ══
-# ═══════════════════════════════════════════════════════════
-
-@app.get("/api/viral/posts")
-async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, ge=1, le=20)):
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            # Use indexed published_at filter, skip ORDER BY views_count (no index)
-            # Instead: fetch recent posts, sort in Python
-            result = await session.execute(text("""
-                SELECT telegram_message_id, text, views_count, forwards_count, published_at
-                FROM posts
-                WHERE published_at > :since
-                LIMIT 500
-            """), {"since": since})
-            rows = result.mappings().all()
-            # Sort in Python
-            posts = sorted(rows, key=lambda r: r["views_count"] or 0, reverse=True)[:limit]
-            return {"posts": [{
-                "id": r["telegram_message_id"],
-                "text": r["text"],
-                "views": r["views_count"] or 0,
-                "forwards": r["forwards_count"] or 0,
-                "published": r["published_at"].isoformat() if r["published_at"] else None,
-                "channel": "markettwits",
-            } for r in posts]}
-    except Exception as e:
-        logger.error(f"/viral/posts error: {e}")
-        return json_response({"posts": [], "error": str(e)}, 500)
-
-
-@app.get("/api/sector/rotation")
-async def sector_rotation(days: int = Query(7, ge=1, le=30)):
-    """NO json_array_elements — fetch hashtags json, parse in Python"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT hashtags FROM posts
-                WHERE published_at > :since
-                  AND hashtags IS NOT NULL
-                  AND json_typeof(hashtags) = 'array'
-                  AND json_array_length(hashtags) > 0
-                LIMIT 3000
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            from collections import defaultdict, Counter
-            tag_counter = Counter()
-            for r in rows:
-                for tag in (r["hashtags"] or []):
-                    tag_counter[tag] += 1
-
-            sector_counts = defaultdict(int)
-            for tag, cnt in tag_counter.most_common(100):
-                clean = tag.replace("#", "").upper()
-                sector = TICKER_TO_SECTOR.get(clean, "Other")
-                sector_counts[sector] += cnt
-
-            sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
-            return {
-                "sectors": [{"name": s, "count": c} for s, c in sectors],
-                "total": sum(c for _, c in sectors),
-            }
-    except Exception as e:
-        logger.error(f"/sector/rotation error: {e}")
-        return json_response({"sectors": [], "total": 0, "error": str(e)}, 500)
-
-
-@app.get("/api/wordcloud")
-async def wordcloud_data(days: int = Query(7, ge=1, le=30), limit: int = Query(50, ge=1, le=100)):
-    """NO json_array_elements — fetch hashtags json, count in Python"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            result = await session.execute(text("""
-                SELECT hashtags FROM posts
-                WHERE published_at > :since
-                  AND hashtags IS NOT NULL
-                  AND json_typeof(hashtags) = 'array'
-                  AND json_array_length(hashtags) > 0
-                LIMIT 3000
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            from collections import Counter
-            counter = Counter()
-            for r in rows:
-                for tag in (r["hashtags"] or []):
-                    counter[tag] += 1
-
-            return {"words": [{"text": w, "count": c} for w, c in counter.most_common(limit)]}
-    except Exception as e:
-        logger.error(f"/wordcloud error: {e}")
-        return json_response({"words": [], "error": str(e)}, 500)
-
-
-@app.get("/api/crossmarket/links")
-async def crossmarket_links(days: int = Query(7, ge=1, le=30)):
-    """Fetch recent posts, filter in Python — no ILIKE on text columns"""
-    try:
-        async with async_session() as session:
-            since = await get_since(session, timedelta(days=days))
-            macro_keywords = ["нефть", "brent", "usd", "доллар", "eur", "рубль", "ставка", "цб", "moex"]
-
-            # Simple fetch by date — Python filtering
-            result = await session.execute(text("""
-                SELECT telegram_message_id, text, views_count, published_at, hashtags
-                FROM posts
-                WHERE published_at > :since
-                LIMIT 500
-            """), {"since": since})
-            rows = result.mappings().all()
-
-            from collections import Counter
-            ticker_counter = Counter()
-            posts_out = []
-            for r in rows:
-                text_lower = (r["text"] or "").lower()
-                hashtags = r["hashtags"] or []
-                # Check if post mentions macro keywords
-                match = False
-                for kw in macro_keywords:
-                    if kw in text_lower or any(kw in (t or "").lower() for t in hashtags):
-                        match = True
-                        break
-                if not match:
-                    continue
-                posts_out.append({
-                    "id": r["telegram_message_id"],
-                    "text": r["text"],
-                    "views": r["views_count"] or 0,
-                    "published": r["published_at"].isoformat() if r["published_at"] else None,
-                    "channel": "markettwits",
-                })
-                for tag in hashtags:
-                    ticker_counter[tag] += 1
-
-            # Sort by views in Python
-            posts_out.sort(key=lambda p: p["views"], reverse=True)
-            tickers = [{"tag": t, "count": c} for t, c in ticker_counter.most_common(15)]
-            return {"posts": posts_out[:30], "tickers": tickers}
-    except Exception as e:
-        logger.error(f"/crossmarket/links error: {e}")
-        return json_response({"posts": [], "tickers": [], "error": str(e)}, 500)
-
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("web:app", host="0.0.0.0", port=cfg.PORT, reload=False)

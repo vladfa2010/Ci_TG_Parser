@@ -1,127 +1,170 @@
-#!/usr/bin/env python3
-"""Retroactively extract hashtags. SQL fixed for JSON column."""
-import json, os, re, sys
-from datetime import datetime, timezone
+"""
+Ретроактивное извлечение хэштегов из существующих постов.
+
+Сканирует таблицу posts, находит записи с пустыми или невалидными hashtags,
+извлекает хэштеги вида #\S+ из текста поста и обновляет поле hashtags.
+
+Использование:
+    python fix_hashtags.py           # с подтверждением
+    python fix_hashtags.py --yes     # без подтверждения
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from collections.abc import Sequence
+
 from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-SYNC_URL = DATABASE_URL.replace("+asyncpg", "")
+from config import settings
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 HASHTAG_RE = re.compile(r"#\S+")
 BATCH_SIZE = 500
 
-def extract_hashtags(text):
-    return HASHTAG_RE.findall(text) if text else []
+engine = create_engine(settings.database_url_sync)
 
-def get_stats(conn):
-    total = conn.execute(text("SELECT COUNT(*) FROM posts")).scalar()
-    # FIXED: use ::text cast for JSON comparison
-    empty = conn.execute(text("""
-        SELECT COUNT(*) FROM posts
-        WHERE hashtags IS NULL
-           OR hashtags::text = '[]'
-           OR json_typeof(hashtags) != 'array'
-    """)).scalar()
-    tagged = conn.execute(text("""
-        SELECT COUNT(*) FROM posts
-        WHERE json_typeof(hashtags) = 'array'
-          AND json_array_length(hashtags) > 0
-    """)).scalar()
-    sample = conn.execute(text("""
-        SELECT telegram_message_id, LEFT(text, 60), hashtags::text
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def extract_hashtags(text: str | None) -> list[str]:
+    """Извлекает хэштеги из текста поста."""
+    if not text:
+        return []
+    return HASHTAG_RE.findall(text)
+
+
+def find_posts_needing_fix() -> Sequence:
+    """Находит посты с пустыми или невалидными hashtags."""
+    stmt = text("""
+        SELECT id, text, hashtags
         FROM posts
-        WHERE hashtags::text = '[]'
-          AND text LIKE '%#%'
-        LIMIT 5
-    """)).fetchall()
-    return {"total": total, "empty": empty, "tagged": tagged, "sample": sample}
-
-def process_batch(conn, rows):
-    updated = 0
-    skipped = 0
-    for row in rows:
-        post_id, text_content = row[0], row[1] or ""
-        new_tags = extract_hashtags(text_content)
-        if not new_tags:
-            skipped += 1
-            continue
-        conn.execute(
-            text("UPDATE posts SET hashtags = :tags WHERE id = :id"),
-            {"tags": json.dumps(new_tags), "id": post_id},
-        )
-        updated += 1
-    return updated, skipped
-
-def main():
-    if not SYNC_URL:
-        print("ERROR: DATABASE_URL not set"); sys.exit(1)
-
-    print("=" * 60)
-    print("HASHTAG RETROACTIVE FIX")
-    print("=" * 60)
-    print(f"DB: {SYNC_URL.split('@')[-1] if '@' in SYNC_URL else 'local'}")
-    print()
-
-    engine = create_engine(SYNC_URL)
+        WHERE text IS NOT NULL
+          AND (
+              hashtags IS NULL
+              OR hashtags = 'null'
+              OR hashtags = '[]'
+              OR hashtags::text = '[]'
+          )
+        ORDER BY id
+    """)
     with engine.connect() as conn:
-        print("--- BEFORE ---")
-        before = get_stats(conn)
-        print(f"  Total posts:     {before['total']}")
-        print(f"  Empty hashtags:  {before['empty']}")
-        print(f"  Tagged posts:    {before['tagged']}")
+        return conn.execute(stmt).mappings().all()
+
+
+def find_mismatched_hashtags() -> Sequence:
+    """Находит посты, у которых hashtags не соответствует тексту (есть # в тексте, но нет в hashtags)."""
+    stmt = text("""
+        SELECT id, text, hashtags
+        FROM posts
+        WHERE text IS NOT NULL
+          AND text LIKE '%#%'
+          AND (
+              hashtags IS NULL
+              OR hashtags = '[]'
+              OR jsonb_array_length(hashtags::jsonb) = 0
+          )
+        ORDER BY id
+    """)
+    with engine.connect() as conn:
+        return conn.execute(stmt).mappings().all()
+
+
+def update_post_hashtags(post_id: int, hashtags: list[str]) -> None:
+    """Обновляет поле hashtags для конкретного поста."""
+    stmt = text("""
+        UPDATE posts
+        SET hashtags = :hashtags
+        WHERE id = :post_id
+    """)
+    with engine.begin() as conn:
+        conn.execute(stmt, {"hashtags": hashtags, "post_id": post_id})
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def scan_and_fix(*, auto_confirm: bool = False) -> tuple[int, int]:
+    """Сканирует посты и извлекает хэштеги.
+
+    Returns:
+        (processed_count, updated_count)
+    """
+    posts = find_mismatched_hashtags()
+    total = len(posts)
+    print(f"Найдено постов для обработки: {total}")
+
+    if total == 0:
+        print("Все хэштеги на месте. Исправлений не требуется.")
+        return 0, 0
+
+    # Preview first 5
+    preview = posts[:5]
+    print("\n--- Примера ---")
+    for row in preview:
+        tags = extract_hashtags(row["text"])
+        txt = (row["text"] or "")[:80].replace("\n", " ")
+        print(f"  [id={row['id']}] теги: {tags}")
+        print(f"    текст: {txt}...")
+    if total > 5:
+        print(f"  ... и ещё {total - 5} постов")
+
+    # Confirmation
+    if not auto_confirm:
         print()
+        answer = input(f"Обновить хэштеги для {total} постов? [y/N]: ").strip().lower()
+        if answer not in ("y", "yes", "д", "да"):
+            print("Отменено.")
+            return 0, 0
 
-        if before["sample"]:
-            print("  Sample posts with #text but [] hashtags:")
-            for row in before["sample"]:
-                print(f"    ID {row[0]}: {row[1]}... | tags={row[2]}")
-            print()
+    # Process in batches
+    processed = 0
+    updated = 0
+    batch_count = 0
 
-        if before["empty"] == 0:
-            print("No posts to fix. Exiting."); return
+    for row in posts:
+        tags = extract_hashtags(row["text"])
+        processed += 1
+        if tags:
+            update_post_hashtags(row["id"], tags)
+            updated += 1
 
-        confirm = input(f"Fix {before['empty']} posts? [y/N]: ").strip().lower()
-        if confirm != "y":
-            print("Aborted."); return
+        if processed % BATCH_SIZE == 0:
+            batch_count += 1
+            print(f"  ... обработано {processed}/{total} (обновлено {updated})")
 
-        print("\nProcessing...")
-        total_updated = 0
-        total_skipped = 0
-        offset = 0
+    print(f"\nГотово: обработано {processed}, обновлено {updated} постов.")
+    return processed, updated
 
-        while True:
-            rows = conn.execute(text("""
-                SELECT id, text
-                FROM posts
-                WHERE hashtags IS NULL
-                   OR hashtags::text = '[]'
-                   OR json_typeof(hashtags) != 'array'
-                ORDER BY id
-                LIMIT :limit OFFSET :offset
-            """), {"limit": BATCH_SIZE, "offset": offset}).fetchall()
 
-            if not rows:
-                break
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-            updated, skipped = process_batch(conn, rows)
-            conn.commit()
-            total_updated += updated
-            total_skipped += skipped
-            offset += len(rows)
-            print(f"  Batch: +{updated} fixed, {skipped} no-tags, total: {offset}")
+def usage() -> None:
+    print("Использование: python fix_hashtags.py [--yes]")
+    print("  --yes    пропустить подтверждение")
 
-        print("\n--- AFTER ---")
-        after = get_stats(conn)
-        print(f"  Total posts:     {after['total']}")
-        print(f"  Empty hashtags:  {after['empty']}")
-        print(f"  Tagged posts:    {after['tagged']}")
-        print(f"\nPosts fixed: {total_updated}")
-        print(f"Posts still empty (no # in text): {total_skipped}")
-        print("\nDone!")
+
+def main() -> None:
+    auto_confirm = "--yes" in sys.argv[1:]
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        usage()
+        sys.exit(0)
+
+    print("=" * 50)
+    print("Ретроактивное извлечение хэштегов")
+    print("=" * 50)
+
+    scan_and_fix(auto_confirm=auto_confirm)
+
 
 if __name__ == "__main__":
-    start = datetime.now(timezone.utc)
     main()
-    print(f"Time: {(datetime.now(timezone.utc) - start).total_seconds():.1f}s")

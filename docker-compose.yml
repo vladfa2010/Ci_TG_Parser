@@ -1,61 +1,135 @@
-version: "3.8"
+# =============================================
+# tgparser_v2 — Docker Compose
+# Services:
+#   postgres   — PostgreSQL 16 database
+#   parser     — single-run Telegram parser
+#   scheduler  — periodic parser (cron-like)
+#   web        — FastAPI dashboard
+#   init       — one-time database initialization
+# =============================================
 
 services:
-  # ─── PostgreSQL ──────────────────────────────────────────
+
+  # --- PostgreSQL Database ---
   postgres:
     image: postgres:16-alpine
-    container_name: mt_postgres
+    container_name: tgparser_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: tgparser
       POSTGRES_PASSWORD: tgparser_secret
       POSTGRES_DB: tgparser
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tgparser -d tgparser"]
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 10s
+    ports:
+      - "5432:5432"
+    networks:
+      - tgparser_network
 
-  # ─── Parser (одиночный запуск) ──────────────────────────
+  # --- Single-Run Parser ---
   parser:
-    build: .
-    container_name: mt_parser
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgparser_parser
     environment:
       TG_API_ID: ${TG_API_ID}
       TG_API_HASH: ${TG_API_HASH}
-      TG_SESSION: /app/sessions/markettwits_session
-      DATABASE_URL: postgresql+asyncpg://tgparser:tgparser_secret@postgres/tgparser
-      # История целиком при первом запуске: HISTORY=1
-      HISTORY: ${HISTORY:-0}
-      # Лимит постов (None = все)
-      LIMIT: ${LIMIT:-}
+      TG_SESSION: ${TG_SESSION:-session}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tgparser:tgparser_secret@postgres:5432/tgparser}
+      HISTORY: ${HISTORY:-24}
+      LIMIT: ${LIMIT:-100}
+      CHANNELS: ${CHANNELS}
     volumes:
       - ./sessions:/app/sessions
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - tgparser_network
 
-  # ─── Scheduler (периодический парсинг каждые 5 мин) ─────
+  # --- Periodic Scheduler (cron-like) ---
   scheduler:
-    build: .
-    container_name: mt_scheduler
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgparser_scheduler
+    restart: unless-stopped
     environment:
+      APP_MODE: "scheduler"
+      SCHEDULE_MODE: "1"
+      INTERVAL_SEC: ${INTERVAL_SEC:-300}
+      CHANNELS: ${CHANNELS}
       TG_API_ID: ${TG_API_ID}
       TG_API_HASH: ${TG_API_HASH}
-      TG_SESSION: /app/sessions/markettwits_session
-      DATABASE_URL: postgresql+asyncpg://tgparser:tgparser_secret@postgres/tgparser
-      SCHEDULE_MODE: "1"
-      INTERVAL_SEC: "300"  # 5 минут
+      TG_SESSION: ${TG_SESSION:-session}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tgparser:tgparser_secret@postgres:5432/tgparser}
+      HISTORY: ${HISTORY:-24}
+      LIMIT: ${LIMIT:-100}
     volumes:
       - ./sessions:/app/sessions
     depends_on:
       postgres:
         condition: service_healthy
     profiles:
-      - scheduler  # docker compose --profile scheduler up
+      - scheduler
+    networks:
+      - tgparser_network
 
+  # --- Web Dashboard (FastAPI) ---
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgparser_web
+    restart: unless-stopped
+    environment:
+      APP_MODE: web
+      PORT: 8000
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tgparser:tgparser_secret@postgres:5432/tgparser}
+    ports:
+      - "8000:8000"
+    command: uvicorn web:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      - postgres
+    networks:
+      - tgparser_network
+
+  # --- Database Initialization (one-time) ---
+  init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tgparser_init
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://tgparser:tgparser_secret@postgres:5432/tgparser}
+    command: >
+      python -c "
+      import asyncio;
+      from parser import MultiChannelParser;
+      p = MultiChannelParser();
+      asyncio.run(p.init_db())
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - init
+    networks:
+      - tgparser_network
+
+# --- Named Volumes ---
 volumes:
   postgres_data:
+    driver: local
+
+# --- Networks ---
+networks:
+  tgparser_network:
+    driver: bridge

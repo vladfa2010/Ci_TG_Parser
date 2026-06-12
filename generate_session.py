@@ -1,28 +1,34 @@
-#!/usr/bin/env python3
 """
-Generate a string session for Telethon.
-Run this ONCE locally, then save the output to TG_STRING_SESSION env var.
+Генератор строковой сессии Telethon.
+
+Запуск:
+    python generate_session.py
+
+Выводит строку сессии, которую нужно сохранить в .env как TG_STRING_SESSION.
 """
+
+from __future__ import annotations
+
 import asyncio
-import os
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-API_ID = int(os.getenv("TG_API_ID", input("Enter API_ID: ")))
-API_HASH = os.getenv("TG_API_HASH", input("Enter API_HASH: "))
+from config import settings
 
 
-async def main():
-    async with TelegramClient(StringSession(), API_ID, API_HASH) as client:
-        # Will prompt for phone + code
-        session_string = client.session.save()
-        print("\n" + "=" * 60)
-        print("YOUR STRING SESSION (save it securely):")
-        print("=" * 60)
-        print(session_string)
-        print("=" * 60)
-        print("\nSet it as TG_STRING_SESSION environment variable on Render.")
+async def main() -> None:
+    """Создаёт клиент, авторизуется и выводит строку сессии."""
+    client = TelegramClient(
+        StringSession(),
+        settings.TG_API_ID,
+        settings.TG_API_HASH,
+    )
+    await client.start()
+    session_string = client.session.save()
+    print(f"\n=== STRING SESSION ===\n{session_string}\n======================")
+    print("Сохраните её в .env как TG_STRING_SESSION=<строка>")
+    await client.disconnect()
 
 
 if __name__ == "__main__":
