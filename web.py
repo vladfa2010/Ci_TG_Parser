@@ -242,18 +242,33 @@ def _channel_where_clause(channel: Optional[str]) -> tuple[str, dict]:
     return "", {}
 
 
-# ─── Authentication ──────────────────────────────────────────
+# ─── Universal Authentication ────────────────────────────────
+# Tries cookie session first (browser), then Basic Auth (curl/API)
+
 security = HTTPBasic(auto_error=False)
 
-async def api_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    async with async_session() as session:
-        result = await session.execute(select(User).where(User.username == credentials.username))
-        user = result.scalar_one_or_none()
-        if not user or not user.is_active or not user.check_password(credentials.password):
-            raise HTTPException(status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
+async def _get_auth_user(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(security),
+) -> str:
+    """Universal auth: cookie session (browser) OR Basic Auth (curl/API)."""
+    # 1. Try cookie session (for logged-in browser users doing AJAX)
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        user = _verify_session(token)
+        if user:
+            return user
+
+    # 2. Try HTTP Basic Auth (for curl/external clients)
+    if credentials:
+        async with async_session() as session:
+            result = await session.execute(select(User).where(User.username == credentials.username))
+            user = result.scalar_one_or_none()
+            if user and user.is_active and user.check_password(credentials.password):
+                return credentials.username
+
+    # 3. Unauthorized
+    raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
 
 
 async def get_since(session, delta):
@@ -2414,7 +2429,7 @@ async def crosschannel_page():
 # ═══════════════════════════════════════════════════════════════
 
 # ─── API: Channels list (v2) ─────────────────────────────────
-@app.get("/api/channels", dependencies=[Depends(api_auth)])
+@app.get("/api/channels", dependencies=[Depends(_get_auth_user)])
 async def api_channels():
     """Return all channels with computed metrics."""
     try:
@@ -2462,7 +2477,7 @@ async def api_channels():
 
 
 # ─── API: Debug routes (diagnostic) ──────────────────────────
-@app.get("/api/debug/routes", dependencies=[Depends(api_auth)])
+@app.get("/api/debug/routes", dependencies=[Depends(_get_auth_user)])
 async def api_debug_routes():
     """Return all registered API routes for debugging."""
     routes = []
@@ -2473,13 +2488,13 @@ async def api_debug_routes():
 
 
 # ─── API: Test endpoint ──────────────────────────────────────
-@app.get("/api/test", dependencies=[Depends(api_auth)])
+@app.get("/api/test", dependencies=[Depends(_get_auth_user)])
 async def api_test():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 
 # ─── API: Add channel ────────────────────────────────────────
-@app.get("/api/channel/add", dependencies=[Depends(api_auth)])
+@app.get("/api/channel/add", dependencies=[Depends(_get_auth_user)])
 async def api_channel_add(identifier: str = Query(..., description="Username, numeric ID или ссылка на канал")):
     """Добавляет новый канал в БД и синхронизирует его метаданные.
 
@@ -2572,7 +2587,7 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
 
 
 # ─── API: Toggle channel active ──────────────────────────────
-@app.get("/api/channel/toggle/{channel_id}", dependencies=[Depends(api_auth)])
+@app.get("/api/channel/toggle/{channel_id}", dependencies=[Depends(_get_auth_user)])
 async def api_channels_toggle(channel_id: int):
     """Включает/выключает канал (is_active)."""
     try:
@@ -2596,7 +2611,7 @@ async def api_channels_toggle(channel_id: int):
 
 
 # ─── API: Delete channel ─────────────────────────────────────
-@app.delete("/api/channel/delete/{channel_id}", dependencies=[Depends(api_auth)])
+@app.delete("/api/channel/delete/{channel_id}", dependencies=[Depends(_get_auth_user)])
 async def api_channels_delete(channel_id: int):
     """Удаляет канал и все его посты из БД."""
     try:
@@ -2617,7 +2632,7 @@ async def api_channels_delete(channel_id: int):
 
 
 # ─── API: Cross-Channel comparison (v2) ──────────────────────
-@app.get("/api/channels/comparison", dependencies=[Depends(api_auth)])
+@app.get("/api/channels/comparison", dependencies=[Depends(_get_auth_user)])
 async def api_channels_comparison(days: int = Query(7, ge=1, le=90)):
     """Compare channels by activity: posts, views, timeline."""
     try:
@@ -2686,7 +2701,7 @@ async def api_channels_comparison(days: int = Query(7, ge=1, le=90)):
 
 
 # ─── API: Stats (with optional channel filter) ───────────────
-@app.get("/api/stats", dependencies=[Depends(api_auth)])
+@app.get("/api/stats", dependencies=[Depends(_get_auth_user)])
 async def api_stats(channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2743,7 +2758,7 @@ async def api_stats(channel: Optional[str] = Query(None)):
 
 
 # ─── API: Posts (with optional channel filter) ───────────────
-@app.get("/api/posts", dependencies=[Depends(api_auth)])
+@app.get("/api/posts", dependencies=[Depends(_get_auth_user)])
 async def api_posts(
     page: int = 1, limit: int = 20,
     search: str = "", sort: str = "new",
@@ -2789,7 +2804,7 @@ async def api_posts(
 
 
 # ─── API: Tags (parametric, with channel filter) ─────────────
-@app.get("/api/tags", dependencies=[Depends(api_auth)])
+@app.get("/api/tags", dependencies=[Depends(_get_auth_user)])
 async def api_tags(
     hours: int = Query(24, ge=1, le=720),
     channel: Optional[str] = Query(None)
@@ -2839,13 +2854,13 @@ async def api_tags(
 
 
 # Backward compatibility: /api/tags/24h -> /api/tags?hours=24
-@app.get("/api/tags/24h", dependencies=[Depends(api_auth)])
+@app.get("/api/tags/24h", dependencies=[Depends(_get_auth_user)])
 async def api_tags_24h_compat():
     return await api_tags(hours=24)
 
 
 # ─── Charts API (all with channel filter) ────────────────────
-@app.get("/api/charts/tags", dependencies=[Depends(api_auth)])
+@app.get("/api/charts/tags", dependencies=[Depends(_get_auth_user)])
 async def chart_tags(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2884,7 +2899,7 @@ async def chart_tags(days: int = Query(7, ge=1, le=90), channel: Optional[str] =
         return json_response({"tags": [], "total_posts": 0, "avg_reach": 0, "error": str(e)}, 500)
 
 
-@app.get("/api/charts/activity", dependencies=[Depends(api_auth)])
+@app.get("/api/charts/activity", dependencies=[Depends(_get_auth_user)])
 async def chart_activity(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2913,7 +2928,7 @@ async def chart_activity(days: int = Query(7, ge=1, le=90), channel: Optional[st
         return json_response({"hours": [0]*168, "peak_hour": 0, "error": str(e)}, 500)
 
 
-@app.get("/api/charts/views", dependencies=[Depends(api_auth)])
+@app.get("/api/charts/views", dependencies=[Depends(_get_auth_user)])
 async def chart_views(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2942,7 +2957,7 @@ async def chart_views(days: int = Query(7, ge=1, le=90), channel: Optional[str] 
         return json_response({"bins": [], "error": str(e)}, 500)
 
 
-@app.get("/api/charts/timeline", dependencies=[Depends(api_auth)])
+@app.get("/api/charts/timeline", dependencies=[Depends(_get_auth_user)])
 async def chart_timeline(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -2986,7 +3001,7 @@ async def chart_timeline(days: int = Query(7, ge=1, le=90), channel: Optional[st
         return json_response({"tags": [], "error": str(e)}, 500)
 
 
-@app.get("/api/charts/pairs", dependencies=[Depends(api_auth)])
+@app.get("/api/charts/pairs", dependencies=[Depends(_get_auth_user)])
 async def chart_pairs(days: int = Query(7, ge=1, le=90), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3016,7 +3031,7 @@ async def chart_pairs(days: int = Query(7, ge=1, le=90), channel: Optional[str] 
 
 
 # ─── Analytics API (all with channel filter) ─────────────────
-@app.get("/api/analytics/alltime-tags", dependencies=[Depends(api_auth)])
+@app.get("/api/analytics/alltime-tags", dependencies=[Depends(_get_auth_user)])
 async def analytics_alltime_tags(limit: int = Query(100, ge=1, le=500), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3045,7 +3060,7 @@ async def analytics_alltime_tags(limit: int = Query(100, ge=1, le=500), channel:
         return json_response({"tags": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/trends", dependencies=[Depends(api_auth)])
+@app.get("/api/analytics/trends", dependencies=[Depends(_get_auth_user)])
 async def analytics_trends(channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3105,7 +3120,7 @@ async def analytics_trends(channel: Optional[str] = Query(None)):
         return json_response({"trends": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/posts-by-tag", dependencies=[Depends(api_auth)])
+@app.get("/api/analytics/posts-by-tag", dependencies=[Depends(_get_auth_user)])
 async def analytics_posts_by_tag(
     tag: str = Query(...), page: int = Query(1, ge=1), limit: int = Query(20, ge=1, le=50),
     channel: Optional[str] = Query(None)
@@ -3129,7 +3144,7 @@ async def analytics_posts_by_tag(
         return json_response({"posts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/tag-daily", dependencies=[Depends(api_auth)])
+@app.get("/api/analytics/tag-daily", dependencies=[Depends(_get_auth_user)])
 async def analytics_tag_daily(tag: str = Query(...), days: int = Query(90, ge=1, le=365), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3161,7 +3176,7 @@ async def analytics_tag_daily(tag: str = Query(...), days: int = Query(90, ge=1,
         return json_response({"tag": tag, "days": [], "counts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/tag-posts-by-day", dependencies=[Depends(api_auth)])
+@app.get("/api/analytics/tag-posts-by-day", dependencies=[Depends(_get_auth_user)])
 async def analytics_tag_posts_by_day(tag: str = Query(...), date: str = Query(...), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3183,7 +3198,7 @@ async def analytics_tag_posts_by_day(tag: str = Query(...), date: str = Query(..
         return json_response({"posts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/analytics/export-csv", dependencies=[Depends(api_auth)])
+@app.get("/api/analytics/export-csv", dependencies=[Depends(_get_auth_user)])
 async def analytics_export_csv(channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3223,7 +3238,7 @@ async def analytics_export_csv(channel: Optional[str] = Query(None)):
 
 
 # ─── Stock Price API (MOEX proxy) ────────────────────────────
-@app.get("/api/stock/price", dependencies=[Depends(api_auth)])
+@app.get("/api/stock/price", dependencies=[Depends(_get_auth_user)])
 async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=365)):
     try:
         import urllib.request
@@ -3253,7 +3268,7 @@ async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=3
         return json_response({"ticker": ticker, "days": [], "ohlc": [], "error": str(e)}, 500)
 
 
-@app.get("/api/stock/intraday", dependencies=[Depends(api_auth)])
+@app.get("/api/stock/intraday", dependencies=[Depends(_get_auth_user)])
 async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
     try:
         import urllib.request
@@ -3282,7 +3297,7 @@ async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
 # ═══ Sentiment & Intelligence API (with channel filter) ══
 # ═══════════════════════════════════════════════════════════
 
-@app.get("/api/sentiment/timeline", dependencies=[Depends(api_auth)])
+@app.get("/api/sentiment/timeline", dependencies=[Depends(_get_auth_user)])
 async def sentiment_timeline(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Daily sentiment scores: positive / negative / neutral / total"""
     try:
@@ -3334,7 +3349,7 @@ async def sentiment_timeline(days: int = Query(7, ge=1, le=30), channel: Optiona
         return json_response({"days": [], "positive": [], "negative": [], "neutral": [], "error": str(e)}, 500)
 
 
-@app.get("/api/sentiment/top-words", dependencies=[Depends(api_auth)])
+@app.get("/api/sentiment/top-words", dependencies=[Depends(_get_auth_user)])
 async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str = Query("positive"), channel: Optional[str] = Query(None)):
     """Most frequent words from posts with given sentiment"""
     try:
@@ -3371,7 +3386,7 @@ async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str 
         return json_response({"words": [], "error": str(e)}, 500)
 
 
-@app.get("/api/velocity/alerts", dependencies=[Depends(api_auth)])
+@app.get("/api/velocity/alerts", dependencies=[Depends(_get_auth_user)])
 async def velocity_alerts(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Tickers with anomalous mention growth vs previous period"""
     try:
@@ -3431,7 +3446,7 @@ async def velocity_alerts(days: int = Query(7, ge=1, le=30), channel: Optional[s
         return json_response({"alerts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/correlation/matrix", dependencies=[Depends(api_auth)])
+@app.get("/api/correlation/matrix", dependencies=[Depends(_get_auth_user)])
 async def correlation_matrix(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Correlation matrix: which tags appear together in same posts"""
     try:
@@ -3483,7 +3498,7 @@ async def correlation_matrix(days: int = Query(7, ge=1, le=30), channel: Optiona
         return json_response({"tags": [], "matrix": [], "error": str(e)}, 500)
 
 
-@app.get("/api/premarket/intel", dependencies=[Depends(api_auth)])
+@app.get("/api/premarket/intel", dependencies=[Depends(_get_auth_user)])
 async def premarket_intel(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Posts segmented by time: pre-market / market hours / after-hours (MOEX: 10:00-18:45 MSK = 07:00-15:45 UTC)"""
     try:
@@ -3535,7 +3550,7 @@ async def premarket_intel(days: int = Query(7, ge=1, le=30), channel: Optional[s
 # ═══ Viral & Cross-Market API (with channel filter) ══════
 # ═══════════════════════════════════════════════════════════
 
-@app.get("/api/viral/posts", dependencies=[Depends(api_auth)])
+@app.get("/api/viral/posts", dependencies=[Depends(_get_auth_user)])
 async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, ge=1, le=20), channel: Optional[str] = Query(None)):
     try:
         async with async_session() as session:
@@ -3567,7 +3582,7 @@ async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, 
         return json_response({"posts": [], "error": str(e)}, 500)
 
 
-@app.get("/api/sector/rotation", dependencies=[Depends(api_auth)])
+@app.get("/api/sector/rotation", dependencies=[Depends(_get_auth_user)])
 async def sector_rotation(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """NO json_array_elements -- fetch hashtags json, parse in Python"""
     try:
@@ -3607,7 +3622,7 @@ async def sector_rotation(days: int = Query(7, ge=1, le=30), channel: Optional[s
         return json_response({"sectors": [], "total": 0, "error": str(e)}, 500)
 
 
-@app.get("/api/wordcloud", dependencies=[Depends(api_auth)])
+@app.get("/api/wordcloud", dependencies=[Depends(_get_auth_user)])
 async def wordcloud_data(days: int = Query(7, ge=1, le=30), limit: int = Query(50, ge=1, le=100), channel: Optional[str] = Query(None)):
     """NO json_array_elements -- fetch hashtags json, count in Python"""
     try:
@@ -3637,7 +3652,7 @@ async def wordcloud_data(days: int = Query(7, ge=1, le=30), limit: int = Query(5
         return json_response({"words": [], "error": str(e)}, 500)
 
 
-@app.get("/api/crossmarket/links", dependencies=[Depends(api_auth)])
+@app.get("/api/crossmarket/links", dependencies=[Depends(_get_auth_user)])
 async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
     """Fetch recent posts, filter in Python -- no ILIKE on text columns"""
     try:
@@ -3693,7 +3708,7 @@ async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional
 _RSS_CHANNELS = [c.strip() for c in cfg.CHANNELS.split(",") if c.strip()] if hasattr(cfg, 'CHANNELS') and cfg.CHANNELS else ["markettwits"]
 
 
-@app.get("/rss", dependencies=[Depends(api_auth)])
+@app.get("/rss", dependencies=[Depends(_get_auth_user)])
 async def rss_feed(
     limit: int = Query(50, ge=1, le=200),
     channel: str = Query("", description="Filter by channel username(s), comma-separated"),
