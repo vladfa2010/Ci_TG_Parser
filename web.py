@@ -1728,12 +1728,37 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 .empty{text-align:center;color:#64748b;padding:60px;font-size:14px}
 .err{background:#0f172a;border:1px solid #7f1d1d;border-radius:12px;padding:24px;text-align:center}
 .err h3{color:#f87171;margin-bottom:8px}
+
+/* Add channel form */
+.add-form{display:flex;gap:10px;margin-bottom:24px;flex-wrap:wrap}
+.add-form input{flex:1;min-width:200px;background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;padding:12px 16px;border-radius:10px;font-size:14px;outline:none}
+.add-form input:focus{border-color:#00d4aa}
+.add-form button{background:#00d4aa;color:#0a0a1a;border:none;padding:12px 28px;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer}
+.add-form button:hover{opacity:.85}
+.add-form button:disabled{opacity:.5;cursor:not-allowed}
+.add-msg{font-size:13px;margin-top:8px;min-height:20px}
+.add-msg.ok{color:#00d4aa}
+.add-msg.err{color:#f87171}
+
+/* Channel actions */
+.ch-actions{display:flex;gap:8px}
+.ch-actions button{background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:6px 14px;border-radius:6px;font-size:12px;cursor:pointer;transition:.15s}
+.ch-actions button:hover{background:#334155}
+.ch-actions .btn-del{color:#f87171;border-color:#7f1d1d}
+.ch-actions .btn-del:hover{background:#7f1d1d}
 </style>
 </head>
 <body>
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading channels...</div></div>
 <div class="wrap">
 <header><h1>Channels</h1><a href="/" class="back">&larr; Back</a></header>
+
+<!-- Add channel form -->
+<div class="add-form">
+<input type="text" id="ch-input" placeholder="Username или numeric ID канала..." onkeydown="if(event.key==='Enter')addChannel()">
+<button id="ch-add-btn" onclick="addChannel()">+ Добавить канал</button>
+</div>
+<div class="add-msg" id="add-msg"></div>
 
 <div class="stats" id="top-stats">
 <div class="stat"><div class="stat-v" id="s-total">-</div><div class="stat-l">Total</div></div>
@@ -1783,10 +1808,11 @@ async function loadAll(){
       if(c.parse_error_count>0){badgeClass='badge-error';badgeText='error('+c.parse_error_count+')';}
       var lastParsed=c.last_parsed_at?c.last_parsed_at.slice(0,16).replace('T',' '):'never';
       var chLink=(c.channel_type==='private'&&c.numeric_id)?'https://t.me/c/'+c.numeric_id:c.username?'https://t.me/'+c.username:'#';
-      return'<div class="ch-row">'+
+      var toggleLabel=c.is_active?'Stop':'Start';
+      return'<div class="ch-row" id="ch-'+c.id+'">'+
         '<div class="ch-info">'+
           '<div class="ch-title"><a href="'+chLink+'" target="_blank" style="color:inherit;text-decoration:none">'+esc(c.title||c.username||'Channel #'+c.id)+'</a></div>'+
-          '<div class="ch-user">@'+esc(c.username||'-')+' | ID:'+c.telegram_id+'</div>'+
+          '<div class="ch-user">'+(c.channel_type==='private'?'c/'+c.numeric_id:'@'+esc(c.username||'-'))+' | tid:'+c.telegram_id+'</div>'+
           '<div class="ch-meta">'+
             '<span>'+fmt(c.posts_count||0)+' posts</span>'+
             '<span>'+fmt(c.subscriber_count||0)+' subs</span>'+
@@ -1795,6 +1821,10 @@ async function loadAll(){
           '</div>'+
         '</div>'+
         '<span class="badge '+badgeClass+'">'+badgeText+'</span>'+
+        '<div class="ch-actions">'+
+          '<button onclick="toggleChannel('+c.id+')">'+toggleLabel+'</button>'+
+          '<button class="btn-del" onclick="deleteChannel('+c.id+')">Delete</button>'+
+        '</div>'+
       '</div>';
     }).join('');
     hideLoader();
@@ -1804,6 +1834,50 @@ async function loadAll(){
     hideLoader();
   }
 }
+
+// Add channel
+async function addChannel(){
+  var input=$('ch-input');
+  var btn=$('ch-add-btn');
+  var msg=$('add-msg');
+  var id=input.value.trim();
+  if(!id){msg.textContent='Введите username или numeric ID';msg.className='add-msg err';return;}
+  btn.disabled=true;
+  msg.textContent='Добавление...';msg.className='add-msg';
+  try{
+    var data=await api('/channels/add?identifier='+encodeURIComponent(id));
+    if(data.success){
+      msg.textContent='Канал добавлен: '+(data.channel.title||data.channel.username||data.channel.numeric_id);msg.className='add-msg ok';
+      input.value='';
+      loadAll();
+    }else{
+      msg.textContent='Ошибка: '+(data.error||'unknown');msg.className='add-msg err';
+    }
+  }catch(e){
+    msg.textContent='Ошибка: '+(e.message||e);msg.className='add-msg err';
+  }finally{
+    btn.disabled=false;
+  }
+}
+
+// Toggle channel active
+async function toggleChannel(id){
+  try{
+    var data=await api('/channels/'+id+'/toggle');
+    if(data.success) loadAll();
+  }catch(e){console.error(e);}
+}
+
+// Delete channel
+async function deleteChannel(id){
+  if(!confirm('Удалить канал и все его посты?')) return;
+  try{
+    var r=await fetch('/api/channels/'+id,{method:'DELETE',cache:'no-store'});
+    var data=await r.json();
+    if(data.success){var el=$('ch-'+id);if(el)el.remove();}
+  }catch(e){console.error(e);}
+}
+
 loadAll();
 })();
 </script>
@@ -2128,6 +2202,132 @@ async def api_channels():
     except Exception as e:
         logger.error(f"/channels error: {e}"); traceback.print_exc()
         return json_response({"channels": [], "error": str(e)}, 500)
+
+
+# ─── API: Add channel ────────────────────────────────────────
+@app.post("/api/channels/add")
+async def api_channels_add(identifier: str = Query(..., description="Username или numeric ID канала")):
+    """Добавляет новый канал в БД и синхронизирует его метаданные.
+
+    Args:
+        identifier: @username или numeric_id канала (без @).
+    """
+    try:
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        from telethon.errors import FloodWaitError
+
+        async with async_session() as session:
+            # Проверяем, нет ли уже такого канала
+            existing = await session.execute(
+                select(Channel).where(
+                    (Channel.username == identifier) |
+                    (Channel.numeric_id == int(identifier) if identifier.isdigit() else False) |
+                    (Channel.telegram_id == int(identifier) if identifier.lstrip('-').isdigit() else False)
+                )
+            )
+            if existing.scalar_one_or_none():
+                return json_response({"success": False, "error": "Канал уже существует"}, 409)
+
+            # Подключаемся к Telegram и получаем метаданные
+            client = TelegramClient(
+                StringSession(cfg.TG_STRING_SESSION) if cfg.TG_STRING_SESSION else cfg.TG_SESSION or "/app/sessions/citg_session",
+                cfg.TG_API_ID, cfg.TG_API_HASH,
+            )
+            await client.connect()
+            try:
+                entity = await client.get_entity(identifier)
+
+                has_username = bool(getattr(entity, "username", None))
+                channel_type = "public" if has_username else "private"
+                telegram_id = entity.id
+                numeric_id = None
+                if telegram_id < 0:
+                    numeric_id = abs(telegram_id) % 1_000_000_000_000
+                else:
+                    numeric_id = telegram_id
+
+                channel = Channel(
+                    telegram_id=telegram_id,
+                    numeric_id=numeric_id,
+                    channel_type=channel_type,
+                    username=entity.username if has_username else None,
+                    title=entity.title,
+                    description=getattr(entity, "about", None),
+                    subscriber_count=getattr(entity, "participants_count", 0),
+                    is_active=True,
+                    parse_error_count=0,
+                    total_posts_parsed=0,
+                )
+                session.add(channel)
+                await session.commit()
+
+                return {
+                    "success": True,
+                    "channel": {
+                        "id": channel.id,
+                        "telegram_id": channel.telegram_id,
+                        "numeric_id": channel.numeric_id,
+                        "channel_type": channel.channel_type,
+                        "username": channel.username,
+                        "title": channel.title,
+                    },
+                }
+            finally:
+                await client.disconnect()
+
+    except FloodWaitError as e:
+        return json_response({"success": False, "error": f"FloodWait: подождите {e.seconds} секунд"}, 429)
+    except ValueError as e:
+        return json_response({"success": False, "error": f"Канал не найден или недоступен: {e}"}, 404)
+    except Exception as e:
+        logger.error(f"/channels/add error: {e}"); traceback.print_exc()
+        return json_response({"success": False, "error": str(e)}, 500)
+
+
+# ─── API: Toggle channel active ──────────────────────────────
+@app.post("/api/channels/{channel_id}/toggle")
+async def api_channels_toggle(channel_id: int):
+    """Включает/выключает канал (is_active)."""
+    try:
+        async with async_session() as session:
+            result = await session.execute(select(Channel).where(Channel.id == channel_id))
+            channel = result.scalar_one_or_none()
+            if not channel:
+                return json_response({"success": False, "error": "Канал не найден"}, 404)
+
+            channel.is_active = not channel.is_active
+            # Сбрасываем error_count при активации
+            if channel.is_active:
+                channel.parse_error_count = 0
+                channel.last_error_message = None
+            await session.commit()
+
+            return {"success": True, "is_active": channel.is_active, "channel_id": channel_id}
+    except Exception as e:
+        logger.error(f"/channels/toggle error: {e}"); traceback.print_exc()
+        return json_response({"success": False, "error": str(e)}, 500)
+
+
+# ─── API: Delete channel ─────────────────────────────────────
+@app.delete("/api/channels/{channel_id}")
+async def api_channels_delete(channel_id: int):
+    """Удаляет канал и все его посты из БД."""
+    try:
+        async with async_session() as session:
+            result = await session.execute(select(Channel).where(Channel.id == channel_id))
+            channel = result.scalar_one_or_none()
+            if not channel:
+                return json_response({"success": False, "error": "Канал не найден"}, 404)
+
+            # Удаляем канал (посты удалятся CASCADE если настроено)
+            await session.delete(channel)
+            await session.commit()
+
+            return {"success": True, "deleted_id": channel_id}
+    except Exception as e:
+        logger.error(f"/channels/delete error: {e}"); traceback.print_exc()
+        return json_response({"success": False, "error": str(e)}, 500)
 
 
 # ─── API: Cross-Channel comparison (v2) ──────────────────────

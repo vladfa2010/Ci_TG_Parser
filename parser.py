@@ -728,6 +728,30 @@ class MultiChannelParser:
 
                 return username, result
 
+    async def _get_active_channels_from_db(self) -> list[str]:
+        """Получает список активных каналов из БД.
+
+        Returns:
+            Список идентификаторов (username или numeric_id как строка).
+        """
+        async with self._db_session() as db_session:
+            result = await db_session.execute(
+                select(Channel).where(
+                    (Channel.is_active == True) & (Channel.parse_error_count < 3)
+                )
+            )
+            channels = result.scalars().all()
+            identifiers = []
+            for ch in channels:
+                # Используем username если есть, иначе numeric_id или telegram_id
+                if ch.username:
+                    identifiers.append(ch.username)
+                elif ch.numeric_id:
+                    identifiers.append(str(ch.numeric_id))
+                else:
+                    identifiers.append(str(ch.telegram_id))
+            return identifiers
+
     async def parse_all(
         self,
         channels: Optional[list[str]] = None,
@@ -737,14 +761,24 @@ class MultiChannelParser:
         """Парсит все каналы параллельно.
 
         Args:
-            channels: Список username каналов. Если None — берётся из settings.
+            channels: Список username каналов. Если None — берётся из БД (active).
             limit: Лимит постов на канал.
             history: Если True — парсить всю историю.
 
         Returns:
             Словарь {username: ParseResult}.
         """
-        channel_list = channels or settings.channels_list
+        # Если channels переданы явно — используем их (для ручного запуска)
+        # Иначе берём активные каналы из БД
+        if channels:
+            channel_list = channels
+        else:
+            channel_list = await self._get_active_channels_from_db()
+            # Fallback: если БД пустая — используем env var
+            if not channel_list:
+                channel_list = settings.channels_list
+                logger.info("БД пустая, используем CHANNELS из env: %s", channel_list)
+
         if not channel_list:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
