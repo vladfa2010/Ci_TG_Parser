@@ -110,7 +110,7 @@ class Settings(BaseSettings):
         ge=1,
     )
     MAX_CONCURRENT_CHANNELS: int = Field(
-        default=5,
+        default=10,
         description="Максимум одновременно парсимых каналов",
         ge=1,
     )

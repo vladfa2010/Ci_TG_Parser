@@ -15,7 +15,7 @@ services:
       - key: PORT
         value: "10000"
 
-  # ─── Cron Job: многоканальный парсинг каждые 5 минут ──────
+  # ─── Cron Job: парсинг до 50 каналов (10 параллельно) ────
   - type: cron
     name: citg-cron
     runtime: docker
@@ -42,7 +42,7 @@ services:
       - key: SCHEDULE_MODE
         value: "0"
       - key: MAX_CONCURRENT_CHANNELS
-        value: "5"
+        value: "10"
       - key: RETRY_ATTEMPTS
         value: "3"
 
@@ -53,7 +53,7 @@ services:
   #   name: citg-scheduler
   #   runtime: docker
   #   plan: starter
-  #   branch: v2-multichannel
+  #   branch: v2-citg-rebrand
   #   envVars:
   #     - key: DATABASE_URL
   #       fromDatabase:
@@ -72,7 +72,7 @@ services:
   #     - key: INTERVAL_SEC
   #       value: "300"
   #     - key: MAX_CONCURRENT_CHANNELS
-  #       value: "5"
+  #       value: "10"
 
   # ─── Job: первоначальная загрузка истории (разовый запуск) ─
   # Запусти вручную из Render Dashboard → Jobs → New Job
@@ -81,7 +81,7 @@ services:
   #   name: citg-history
   #   runtime: docker
   #   plan: starter
-  #   branch: v2-multichannel
+  #   branch: v2-citg-rebrand
   #   envVars:
   #     - key: DATABASE_URL
   #       fromDatabase:
