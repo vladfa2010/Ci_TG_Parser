@@ -432,7 +432,7 @@ function showError(id,msg){$(id).innerHTML='<div class="err"><h3>Failed to load<
 function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 
-async function api(path,attempt){attempt=attempt||1;try{var r=await fetch('/api'+path,{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.error)throw new Error(d.error);return d}catch(e){if(attempt<3){await new Promise(function(r){setTimeout(r,1000*attempt)});return api(path,attempt+1)}throw e}}
+async function api(path,attempt){attempt=attempt||1;try{var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.error)throw new Error(d.error);return d}catch(e){if(attempt<3){await new Promise(function(r){setTimeout(r,1000*attempt)});return api(path,attempt+1)}throw e}}
 
 // Load channel list into dropdown
 async function loadChannels(){
@@ -593,7 +593,7 @@ function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 
 async function api(path){
-  var r=await fetch('/api'+path,{cache:'no-store'});
+  var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});
   if(!r.ok) throw new Error('HTTP '+r.status);
   var d=await r.json();
   if(d.error) throw new Error(d.error);
@@ -891,7 +891,7 @@ function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 
 async function api(path){
-  var r=await fetch('/api'+path,{cache:'no-store'});
+  var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});
   if(!r.ok) throw new Error('HTTP '+r.status);
   var d=await r.json();
   if(d.error) throw new Error(d.error);
@@ -1090,7 +1090,7 @@ async function api(path,attempt){
   attempt=attempt||1;
   try{
     console.log('API fetch:',path);
-    var r=await fetch('/api'+path,{cache:'no-store'});
+    var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});
     if(!r.ok) throw new Error('HTTP '+r.status);
     var d=await r.json();
     if(d.error) throw new Error(d.error);
@@ -1391,7 +1391,7 @@ function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
 async function api(path){
-  var r=await fetch('/api'+path,{cache:'no-store'});
+  var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});
   if(!r.ok) throw new Error('HTTP '+r.status);
   var d=await r.json();
   if(d.error) throw new Error(d.error);
@@ -1911,7 +1911,7 @@ function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 
 async function api(path){
-  var r=await fetch('/api'+path,{cache:'no-store'});
+  var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});
   if(!r.ok) throw new Error('HTTP '+r.status);
   var d=await r.json();
   if(d.error) throw new Error(d.error);
@@ -2016,7 +2016,7 @@ async function toggleChannel(id){
 async function deleteChannel(id){
   if(!confirm('Удалить канал и все его посты?')) return;
   try{
-    var r=await fetch('/api/channel/delete/'+id,{method:'DELETE',cache:'no-store'});
+    var r=await fetch('/api/channel/delete/'+id,{method:'DELETE',cache:'no-store',credentials:'include'});
     var data=await r.json();
     if(data.success){var el=$('ch-'+id);if(el)el.remove();}
   }catch(e){console.error(e);}
@@ -2131,7 +2131,7 @@ function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
 function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 
 async function api(path){
-  var r=await fetch('/api'+path,{cache:'no-store'});
+  var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});
   if(!r.ok) throw new Error('HTTP '+r.status);
   var d=await r.json();
   if(d.error) throw new Error(d.error);
