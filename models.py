@@ -1,5 +1,5 @@
 """
-SQLAlchemy 2.0 async ORM models for Telegram Parser (tgparser_v2).
+SQLAlchemy 2.0 async ORM models for Telegram Parser (citg_v2).
 
 Contains all database models for storing Telegram channels, posts,
 parsing logs, error tracking, and channel grouping.

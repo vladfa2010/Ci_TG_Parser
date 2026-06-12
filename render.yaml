@@ -1,14 +1,14 @@
 services:
   # ─── Web Dashboard (FastAPI) ──────────────────────────────
   - type: web
-    name: tgparser-web
+    name: citg-web
     runtime: docker
     plan: starter
-    branch: v2-multichannel
+    branch: v2-citg-rebrand
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: tgparser-db
+          name: citg-db
           property: connectionString
       - key: APP_MODE
         value: "web"
@@ -17,15 +17,15 @@ services:
 
   # ─── Cron Job: многоканальный парсинг каждые 5 минут ──────
   - type: cron
-    name: tgparser-cron
+    name: citg-cron
     runtime: docker
     plan: starter
-    branch: v2-multichannel
+    branch: v2-citg-rebrand
     schedule: "*/5 * * * *"
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: tgparser-db
+          name: citg-db
           property: connectionString
       # ─── Telegram API credentials ( Secrets ) ────────────
       - key: TG_API_ID
@@ -50,14 +50,14 @@ services:
   # Раскомментируй если хочешь заменить cron на постоянно
   # работающий background worker с SCHEDULE_MODE=1
   # - type: worker
-  #   name: tgparser-scheduler
+  #   name: citg-scheduler
   #   runtime: docker
   #   plan: starter
   #   branch: v2-multichannel
   #   envVars:
   #     - key: DATABASE_URL
   #       fromDatabase:
-  #         name: tgparser-db
+  #         name: citg-db
   #         property: connectionString
   #     - key: TG_API_ID
   #       sync: false
@@ -78,14 +78,14 @@ services:
   # Запусти вручную из Render Dashboard → Jobs → New Job
   # Затем удали или отключи
   # - type: job
-  #   name: tgparser-history
+  #   name: citg-history
   #   runtime: docker
   #   plan: starter
   #   branch: v2-multichannel
   #   envVars:
   #     - key: DATABASE_URL
   #       fromDatabase:
-  #         name: tgparser-db
+  #         name: citg-db
   #         property: connectionString
   #     - key: TG_API_ID
   #       sync: false
@@ -101,6 +101,6 @@ services:
   #       value: "3"
 
 databases:
-  - name: tgparser-db
-    plan: free
+  - name: citg-db
+    plan: starter
     ipAllowList: []

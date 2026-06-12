@@ -1,4 +1,4 @@
-# TG Parser v2 — Multi-Channel Telegram Parser
+# CITG v2 — Multi-Channel Telegram Parser
 
 > Параллельный сбор и аналитика данных из нескольких Telegram-каналов с веб-дашбордом.
 
@@ -94,8 +94,8 @@
 ### 1. Клонирование и подготовка
 
 ```bash
-git clone https://github.com/username/tgparser_v2.git
-cd tgparser_v2
+git clone https://github.com/username/citg_v2.git
+cd citg_v2
 cp .env.example .env
 ```
 
@@ -112,7 +112,7 @@ TG_API_HASH=your_api_hash_here
 CHANNELS=markettwits,ru2ch,etc
 
 # PostgreSQL
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/tgparser
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/citg
 
 # Парсер
 PARSER_INTERVAL=300
@@ -177,7 +177,7 @@ docker compose logs -f db
 | `TG_API_ID` | Да | — | App ID из https://my.telegram.org |
 | `TG_API_HASH` | Да | — | App Hash из https://my.telegram.org |
 | `CHANNELS` | Да | — | Список каналов через запятую (без `@`) |
-| `DATABASE_URL` | Да | `postgresql+asyncpg://postgres:postgres@db:5432/tgparser` | URL подключения к PostgreSQL |
+| `DATABASE_URL` | Да | `postgresql+asyncpg://postgres:postgres@db:5432/citg` | URL подключения к PostgreSQL |
 | `PARSER_INTERVAL` | Нет | `300` | Интервал между циклами парсинга, секунды |
 | `MAX_CHANNELS` | Нет | `5` | Максимальное количество параллельных каналов |
 | `RETRY_BASE_DELAY` | Нет | `1` | Базовая задержка retry, секунды |
@@ -433,13 +433,13 @@ CREATE TABLE IF NOT EXISTS channel_group_members (
 # render.yaml
 services:
   - type: web
-    name: tgparser-web
+    name: citg-web
     runtime: docker
     plan: standard
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: tgparser-db
+          name: citg-db
           property: connectionString
       - key: TG_API_ID
         sync: false
@@ -450,14 +450,14 @@ services:
     healthCheckPath: /health
 
   - type: worker
-    name: tgparser-worker
+    name: citg-worker
     runtime: docker
     plan: standard
     dockerfilePath: ./Dockerfile.parser
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: tgparser-db
+          name: citg-db
           property: connectionString
       - key: TG_API_ID
         sync: false
@@ -467,7 +467,7 @@ services:
         sync: false
 
 databases:
-  - name: tgparser-db
+  - name: citg-db
     plan: standard
     postgresMajorVersion: 16
 ```
@@ -487,7 +487,7 @@ databases:
 ## Структура проекта
 
 ```
-tgparser_v2/
+citg_v2/
 ├── docker-compose.yml        # Docker Compose конфигурация
 ├── Dockerfile                # Dockerfile для web
 ├── Dockerfile.parser         # Dockerfile для parser

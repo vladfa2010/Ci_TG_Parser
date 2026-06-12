@@ -7,7 +7,7 @@
 
 set -e
 
-echo "=== TG Parser v2 ==="
+echo "=== CITG v2 ==="
 echo "APP_MODE: ${APP_MODE:-parser}"
 echo "PORT: ${PORT:-10000}"
 echo "CHANNELS: ${CHANNELS:-markettwits}"

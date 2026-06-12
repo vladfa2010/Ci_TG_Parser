@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TG Parser Dashboard v2 — Multi-Channel FastAPI Dashboard.
+CITG Dashboard v2 — Multi-Channel FastAPI Dashboard.
 Channel-aware SPA with Charts. ECharts, dark theme, error recovery.
 
 Imports models from models.py (SQLAlchemy 2.0 async) and config from config.py.
@@ -157,7 +157,7 @@ INDEX_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TG Parser Dashboard</title>
+<title>CITG Dashboard</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -238,7 +238,7 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 <div id="loader"><div class="loader-ring"></div><div class="loader-text">Loading dashboard...</div><div id="loader-sub">Connecting to database</div></div>
 
 <div class="wrap">
-<header><h1><a href="/">TG Parser Dashboard</a></h1><p class="sub" id="subtitle">Loading...</p></header>
+<header><h1><a href="/">CITG Dashboard</a></h1><p class="sub" id="subtitle">Loading...</p></header>
 <nav>
 <button class="on" data-tab="posts">Posts</button>
 <button data-tab="tags">Tags 24h</button>
@@ -362,7 +362,7 @@ TAG_DAILY_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stock & Tag — TG Parser</title>
+<title>Stock & Tag — CITG</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -649,7 +649,7 @@ ANALYTICS_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tag Analytics — TG Parser</title>
+<title>Tag Analytics — CITG</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -844,7 +844,7 @@ CHARTS_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Charts — TG Parser</title>
+<title>Charts — CITG</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -1135,7 +1135,7 @@ SENTIMENT_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sentiment & Intelligence — TG Parser</title>
+<title>Sentiment & Intelligence — CITG</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -1407,7 +1407,7 @@ VIRAL_POSTS_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Viral Posts — TG Parser</title>
+<title>Viral Posts — CITG</title>
 <style>''' + VIRAL_SHARED_CSS + '''
 .vpost{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:12px;cursor:pointer;transition:.15s}
 .vpost:hover{border-color:#334155}
@@ -1479,7 +1479,7 @@ SECTORS_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sector Rotation — TG Parser</title>
+<title>Sector Rotation — CITG</title>
 <style>''' + VIRAL_SHARED_CSS + '''
 .sector-row{display:flex;align-items:center;gap:12px;padding:14px 16px;background:#0f172a;border:1px solid #1e293b;border-radius:12px;margin-bottom:10px}
 .sector-row:hover{border-color:#334155}
@@ -1548,7 +1548,7 @@ WORDCLOUD_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Word Cloud — TG Parser</title>
+<title>Word Cloud — CITG</title>
 <style>''' + VIRAL_SHARED_CSS + '''
 .cloud{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:center;min-height:400px;padding:30px}
 .cloud-tag{padding:10px 20px;border-radius:24px;font-weight:600;cursor:pointer;transition:transform .2s,opacity .2s;opacity:.85}
@@ -1613,7 +1613,7 @@ CROSSMARKET_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cross-Market — TG Parser</title>
+<title>Cross-Market — CITG</title>
 <style>''' + VIRAL_SHARED_CSS + '''
 .xpost{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:14px;margin-bottom:10px;cursor:pointer;transition:.15s}
 .xpost:hover{border-color:#334155}
@@ -1693,7 +1693,7 @@ CHANNELS_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Channels — TG Parser</title>
+<title>Channels — CITG</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -1816,7 +1816,7 @@ CROSSCHANNEL_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cross-Channel — TG Parser</title>
+<title>Cross-Channel — CITG</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a1a;color:#e2e8f0;line-height:1.5}
@@ -2741,7 +2741,7 @@ async def stock_price(ticker: str = Query(...), days: int = Query(90, ge=1, le=3
         till = _dt.now().strftime("%Y-%m-%d")
         since = (_dt.now() - _td(days=days)).strftime("%Y-%m-%d")
         moex_url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?from={since}&till={till}&interval=24"
-        req = urllib.request.Request(moex_url, headers={"User-Agent": "tgparser/1.0"})
+        req = urllib.request.Request(moex_url, headers={"User-Agent": "citg/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
 
@@ -2769,7 +2769,7 @@ async def stock_intraday(ticker: str = Query(...), date: str = Query(...)):
         from datetime import datetime as _dt
         ticker = ticker.upper()
         moex_url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?from={date}&till={date}&interval=10"
-        req = urllib.request.Request(moex_url, headers={"User-Agent": "tgparser/1.0"})
+        req = urllib.request.Request(moex_url, headers={"User-Agent": "citg/1.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
 

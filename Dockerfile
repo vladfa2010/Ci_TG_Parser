@@ -1,5 +1,5 @@
 # =============================================
-# tgparser_v2 — Dockerfile
+# citg_v2 — Dockerfile
 # Supports two modes via APP_MODE env var:
 #   web   → FastAPI dashboard (uvicorn)
 #   *     → Telegram parser (parser.py)
@@ -7,7 +7,7 @@
 
 FROM python:3.11-slim
 
-LABEL maintainer="tgparser_v2"
+LABEL maintainer="citg_v2"
 LABEL description="Telegram Parser: parser (cron) + web (FastAPI dashboard)"
 
 # Prevent Python from writing .pyc files and buffering stdout
