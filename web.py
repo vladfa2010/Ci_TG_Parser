@@ -337,7 +337,7 @@ $('ch-info').textContent='';
 document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListener('click',function(){var tab=btn.dataset.tab;document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');$('tab-posts').style.display=tab==='posts'?'':'none';$('tab-tags').style.display=tab==='tags'?'':'none';if(tab==='tags')loadTags()})});
 
 // Posts
-async function loadPosts(){if(loading.posts)return;loading.posts=true;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value,ch=$('ch-filter').value;try{var chQ=ch?'&channel='+encodeURIComponent(ch):'';var data=await api('/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+chQ);var stats=await api('/stats'+(ch?'?channel='+encodeURIComponent(ch):''));$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');$('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');var chLink=p.channel_username?'<a class="post-ch" href="https://t.me/'+esc(p.channel_username)+'/'+p.id+'" target="_blank">@'+esc(p.channel_username)+'</a>':'';return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span>'+chLink+'<span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){console.error(e);showError('p-list',e.message)}finally{loading.posts=false}}
+async function loadPosts(){if(loading.posts)return;loading.posts=true;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value,ch=$('ch-filter').value;try{var chQ=ch?'&channel='+encodeURIComponent(ch):'';var data=await api('/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+chQ);var stats=await api('/stats'+(ch?'?channel='+encodeURIComponent(ch):''));$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');$('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');var chUrl=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'@channel';var chLink='<a class="post-ch" href="'+chUrl+'" target="_blank">'+chLabel+'</a>';return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span>'+chLink+'<span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){console.error(e);showError('p-list',e.message)}finally{loading.posts=false}}
 window.goPage=function(p){page=p;loadPosts()};
 
 // Tags -- period selector state
@@ -1451,7 +1451,7 @@ async function load(){
     if(!posts.length){$('content').innerHTML='<div class="empty">No viral posts</div>';hideLoader();return;}
     $('content').innerHTML=posts.map(function(p,i){
       var ch=p.channel_username||'markettwits';
-      var link='https://t.me/'+ch+'/'+p.id;
+      var link=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:'https://t.me/'+ch+'/'+p.id;
       return'<div class="vpost" onclick="window.open(\''+link+'\')">'+
         '<div class="vpost-head"><span>#'+(i+1)+'</span><span class="vpost-ch">@'+esc(ch)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div>'+
         '<div class="vpost-body">'+esc((p.text||'(no text)').slice(0,250))+'</div>'+
@@ -1657,7 +1657,7 @@ async function load(){
     if(!posts.length){$('content').innerHTML='<div class="empty">No cross-market posts</div>';hideLoader();return;}
     $('content').innerHTML=posts.slice(0,10).map(function(p){
       var ch=p.channel_username||'markettwits';
-      var link='https://t.me/'+ch+'/'+p.id;
+      var link=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:'https://t.me/'+ch+'/'+p.id;
       return'<div class="xpost" onclick="window.open(\''+link+'\')">'+
         '<div class="xpost-head"><span>Views '+fmt(p.views)+' | '+(p.published?p.published.slice(0,16).replace('T',' '):'')+' | @'+esc(ch)+'</span></div>'+
         '<div class="xpost-body">'+esc((p.text||'(no text)').slice(0,250))+'</div></div>';
@@ -1782,7 +1782,7 @@ async function loadAll(){
       var badgeText=c.is_active?'active':'inactive';
       if(c.parse_error_count>0){badgeClass='badge-error';badgeText='error('+c.parse_error_count+')';}
       var lastParsed=c.last_parsed_at?c.last_parsed_at.slice(0,16).replace('T',' '):'never';
-      var chLink=c.username?'https://t.me/'+c.username:'#';
+      var chLink=(c.channel_type==='private'&&c.numeric_id)?'https://t.me/c/'+c.numeric_id:c.username?'https://t.me/'+c.username:'#';
       return'<div class="ch-row">'+
         '<div class="ch-info">'+
           '<div class="ch-title"><a href="'+chLink+'" target="_blank" style="color:inherit;text-decoration:none">'+esc(c.title||c.username||'Channel #'+c.id)+'</a></div>'+
@@ -2090,7 +2090,7 @@ async def api_channels():
         async with async_session() as session:
             result = await session.execute(text("""
                 SELECT
-                    c.id, c.telegram_id, c.username, c.title,
+                    c.id, c.telegram_id, c.numeric_id, c.channel_type, c.username, c.title,
                     c.subscriber_count, c.is_active, c.last_parsed_at,
                     c.total_posts_parsed, c.parse_error_count, c.last_error_message,
                     (SELECT COUNT(*) FROM posts WHERE channel_id = c.id) as posts_count,
@@ -2109,6 +2109,8 @@ async def api_channels():
                 channels.append({
                     "id": r["id"],
                     "telegram_id": r["telegram_id"],
+                    "numeric_id": r["numeric_id"],
+                    "channel_type": r["channel_type"],
                     "username": r["username"],
                     "title": r["title"],
                     "subscriber_count": r["subscriber_count"] or 0,
@@ -2274,7 +2276,8 @@ async def api_posts(
 
             result = await session.execute(text(f"""
                 SELECT p.telegram_message_id, p.text, p.views_count,
-                       p.hashtags, p.published_at, c.username as channel_username
+                       p.hashtags, p.published_at, c.username as channel_username,
+                       c.channel_type, c.numeric_id
                 FROM posts p
                 JOIN channels c ON p.channel_id = c.id
                 WHERE 1=1 {ch_filter} {search_filter}
@@ -2290,6 +2293,8 @@ async def api_posts(
                     "hashtags": r["hashtags"] or [],
                     "published": r["published_at"].isoformat() if r["published_at"] else None,
                     "channel_username": r["channel_username"],
+                    "channel_type": r["channel_type"],
+                    "numeric_id": r["numeric_id"],
                 } for r in rows
             ]}
     except Exception as e:
@@ -3052,7 +3057,7 @@ async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, 
             ch_filter, ch_params = _channel_where_clause(channel)
             result = await session.execute(text(f"""
                 SELECT p.telegram_message_id, p.text, p.views_count, p.forwards_count, p.published_at,
-                       c.username as channel_username
+                       c.username as channel_username, c.channel_type, c.numeric_id
                 FROM posts p
                 JOIN channels c ON p.channel_id = c.id
                 WHERE p.published_at > :since
@@ -3067,7 +3072,9 @@ async def viral_posts(days: int = Query(7, ge=1, le=30), limit: int = Query(10, 
                 "views": r["views_count"] or 0,
                 "forwards": r["forwards_count"] or 0,
                 "published": r["published_at"].isoformat() if r["published_at"] else None,
-                "channel_username": r["channel_username"] or "markettwits",
+                "channel_username": r["channel_username"],
+                "channel_type": r["channel_type"],
+                "numeric_id": r["numeric_id"],
             } for r in posts]}
     except Exception as e:
         logger.error(f"/viral/posts error: {e}")
@@ -3155,7 +3162,7 @@ async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional
 
             result = await session.execute(text(f"""
                 SELECT p.telegram_message_id, p.text, p.views_count, p.published_at, p.hashtags,
-                       c.username as channel_username
+                       c.username as channel_username, c.channel_type, c.numeric_id
                 FROM posts p
                 JOIN channels c ON p.channel_id = c.id
                 WHERE p.published_at > :since
@@ -3181,7 +3188,9 @@ async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional
                     "text": r["text"],
                     "views": r["views_count"] or 0,
                     "published": r["published_at"].isoformat() if r["published_at"] else None,
-                    "channel_username": r["channel_username"] or "markettwits",
+                    "channel_username": r["channel_username"],
+                    "channel_type": r["channel_type"],
+                    "numeric_id": r["numeric_id"],
                 })
                 for tag in hashtags:
                     ticker_counter[tag] += 1
@@ -3228,7 +3237,9 @@ async def rss_feed(
                     p.text,
                     p.published_at,
                     c.username as channel_username,
-                    c.title as channel_title
+                    c.title as channel_title,
+                    c.channel_type,
+                    c.numeric_id
                 FROM posts p
                 JOIN channels c ON p.channel_id = c.id
                 WHERE 1=1 {channel_filter}
@@ -3242,12 +3253,24 @@ async def rss_feed(
                 msg_id = row[0]
                 body = row[1] or ""
                 pub = row[2]
-                ch_username = row[3] or "markettwits"
-                ch_title = row[4] or ch_username
+                ch_username = row[3]
+                ch_title = row[4] or (ch_username or "channel")
+                ch_type = row[5]
+                numeric_id = row[6]
+
+                # Generate correct Telegram link
+                if ch_type == "private" and numeric_id:
+                    link = f"https://t.me/c/{numeric_id}/{msg_id}"
+                    source_url = f"https://t.me/c/{numeric_id}"
+                elif ch_username:
+                    link = f"https://t.me/{ch_username}/{msg_id}"
+                    source_url = f"https://t.me/{ch_username}"
+                else:
+                    link = f"https://t.me/c/{numeric_id}/{msg_id}" if numeric_id else "#"
+                    source_url = f"https://t.me/c/{numeric_id}" if numeric_id else "#"
 
                 title = body[:100].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 desc = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                link = f"https://t.me/{ch_username}/{msg_id}"
                 pub_date = format_datetime(pub) if pub else ""
                 items.append(f"""<item>
 <title>{title}</title>
@@ -3255,17 +3278,19 @@ async def rss_feed(
 <description>{desc}</description>
 <pubDate>{pub_date}</pubDate>
 <guid>{link}</guid>
-<source url="https://t.me/{ch_username}">{ch_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")}</source>
+<source url="{source_url}">{ch_title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")}</source>
 </item>""")
 
             if len(requested_channels) == 1:
-                rss_title = requested_channels[0]
-                rss_link = f"https://t.me/{requested_channels[0]}"
-                rss_desc = f"Лента канала @{requested_channels[0]}"
+                ch_name = requested_channels[0]
+                rss_title = ch_name
+                # Check if it's a numeric ID (private channel)
+                rss_link = f"https://t.me/c/{ch_name}" if ch_name.isdigit() else f"https://t.me/{ch_name}"
+                rss_desc = f"Лента канала {ch_name}"
             else:
-                rss_title = "MarketTwits"
-                rss_link = "https://t.me/markettwits"
-                rss_desc = "Финансы, рынки и экономика"
+                rss_title = "CITG"
+                rss_link = "https://t.me"
+                rss_desc = "Агрегатор Telegram-каналов"
 
             rss = f"""<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">

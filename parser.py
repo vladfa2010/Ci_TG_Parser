@@ -250,28 +250,48 @@ class MultiChannelParser:
     # Channel sync
     # ------------------------------------------------------------------
 
-    async def sync_channel(self, db_session: AsyncSession, username: str) -> Channel:
+    async def sync_channel(self, db_session: AsyncSession, identifier: str) -> Channel:
         """Получает (или создаёт) запись Channel в БД, синхронизируя метаданные.
 
         Args:
             db_session: Активная сессия SQLAlchemy.
-            username: Username канала (без @).
+            identifier: Username или numeric ID канала (без @).
 
         Returns:
             Экземпляр Channel (существующий или новый).
         """
         client = await self._ensure_client()
-        entity = await client.get_entity(username)
+        entity = await client.get_entity(identifier)
 
-        result = await db_session.execute(
-            select(Channel).where(Channel.username == username)
-        )
+        # Определяем тип канала и numeric_id
+        has_username = bool(getattr(entity, "username", None))
+        channel_type = "public" if has_username else "private"
+
+        # Вычисляем numeric_id (без -100 префикса) для приватных каналов
+        telegram_id = entity.id
+        numeric_id = None
+        if telegram_id < 0:
+            numeric_id = abs(telegram_id) % 1_000_000_000_000
+        else:
+            numeric_id = telegram_id
+
+        # Ищем канал по telegram_id или username
+        if has_username:
+            result = await db_session.execute(
+                select(Channel).where(Channel.username == entity.username)
+            )
+        else:
+            result = await db_session.execute(
+                select(Channel).where(Channel.telegram_id == telegram_id)
+            )
         channel: Optional[Channel] = result.scalar_one_or_none()
 
         if channel is None:
             channel = Channel(
-                telegram_id=entity.id,
-                username=username,
+                telegram_id=telegram_id,
+                numeric_id=numeric_id,
+                channel_type=channel_type,
+                username=entity.username if has_username else None,
                 title=entity.title,
                 description=getattr(entity, "about", None),
                 subscriber_count=getattr(entity, "participants_count", 0),
@@ -284,15 +304,23 @@ class MultiChannelParser:
             )
             db_session.add(channel)
             await db_session.flush()
-            logger.info("Канал создан: %s (id=%s)", username, entity.id)
+            logger.info(
+                "Канал создан: %s (type=%s, tid=%s, numeric=%s)",
+                entity.username or str(numeric_id),
+                channel_type,
+                telegram_id,
+                numeric_id,
+            )
         else:
             channel.title = entity.title
             channel.subscriber_count = getattr(entity, "participants_count", 0)
+            channel.numeric_id = numeric_id
+            channel.channel_type = channel_type
             # При успешном sync — сбрасываем error_count (канал жив)
             if channel.parse_error_count > 0:
                 channel.parse_error_count = 0
                 channel.last_error_message = None
-            logger.debug("Канал обновлён: %s", username)
+            logger.debug("Канал обновлён: %s", entity.username or str(numeric_id))
 
         return channel
 

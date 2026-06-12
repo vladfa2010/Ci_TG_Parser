@@ -73,7 +73,9 @@ class Channel(Base):
     Attributes:
         id: Internal surrogate primary key.
         telegram_id: Telegram's own channel ID (bigint, unique).
-        username: Telegram @username (unique, may be NULL for private channels).
+        numeric_id: Channel ID without the -100 prefix (used for private channel links).
+        channel_type: 'public' (has @username) or 'private' (no username, numeric ID).
+        username: Telegram @username (unique, NULL for private channels).
         title: Human-readable channel title.
         description: Channel bio / description.
         subscriber_count: Number of subscribers at last check.
@@ -94,7 +96,19 @@ class Channel(Base):
         BigInteger,
         unique=True,
         nullable=False,
-        comment="Telegram internal channel ID",
+        comment="Telegram internal channel ID (e.g. -1003147415698)",
+    )
+    numeric_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        unique=True,
+        nullable=True,
+        comment="Channel ID without -100 prefix (e.g. 3147415698) for private links",
+    )
+    channel_type: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="public",
+        comment="'public' (has @username) or 'private' (numeric ID only)",
     )
     username: Mapped[Optional[str]] = mapped_column(
         String(255),
