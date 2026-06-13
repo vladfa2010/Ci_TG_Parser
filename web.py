@@ -135,9 +135,19 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create tables and default admin user if needed."""
+    """Startup: create tables, run migrations, ensure admin user."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migration: make parse_logs.channel_id nullable (for old DBs)
+        try:
+            await conn.execute(text("""
+                ALTER TABLE parse_logs 
+                ALTER COLUMN channel_id DROP NOT NULL
+            """))
+            logger.info("[migrate] parse_logs.channel_id → nullable")
+        except Exception:
+            # Already nullable or other issue — ignore
+            pass
     # Ensure admin user exists
     async with async_session() as session:
         result = await session.execute(select(User))

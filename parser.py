@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -199,6 +199,15 @@ class MultiChannelParser:
         )
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            # Migration: make parse_logs.channel_id nullable
+            try:
+                await conn.execute(text("""
+                    ALTER TABLE parse_logs 
+                    ALTER COLUMN channel_id DROP NOT NULL
+                """))
+                logger.info("[migrate] parse_logs.channel_id → nullable")
+            except Exception:
+                pass
         logger.info("База данных инициализирована")
         # Create default admin user if not exists
         await self._ensure_admin_user()
