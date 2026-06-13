@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query, Depends, Request, Form, status, HTTPException
+from fastapi import FastAPI, Query, Depends, Request, Form, status, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy import func, select, text
@@ -29,6 +29,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 
 from models import Base, Channel, Post, ParseLog, ChannelError, User
 from config import settings, settings as cfg
+
+# Lazy import parser to avoid circular deps and heavy init
+_parser_module = None
+
+def _get_parser():
+    global _parser_module
+    if _parser_module is None:
+        from parser import MultiChannelParser
+        _parser_module = MultiChannelParser()
+    return _parser_module
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -1901,12 +1911,14 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 <div class="wrap">
 <header><h1>Channels</h1><a href="/" class="back">&larr; Back</a></header>
 
-<!-- Add channel form -->
+<!-- Add channel form + Parse trigger -->
 <div class="add-form">
 <input type="text" id="ch-input" placeholder="Username или numeric ID канала..." onkeydown="if(event.key==='Enter')addChannel()">
 <button id="ch-add-btn" onclick="addChannel()">+ Добавить канал</button>
+<button id="parse-btn" onclick="triggerParse()" style="background:#0984e3;color:#fff;margin-left:8px">🔄 Запустить парсинг</button>
 </div>
 <div class="add-msg" id="add-msg"></div>
+<div class="add-msg" id="parse-status" style="color:#64748b;font-size:12px;margin-top:4px"></div>
 
 <div class="stats" id="top-stats">
 <div class="stat"><div class="stat-v" id="s-total">-</div><div class="stat-l">Total</div></div>
@@ -2023,6 +2035,27 @@ async function addChannel(){
 }
 
 // Toggle channel active
+// Trigger parse
+async function triggerParse(){
+  var btn=$('parse-btn');
+  var status=$('parse-status');
+  btn.disabled=true;
+  status.textContent='Запуск парсинга...';
+  try{
+    var data=await api('/parse/trigger');
+    if(data.success){
+      status.textContent='Парсинг запущен! Каналов: '+data.status.channels_parsed;
+      setTimeout(function(){btn.disabled=false;},3000);
+    }else{
+      status.textContent='Ошибка: '+(data.error||'unknown');
+      btn.disabled=false;
+    }
+  }catch(e){
+    status.textContent='Ошибка: '+(e.message||e);
+    btn.disabled=false;
+  }
+}
+
 async function toggleChannel(id){
   try{
     var data=await api('/channel/toggle/'+id);
@@ -2042,6 +2075,7 @@ async function deleteChannel(id){
 
 // Export functions for onclick handlers
 window.addChannel=addChannel;
+window.triggerParse=triggerParse;
 window.toggleChannel=toggleChannel;
 window.deleteChannel=deleteChannel;
 
@@ -2510,6 +2544,45 @@ async def api_debug_routes():
 @app.get("/api/test", dependencies=[Depends(_get_auth_user)])
 async def api_test():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+# ─── API: Parse trigger ──────────────────────────────────────
+_parse_task = None
+_parse_status = {"running": False, "started_at": None, "finished_at": None, "error": None, "channels_parsed": 0}
+
+@app.get("/api/parse/trigger", dependencies=[Depends(_get_auth_user)])
+async def api_parse_trigger(background_tasks: BackgroundTasks):
+    """Trigger parsing of all active channels in background."""
+    global _parse_task, _parse_status
+    if _parse_status["running"]:
+        return {"success": False, "error": "Parsing already running", "status": _parse_status}
+    
+    async def _do_parse():
+        global _parse_status
+        _parse_status = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None, "error": None, "channels_parsed": 0}
+        try:
+            parser = _get_parser()
+            await parser.init_db()
+            results = await parser.parse_all(history=False)
+            _parse_status["channels_parsed"] = len(results)
+            _parse_status["running"] = False
+            _parse_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+            logger.info(f"[parse/trigger] Completed: {len(results)} channels")
+        except Exception as e:
+            logger.error(f"[parse/trigger] Error: {e}")
+            _parse_status["error"] = str(e)
+            _parse_status["running"] = False
+            _parse_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+    
+    import asyncio
+    _parse_task = asyncio.create_task(_do_parse())
+    return {"success": True, "message": "Parsing started in background", "status": _parse_status}
+
+
+@app.get("/api/parse/status", dependencies=[Depends(_get_auth_user)])
+async def api_parse_status():
+    """Get current parsing status."""
+    return {"status": _parse_status}
 
 
 # ─── API: Add channel ────────────────────────────────────────
