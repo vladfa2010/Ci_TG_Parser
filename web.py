@@ -162,7 +162,27 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-AUTH_SECRET_KEY = cfg.DATABASE_URL or "citg-secret-change-me"  # используем DB URL как секрет (уникальный per-instance)
+import secrets as _secrets
+AUTH_SECRET_KEY = cfg.DATABASE_URL or _secrets.token_hex(32)
+if not cfg.DATABASE_URL:
+    logger.warning("[security] DATABASE_URL not set, using random auth secret. Sessions will invalidate on restart.")
+
+# ─── Rate Limiter (simple in-memory) ─────────────────────────
+import time as _time
+_login_attempts: dict[str, list[float]] = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 900  # 15 minutes
+
+def _check_rate_limit(key: str) -> bool:
+    """Return True if within rate limit, False if exceeded."""
+    now = _time.time()
+    attempts = _login_attempts.get(key, [])
+    attempts = [t for t in attempts if now - t < LOGIN_WINDOW_SECONDS]
+    _login_attempts[key] = attempts
+    if len(attempts) >= MAX_LOGIN_ATTEMPTS:
+        return False
+    attempts.append(now)
+    return True
 SESSION_COOKIE_NAME = "citg_auth_v2"  # CHANGED to invalidate old sessions
 SESSION_MAX_AGE = 86400 * 7  # 7 days
 
@@ -216,13 +236,17 @@ async def _require_auth(request: Request):
     return user
 
 
-# Disable caching for all responses (prevent stale JS/HTML after deploy)
+# Security headers + no-cache for all responses
 @app.middleware("http")
-async def add_no_cache_headers(request, call_next):
+async def add_security_headers(request, call_next):
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+    response.headers["X-Frame-Options"] = "DENY"                        # Clickjacking protection
+    response.headers["X-Content-Type-Options"] = "nosniff"              # MIME sniffing protection
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"  # HSTS
     return response
 
 
@@ -2404,6 +2428,15 @@ async def login_page():
 
 @app.post("/login")
 async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
+    # Rate limiting by IP
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        error_html = LOGIN_HTML.replace(
+            '<div id="msg"></div>',
+            '<div id="msg" style="display:block;color:#f87171;text-align:center;margin-top:12px;font-size:13px">Too many attempts. Try again in 15 minutes.</div>'
+        )
+        return HTMLResponse(content=error_html, status_code=429)
+
     async with async_session() as session:
         result = await session.execute(select(User).where(User.username == username))
         user = result.scalar_one_or_none()
@@ -2418,7 +2451,14 @@ async def login_post(request: Request, username: str = Form(...), password: str 
         # Create session
         token = _sign_session(user.username)
         response = RedirectResponse(url="/", status_code=302)
-        response.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, max_age=SESSION_MAX_AGE, samesite="lax")
+        response.set_cookie(
+            SESSION_COOKIE_NAME, token,
+            httponly=True,
+            secure=True,          # HTTPS only (Render uses HTTPS)
+            path="/",             # All paths
+            max_age=SESSION_MAX_AGE,
+            samesite="lax",
+        )
         return response
 
 
