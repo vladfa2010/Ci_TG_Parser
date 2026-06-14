@@ -140,10 +140,9 @@ class MultiChannelParser:
         self.session_str = session_str
         self.db_url = db_url
 
-        # Semaphore ограничивает число одновременно парсимых каналов
-        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(
-            settings.MAX_CONCURRENT_CHANNELS
-        )
+        # Semaphore: 1 канал за раз чтобы избежать FloodWait
+        # (get_entity вызывается только для новых каналов — существующие берутся из БД)
+        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
 
         # Graceful shutdown
         self._shutdown_event: asyncio.Event = asyncio.Event()
@@ -680,6 +679,53 @@ class MultiChannelParser:
         return result
 
     # ------------------------------------------------------------------
+    # Channel lookup (NO get_entity — safe from FloodWait)
+    # ------------------------------------------------------------------
+
+    async def _lookup_channel(self, db_session: AsyncSession, identifier: str) -> Optional[Channel]:
+        """Ищет канал в БД по identifier БЕЗ вызова get_entity().
+
+        Returns:
+            Channel если найден, иначе None.
+        """
+        # По username
+        result = await db_session.execute(
+            select(Channel).where(Channel.username == identifier)
+        )
+        ch = result.scalar_one_or_none()
+        if ch:
+            return ch
+
+        # По numeric_id (bare positive number like "3147415698")
+        if identifier.isdigit():
+            num_id = int(identifier)
+            result = await db_session.execute(
+                select(Channel).where(Channel.numeric_id == num_id)
+            )
+            ch = result.scalar_one_or_none()
+            if ch:
+                return ch
+            # По telegram_id (-1003147415698)
+            result = await db_session.execute(
+                select(Channel).where(Channel.telegram_id == int(f"-100{identifier}"))
+            )
+            ch = result.scalar_one_or_none()
+            if ch:
+                return ch
+
+        # По bare negative ID (like "-740684703")
+        if identifier.startswith('-') and identifier[1:].isdigit():
+            int_id = int(identifier)
+            result = await db_session.execute(
+                select(Channel).where(Channel.telegram_id == int_id)
+            )
+            ch = result.scalar_one_or_none()
+            if ch:
+                return ch
+
+        return None
+
+    # ------------------------------------------------------------------
     # Core: parse all channels
     # ------------------------------------------------------------------
 
@@ -706,12 +752,18 @@ class MultiChannelParser:
                 channel: Optional[Channel] = None
 
                 try:
-                    # Синхронизируем канал СНАЧАЛА (нужен channel.id для лога)
-                    channel = await self._with_retry(
-                        lambda: self.sync_channel(db_session, username),
-                        channel_name=username,
-                        operation="sync_channel",
-                    )
+                    # 1. Сначала ищем в БД БЕЗ get_entity (быстро, без FloodWait)
+                    channel = await self._lookup_channel(db_session, username)
+                    if channel:
+                        logger.debug("[%s] Канал найден в БД: tid=%s", username, channel.telegram_id)
+                    else:
+                        # 2. Fallback: sync через Telegram API (get_entity — медленно)
+                        logger.info("[%s] Канал не найден в БД, sync через Telegram...", username)
+                        channel = await self._with_retry(
+                            lambda: self.sync_channel(db_session, username),
+                            channel_name=username,
+                            operation="sync_channel",
+                        )
 
                     # Проверяем, не деактивирован ли канал
                     if not channel.is_active:
@@ -820,19 +872,12 @@ class MultiChannelParser:
             settings.MAX_CONCURRENT_CHANNELS,
         )
 
-        # Запускаем каналы с задержкой (stagger) чтобы избежать FloodWait
-        # при одновременном sync_channel() / get_entity()
-        stagger_sec = 2.0
-        tasks = []
-        for i, ch in enumerate(channel_list):
-            task = self._parse_one_channel_wrapped(ch, limit, history)
-            tasks.append(task)
-            if (i + 1) % settings.MAX_CONCURRENT_CHANNELS == 0:
-                # Пауза между батчами
-                logger.info("Stagger: пауза %.1fs перед следующим батчем", stagger_sec)
-                await asyncio.sleep(stagger_sec)
-
-        # Запускаем все (Semaphore ограничит concurrency внутри)
+        # Собираем задачи — все запускаются сразу, но Semaphore=1
+        # гарантирует последовательное выполнение
+        tasks = [
+            self._parse_one_channel_wrapped(ch, limit, history)
+            for ch in channel_list
+        ]
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Собираем результаты
