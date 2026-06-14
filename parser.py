@@ -289,7 +289,19 @@ class MultiChannelParser:
             Экземпляр Channel (существующий или новый).
         """
         client = await self._ensure_client()
-        entity = await client.get_entity(identifier)
+
+        # Конвертируем numeric ID в полный telegram ID
+        entity_id = identifier
+        if identifier.isdigit():
+            # Numeric ID → -100{ID} (приватный канал)
+            entity_id = int(f"-100{identifier}")
+            logger.debug("[sync_channel] numeric ID '%s' → telegram ID %s", identifier, entity_id)
+        elif identifier.startswith('-') and identifier[1:].isdigit():
+            # Bare negative ID (группа/чат)
+            entity_id = int(identifier)
+            logger.debug("[sync_channel] bare negative ID → %s", entity_id)
+
+        entity = await client.get_entity(entity_id)
 
         # Определяем тип канала и numeric_id
         has_username = bool(getattr(entity, "username", None))
@@ -525,20 +537,15 @@ class MultiChannelParser:
                         min_id,
                     )
 
-            # --- Получаем entity канала ---
+            # --- Используем telegram_id напрямую (entity уже получен в sync_channel) ---
             client = await self._ensure_client()
-            entity = await self._with_retry(
-                lambda: client.get_entity(username),
-                channel_name=username,
-                operation="get_entity",
-            )
 
             # --- Rate limit перед началом iter_messages ---
             await asyncio.sleep(0.5)
 
-            # --- Итерируем сообщения ---
+            # --- Итерируем сообщения (по ID канала, без повторного get_entity) ---
             async for message in client.iter_messages(
-                entity,
+                channel.telegram_id,
                 limit=limit,
                 min_id=min_id if not history else 0,
             ):
@@ -813,13 +820,19 @@ class MultiChannelParser:
             settings.MAX_CONCURRENT_CHANNELS,
         )
 
-        # Собираем задачи
-        tasks = [
-            self._parse_one_channel_wrapped(ch, limit, history)
-            for ch in channel_list
-        ]
+        # Запускаем каналы с задержкой (stagger) чтобы избежать FloodWait
+        # при одновременном sync_channel() / get_entity()
+        stagger_sec = 2.0
+        tasks = []
+        for i, ch in enumerate(channel_list):
+            task = self._parse_one_channel_wrapped(ch, limit, history)
+            tasks.append(task)
+            if (i + 1) % settings.MAX_CONCURRENT_CHANNELS == 0:
+                # Пауза между батчами
+                logger.info("Stagger: пауза %.1fs перед следующим батчем", stagger_sec)
+                await asyncio.sleep(stagger_sec)
 
-        # Запускаем все параллельно (Semaphore ограничит concurrency)
+        # Запускаем все (Semaphore ограничит concurrency внутри)
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Собираем результаты
