@@ -136,28 +136,42 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: create tables, run migrations, ensure admin user."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Migration: make parse_logs.channel_id nullable (for old DBs)
-        try:
-            await conn.execute(text("""
-                ALTER TABLE parse_logs 
-                ALTER COLUMN channel_id DROP NOT NULL
-            """))
-            logger.info("[migrate] parse_logs.channel_id → nullable")
-        except Exception:
-            # Already nullable or other issue — ignore
-            pass
-    # Ensure admin user exists
-    async with async_session() as session:
-        result = await session.execute(select(User))
-        if result.scalars().first() is None:
-            admin = User(username="vlad", is_active=True)
-            admin.set_password("!1234567890")
-            session.add(admin)
-            await session.commit()
-            logger.info("Default admin user 'vlad' created")
-    yield
+    startup_error = None
+    try:
+        logger.info("[lifespan] Starting up...")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            logger.info("[lifespan] Tables created")
+            try:
+                await conn.execute(text("""
+                    ALTER TABLE parse_logs 
+                    ALTER COLUMN channel_id DROP NOT NULL
+                """))
+                logger.info("[lifespan] Migration: channel_id → nullable")
+            except Exception:
+                pass
+        async with async_session() as session:
+            result = await session.execute(select(User))
+            if result.scalars().first() is None:
+                admin = User(username="vlad", is_active=True)
+                admin.set_password("!1234567890")
+                session.add(admin)
+                await session.commit()
+                logger.info("[lifespan] Default admin user 'vlad' created")
+            else:
+                logger.info("[lifespan] Admin user already exists")
+        logger.info("[lifespan] Startup complete")
+    except Exception as e:
+        startup_error = e
+        logger.critical("[lifespan] STARTUP ERROR: %s: %s", type(e).__name__, e)
+        import traceback
+        traceback.print_exc()
+    
+    yield  # MUST yield even on error, otherwise FastAPI won't start
+    
+    if startup_error:
+        logger.warning("[lifespan] App ran with startup error: %s", startup_error)
+    logger.info("[lifespan] Shutting down...")
     # Shutdown cleanup if needed
 
 app = FastAPI(lifespan=lifespan)
