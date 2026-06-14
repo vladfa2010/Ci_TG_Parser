@@ -133,23 +133,23 @@ DATABASE_URL = cfg.database_url_async
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup: create tables, run migrations, ensure admin user."""
-    startup_error = None
+@app.on_event("startup")
+async def startup():
+    """Create tables, ensure admin user."""
     try:
-        logger.info("[lifespan] Starting up...")
+        logger.info("[startup] Initializing...")
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            logger.info("[lifespan] Tables created")
+            logger.info("[startup] Tables OK")
             try:
                 await conn.execute(text("""
                     ALTER TABLE parse_logs 
                     ALTER COLUMN channel_id DROP NOT NULL
                 """))
-                logger.info("[lifespan] Migration: channel_id → nullable")
             except Exception:
                 pass
+        logger.info("[startup] DB ready")
+
         async with async_session() as session:
             result = await session.execute(select(User))
             if result.scalars().first() is None:
@@ -157,24 +157,14 @@ async def lifespan(app: FastAPI):
                 admin.set_password("!1234567890")
                 session.add(admin)
                 await session.commit()
-                logger.info("[lifespan] Default admin user 'vlad' created")
-            else:
-                logger.info("[lifespan] Admin user already exists")
-        logger.info("[lifespan] Startup complete")
+                logger.info("[startup] Admin user 'vlad' created")
+        logger.info("[startup] Complete")
     except Exception as e:
-        startup_error = e
-        logger.critical("[lifespan] STARTUP ERROR: %s: %s", type(e).__name__, e)
+        logger.critical("[startup] ERROR: %s: %s", type(e).__name__, e)
         import traceback
         traceback.print_exc()
-    
-    yield  # MUST yield even on error, otherwise FastAPI won't start
-    
-    if startup_error:
-        logger.warning("[lifespan] App ran with startup error: %s", startup_error)
-    logger.info("[lifespan] Shutting down...")
-    # Shutdown cleanup if needed
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 import secrets as _secrets
 AUTH_SECRET_KEY = cfg.DATABASE_URL or _secrets.token_hex(32)
