@@ -688,12 +688,15 @@ class MultiChannelParser:
         Returns:
             Channel если найден, иначе None.
         """
+        logger.debug("[_lookup_channel] Searching for: '%s'", identifier)
+
         # По username
         result = await db_session.execute(
             select(Channel).where(Channel.username == identifier)
         )
         ch = result.scalar_one_or_none()
         if ch:
+            logger.info("[_lookup_channel] '%s' found by username", identifier)
             return ch
 
         # По numeric_id (bare positive number like "3147415698")
@@ -704,14 +707,18 @@ class MultiChannelParser:
             )
             ch = result.scalar_one_or_none()
             if ch:
+                logger.info("[_lookup_channel] '%s' found by numeric_id=%s", identifier, num_id)
                 return ch
             # По telegram_id (-1003147415698)
+            tid = int(f"-100{identifier}")
             result = await db_session.execute(
-                select(Channel).where(Channel.telegram_id == int(f"-100{identifier}"))
+                select(Channel).where(Channel.telegram_id == tid)
             )
             ch = result.scalar_one_or_none()
             if ch:
+                logger.info("[_lookup_channel] '%s' found by telegram_id=%s", identifier, tid)
                 return ch
+            logger.warning("[_lookup_channel] '%s' NOT found (numeric_id=%s, tid=%s)", identifier, num_id, tid)
 
         # По bare negative ID (like "-740684703")
         if identifier.startswith('-') and identifier[1:].isdigit():
@@ -721,7 +728,20 @@ class MultiChannelParser:
             )
             ch = result.scalar_one_or_none()
             if ch:
+                logger.info("[_lookup_channel] '%s' found by bare negative tid=%s", identifier, int_id)
                 return ch
+            logger.warning("[_lookup_channel] '%s' NOT found (bare tid=%s)", identifier, int_id)
+
+        # Fallback: list ALL active channels to help debug
+        result = await db_session.execute(
+            select(Channel.telegram_id, Channel.numeric_id, Channel.username, Channel.title)
+            .where(Channel.is_active == True)
+            .limit(10)
+        )
+        rows = result.all()
+        logger.warning("[_lookup_channel] Active channels in DB (%d shown):", len(rows))
+        for row in rows:
+            logger.warning("  tid=%s numeric=%s username=%s title=%s", row.telegram_id, row.numeric_id, row.username, row.title)
 
         return None
 
