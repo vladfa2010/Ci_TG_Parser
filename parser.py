@@ -330,7 +330,11 @@ class MultiChannelParser:
             entity_id = int(identifier)
             logger.debug("[sync_channel] bare negative ID → %s", entity_id)
 
-        entity = await client.get_entity(entity_id)
+        try:
+            entity = await client.get_entity(entity_id)
+        except FloodWaitError as e:
+            logger.warning("[sync_channel] FloodWait %d сек для %s — пропускаем", e.seconds, identifier)
+            raise ValueError(f"FloodWait: {e.seconds} сек — канал временно недоступен")
 
         # Определяем тип канала и numeric_id
         has_username = bool(getattr(entity, "username", None))
@@ -798,7 +802,8 @@ class MultiChannelParser:
         """
         async with self._semaphore:
             # Пауза между каналами (чтобы не спамить Telegram API)
-            await asyncio.sleep(2)
+            # Увеличена до 5 секунд для приватных каналов чтобы избежать FloodWait
+            await asyncio.sleep(5)
             
             if self._is_shutting_down:
                 return username, ParseResult(
@@ -893,9 +898,7 @@ class MultiChannelParser:
         """
         async with self._db_session() as db_session:
             result = await db_session.execute(
-                select(Channel).where(
-                    (Channel.is_active == True) & (Channel.parse_error_count < 3)
-                )
+                select(Channel).where(Channel.is_active == True)
             )
             channels = result.scalars().all()
             identifiers = []
