@@ -134,10 +134,11 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 # ─── Lazy DB init (called on first API request) ─────────────────────
 _db_initialized = False
+_sender_name_ok = False  # cached: does posts.sender_name column exist?
 
 async def _ensure_db():
     """Create tables and admin user on first call. Idempotent and lock-safe."""
-    global _db_initialized
+    global _db_initialized, _sender_name_ok
     if _db_initialized:
         return
     try:
@@ -161,20 +162,25 @@ async def _ensure_db():
                 except Exception:
                     pass  # Already done by another instance
 
-                # Migration: add sender_name to posts if missing
-                try:
-                    result = await conn.execute(text("""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_name = 'posts' AND column_name = 'sender_name'
-                    """))
-                    if not result.fetchone():
-                        await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
-                        await conn.execute(text(
-                            "ALTER TABLE posts ADD COLUMN sender_name VARCHAR(255)"
-                        ))
-                        logger.info("[migrate] posts.sender_name column added")
-                except Exception:
-                    pass
+            # Migration: add sender_name to posts if missing (ALWAYS check)
+            try:
+                result = await conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'posts' AND column_name = 'sender_name'
+                """))
+                if result.fetchone():
+                    _sender_name_ok = True
+                    logger.info("[migrate] posts.sender_name exists")
+                else:
+                    await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                    await conn.execute(text(
+                        "ALTER TABLE posts ADD COLUMN sender_name VARCHAR(255)"
+                    ))
+                    _sender_name_ok = True
+                    logger.info("[migrate] posts.sender_name column added")
+            except Exception:
+                _sender_name_ok = False
+                logger.warning("[migrate] posts.sender_name check failed, will use NULL")
 
         async with async_session() as session:
             # Reactivate all channels once on startup (recovers from auto-deactivation bug)
@@ -3229,33 +3235,21 @@ async def api_posts(
 
             order_col = "p.views_count DESC" if sort == "views" else "p.published_at DESC"
 
-            # Try with sender_name, fallback without it (column may not exist yet)
-            try:
-                result = await session.execute(text(f"""
-                    SELECT p.telegram_message_id, p.text, p.views_count,
-                           p.hashtags, p.published_at,
-                           NULLIF(p.sender_name, '') as sender_name,
-                           c.username as channel_username, c.title as channel_title,
-                           c.channel_type, c.numeric_id
-                    FROM posts p
-                    JOIN channels c ON p.channel_id = c.id
-                    WHERE 1=1 {ch_filter} {search_filter}
-                    ORDER BY {order_col}
-                    LIMIT :limit OFFSET :offset
-                """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
-            except Exception:
-                result = await session.execute(text(f"""
-                    SELECT p.telegram_message_id, p.text, p.views_count,
-                           p.hashtags, p.published_at,
-                           NULL as sender_name,
-                           c.username as channel_username, c.title as channel_title,
-                           c.channel_type, c.numeric_id
-                    FROM posts p
-                    JOIN channels c ON p.channel_id = c.id
-                    WHERE 1=1 {ch_filter} {search_filter}
-                    ORDER BY {order_col}
-                    LIMIT :limit OFFSET :offset
-                """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
+            # Check if sender_name exists (cached in module-level flag)
+            sql_sender = "NULLIF(p.sender_name, '') as sender_name" if _sender_name_ok else "NULL as sender_name"
+            
+            result = await session.execute(text(f"""
+                SELECT p.telegram_message_id, p.text, p.views_count,
+                       p.hashtags, p.published_at,
+                       {sql_sender},
+                       c.username as channel_username, c.title as channel_title,
+                       c.channel_type, c.numeric_id
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE 1=1 {ch_filter} {search_filter}
+                ORDER BY {order_col}
+                LIMIT :limit OFFSET :offset
+            """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
             rows = result.mappings().all()
             return {"posts": [
                 {
