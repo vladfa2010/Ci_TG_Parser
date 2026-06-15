@@ -10,7 +10,7 @@ set -e
 echo "=== CITG v2 ==="
 echo "APP_MODE: ${APP_MODE:-parser}"
 echo "PORT: ${PORT:-10000}"
-echo "CHANNELS: ${CHANNELS:-markettwits}"
+echo "CHANNELS: ${CHANNELS:-<not set, using DB only>}"
 echo "===================="
 
 if [ "$APP_MODE" = "web" ]; then

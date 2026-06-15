@@ -30,7 +30,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
@@ -57,7 +57,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-utc_now = datetime.now(timezone.utc)
+def _now() -> datetime:
+    """Текущее UTC время (вызывается каждый раз — не кэшируется)."""
+    return datetime.now(timezone.utc)
 
 
 def _extract_hashtags(text: str) -> list[str]:
@@ -91,11 +93,6 @@ def _get_media_type(message: Message) -> Optional[str]:
     if message.document:
         return "document"
     return "other"
-
-
-def _now() -> datetime:
-    """Текущее UTC время."""
-    return datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +160,20 @@ class MultiChannelParser:
     # ------------------------------------------------------------------
 
     def _setup_signal_handlers(self) -> None:
-        """Регистрирует обработчики SIGTERM / SIGINT для graceful shutdown."""
-        loop = asyncio.get_event_loop()
+        """Регистрирует обработчики SIGTERM / SIGINT для graceful shutdown.
+
+        Called lazily on first _ensure_client() to guarantee a running loop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # No loop yet — will retry on _ensure_client()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, self._signal_handler, sig)
-            except NotImplementedError:
+            except (NotImplementedError, ValueError):
                 # Windows не поддерживает add_signal_handler
+                # ValueError: signal only works in main thread
                 pass
 
     def _signal_handler(self, sig: int) -> None:
@@ -187,7 +191,14 @@ class MultiChannelParser:
     # ------------------------------------------------------------------
 
     async def init_db(self) -> None:
-        """Создаёт engine, session factory и таблицы (если не существуют)."""
+        """Создаёт engine, session factory и таблицы (если не существуют).
+
+        Idempotent: safe to call multiple times. Disposes old engine
+        to prevent connection leaks.
+        """
+        if self._engine is not None:
+            await self._engine.dispose()
+
         self._engine = create_async_engine(
             self.db_url,
             echo=False,
@@ -199,17 +210,30 @@ class MultiChannelParser:
             class_=AsyncSession,
             expire_on_commit=False,
         )
-        async with self._engine.begin() as conn:
+
+        # create_all вне транзакции — избегаем deadlock при параллельных инстансах
+        async with self._engine.connect() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # Migration: make parse_logs.channel_id nullable
-            try:
-                await conn.execute(text("""
-                    ALTER TABLE parse_logs 
-                    ALTER COLUMN channel_id DROP NOT NULL
-                """))
-                logger.info("[migrate] parse_logs.channel_id → nullable")
-            except Exception:
-                pass
+            await conn.commit()
+
+        # One-time migration: make parse_logs.channel_id nullable
+        # Check first to avoid AccessExclusiveLock contention
+        async with self._engine.begin() as conn:
+            result = await conn.execute(text("""
+                SELECT is_nullable FROM information_schema.columns
+                WHERE table_name = 'parse_logs' AND column_name = 'channel_id'
+            """))
+            row = result.fetchone()
+            if row and row[0] == 'NO':
+                await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                try:
+                    await conn.execute(text(
+                        "ALTER TABLE parse_logs ALTER COLUMN channel_id DROP NOT NULL"
+                    ))
+                    logger.info("[migrate] parse_logs.channel_id → nullable")
+                except Exception:
+                    pass  # Already done by another instance
+
         logger.info("База данных инициализирована")
         # Create default admin user if not exists
         await self._ensure_admin_user()
@@ -461,15 +485,6 @@ class MultiChannelParser:
         channel.parse_error_count += 1
         channel.last_error_message = error_message
         channel.last_error_at = _now()
-
-        if channel.parse_error_count >= 3:
-            channel.is_active = False
-            logger.critical(
-                "Канал %s деактивирован после %d ошибок",
-                channel.username,
-                channel.parse_error_count,
-            )
-
         await db_session.commit()
 
     # ------------------------------------------------------------------
@@ -901,10 +916,6 @@ class MultiChannelParser:
             channel_list = channels
         else:
             channel_list = await self._get_active_channels_from_db()
-            # Fallback: если БД пустая — используем env var
-            if not channel_list:
-                channel_list = settings.channels_list
-                logger.info("БД пустая, используем CHANNELS из env: %s", channel_list)
 
         if not channel_list:
             logger.warning("Список каналов пуст — нечего парсить")

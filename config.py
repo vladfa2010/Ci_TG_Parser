@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",
+        extra="forbid",
     )
 
     # --- Обязательные поля ---
@@ -64,11 +64,12 @@ class Settings(BaseSettings):
     TG_API_ID: int = Field(
         0,
         description="Telegram API ID (положительное целое число)",
-        ge=0,
+        ge=1,
     )
     TG_API_HASH: str = Field(
         "",
         description="Telegram API hash",
+        min_length=1,
     )
     DATABASE_URL: str = Field(
         ...,
@@ -81,13 +82,14 @@ class Settings(BaseSettings):
     TG_STRING_SESSION: str = Field(
         default="",
         description="Строковая сессия Telethon",
+        repr=False,
     )
     TG_SESSION: str = Field(
         default="/app/sessions/parser_session",
         description="Путь к файловой сессии Telethon",
     )
     CHANNELS: str = Field(
-        default="markettwits",
+        default="",
         description="Список каналов через запятую",
     )
     HISTORY: bool = Field(
@@ -121,7 +123,7 @@ class Settings(BaseSettings):
     RETRY_DELAY_BASE: int = Field(
         default=2,
         description="Базовая задержка retry (секунды)",
-        ge=0,
+        ge=1,
     )
     LOG_LEVEL: str = Field(
         default="INFO",
@@ -187,7 +189,7 @@ class Settings(BaseSettings):
         Raises:
             ValueError: Если указан недопустимый уровень.
         """
-        allowed = {"DEBUG", "INFO", "WARNING", "ERROR"}
+        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
         value_upper = value.upper()
         if value_upper not in allowed:
             raise ValueError(

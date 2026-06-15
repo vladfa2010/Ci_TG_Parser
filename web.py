@@ -136,21 +136,31 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 _db_initialized = False
 
 async def _ensure_db():
-    """Create tables and admin user on first call."""
+    """Create tables and admin user on first call. Idempotent and lock-safe."""
     global _db_initialized
     if _db_initialized:
         return
-    _db_initialized = True
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            try:
-                await conn.execute(text("""
-                    ALTER TABLE parse_logs 
-                    ALTER COLUMN channel_id DROP NOT NULL
-                """))
-            except Exception:
-                pass
+
+            # Check if migration is actually needed before ALTER TABLE
+            # to avoid AccessExclusiveLock contention between instances.
+            result = await conn.execute(text("""
+                SELECT is_nullable FROM information_schema.columns
+                WHERE table_name = 'parse_logs' AND column_name = 'channel_id'
+            """))
+            row = result.fetchone()
+            if row and row[0] == 'NO':
+                await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                try:
+                    await conn.execute(text(
+                        "ALTER TABLE parse_logs ALTER COLUMN channel_id DROP NOT NULL"
+                    ))
+                    logger.info("[migrate] parse_logs.channel_id → nullable")
+                except Exception:
+                    pass  # Already done by another instance
+
         async with async_session() as session:
             result = await session.execute(select(User))
             if result.scalars().first() is None:
@@ -159,6 +169,8 @@ async def _ensure_db():
                 session.add(admin)
                 await session.commit()
                 logger.info("[lazy-init] Admin user 'vlad' created")
+
+        _db_initialized = True
     except Exception as e:
         logger.error("[lazy-init] DB init error: %s", e)
 
@@ -166,8 +178,16 @@ async def _ensure_db():
 app = FastAPI()
 
 import secrets as _secrets
-AUTH_SECRET_KEY = cfg.DATABASE_URL or _secrets.token_hex(32)
-if not cfg.DATABASE_URL:
+
+# Derive a stable auth key from DATABASE_URL (hashed) or generate random.
+# Never use raw DATABASE_URL as key — it would allow session forgery.
+_db_url = cfg.DATABASE_URL or ""
+if _db_url:
+    AUTH_SECRET_KEY = hashlib.sha256(
+        (_db_url + "citg-auth-v2-salt").encode()
+    ).hexdigest()[:32]
+else:
+    AUTH_SECRET_KEY = _secrets.token_hex(32)
     logger.warning("[security] DATABASE_URL not set, using random auth secret. Sessions will invalidate on restart.")
 
 # ─── Rate Limiter (simple in-memory) ─────────────────────────
@@ -1646,7 +1666,7 @@ async function load(){
     var posts=d.posts||[];
     if(!posts.length){$('content').innerHTML='<div class="empty">No viral posts</div>';hideLoader();return;}
     $('content').innerHTML=posts.map(function(p,i){
-      var ch=p.channel_username||'markettwits';
+      var ch=p.channel_username||'unknown';
       var link=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:'https://t.me/'+ch+'/'+p.id;
       return'<div class="vpost" onclick="window.open(\''+link+'\')">'+
         '<div class="vpost-head"><span>#'+(i+1)+'</span><span class="vpost-ch">@'+esc(ch)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div>'+
@@ -1852,7 +1872,7 @@ async function load(){
     var posts=d.posts||[],tickers=d.tickers||[];
     if(!posts.length){$('content').innerHTML='<div class="empty">No cross-market posts</div>';hideLoader();return;}
     $('content').innerHTML=posts.slice(0,10).map(function(p){
-      var ch=p.channel_username||'markettwits';
+      var ch=p.channel_username||'unknown';
       var link=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:'https://t.me/'+ch+'/'+p.id;
       return'<div class="xpost" onclick="window.open(\''+link+'\')">'+
         '<div class="xpost-head"><span>Views '+fmt(p.views)+' | '+(p.published?p.published.slice(0,16).replace('T',' '):'')+' | @'+esc(ch)+'</span></div>'+
@@ -2736,6 +2756,34 @@ async def _run_parser_background():
 async def api_parse_status():
     """Get current parsing status (for live progress polling)."""
     return {"state": _parse_state}
+
+
+# ─── API: Reactivate all channels (admin only) ───────────────
+@app.post("/api/admin/reactivate-all", dependencies=[Depends(_get_auth_user)])
+async def api_admin_reactivate_all():
+    """Reactivate ALL channels and reset error counts."""
+    try:
+        await _ensure_db()
+        async with async_session() as session:
+            result = await session.execute(
+                text("""
+                    UPDATE channels 
+                    SET is_active = TRUE, parse_error_count = 0, 
+                        last_error_message = NULL, last_error_at = NULL
+                    WHERE is_active = FALSE OR parse_error_count > 0
+                    RETURNING id, username, telegram_id
+                """)
+            )
+            updated = result.mappings().all()
+            await session.commit()
+            return {
+                "success": True,
+                "reactivated": len(updated),
+                "channels": [{"id": r["id"], "username": r["username"], "tid": r["telegram_id"]} for r in updated]
+            }
+    except Exception as e:
+        logger.error("[reactivate-all] Error: %s", e)
+        return json_response({"error": str(e)}, 500)
 
 
 # ─── API: Add channel ────────────────────────────────────────
@@ -4020,7 +4068,7 @@ async def crossmarket_links(days: int = Query(7, ge=1, le=30), channel: Optional
 
 
 # ─── RSS Feed ────────────────────────────────────────────────
-_RSS_CHANNELS = [c.strip() for c in cfg.CHANNELS.split(",") if c.strip()] if hasattr(cfg, 'CHANNELS') and cfg.CHANNELS else ["markettwits"]
+_RSS_CHANNELS = []  # Channels managed via web UI only
 
 
 @app.get("/rss", dependencies=[Depends(_get_auth_user)])
