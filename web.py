@@ -165,12 +165,6 @@ async def _ensure_db():
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def startup():
-    """Schedule background DB init — returns immediately."""
-    asyncio.create_task(_init_db_background())
-    logger.info("[startup] DB init scheduled in background")
-
 import secrets as _secrets
 AUTH_SECRET_KEY = cfg.DATABASE_URL or _secrets.token_hex(32)
 if not cfg.DATABASE_URL:
