@@ -148,6 +148,9 @@ class MultiChannelParser:
         self._shutdown_event: asyncio.Event = asyncio.Event()
         self._setup_signal_handlers()
 
+        # Callback for live progress reporting (injected by web layer)
+        self._progress_callback: Optional[Callable[..., None]] = None
+
         # Telethon client (инициализируется позже)
         self._client: Optional[TelegramClient] = None
 
@@ -772,6 +775,13 @@ class MultiChannelParser:
                     error_message="Shutdown before start"
                 )
 
+            # Report: starting this channel
+            if self._progress_callback:
+                self._progress_callback(
+                    current_channel=username,
+                    current_operation=f"Parsing {username}...",
+                )
+
             start_ts = time.monotonic()
             async with self._db_session() as db_session:
                 result: ParseResult
@@ -833,6 +843,15 @@ class MultiChannelParser:
                 )
                 db_session.add(log)
                 await db_session.commit()
+
+                # Report: channel done (web layer will increment counters)
+                if self._progress_callback:
+                    self._progress_callback(
+                        increment_channels_done=1,
+                        increment_posts_new=result.posts_new,
+                        increment_posts_parsed=result.posts_parsed,
+                        current_operation=f"Done {username}: +{result.posts_new} posts",
+                    )
 
                 return username, result
 
@@ -897,6 +916,12 @@ class MultiChannelParser:
             len(channel_list),
             settings.MAX_CONCURRENT_CHANNELS,
         )
+        if self._progress_callback:
+            self._progress_callback(
+                channels_total=len(channel_list),
+                channels_done=0,
+                current_operation=f"Starting {len(channel_list)} channels...",
+            )
 
         # Собираем задачи — все запускаются сразу, но Semaphore=1
         # гарантирует последовательное выполнение

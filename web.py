@@ -2073,23 +2073,74 @@ async function addChannel(){
 }
 
 // Toggle channel active
-// Trigger parse
+// ─── Live Parse Progress ────────────────────────────────────
+var _parsePollInterval=null;
+
+function _renderProgress(state){
+  var el=$('parse-status');
+  if(!state.running){
+    if(state.finished_at){
+      var done=state.channels_done||0;
+      var posts=state.posts_new_total||0;
+      el.innerHTML='<span style="color:#00d4aa">Complete: '+done+' channels, +'+posts+' posts</span>';
+    }else{
+      el.innerHTML='';
+    }
+    return;
+  }
+  var total=state.channels_total||0;
+  var done=state.channels_done||0;
+  var posts=state.posts_new_total||0;
+  var current=state.current_channel||'...';
+  var op=state.current_operation||'Working...';
+  var pct=total>0?Math.round(done/total*100):0;
+  
+  el.innerHTML=
+    '<div style="margin-top:10px;padding:12px;background:#0f172a;border:1px solid #1e293b;border-radius:10px">'+
+      '<div style="display:flex;justify-content:space-between;margin-bottom:6px;font-size:13px">'+
+        '<span style="color:#94a3b8">'+esc(op)+'</span>'+
+        '<span style="color:#00d4aa;font-weight:600">'+done+'/'+total+' ('+pct+'%)</span>'+
+      '</div>'+
+      '<div style="background:#1e293b;height:6px;border-radius:3px;overflow:hidden">'+
+        '<div style="background:#00d4aa;height:100%;width:'+pct+'%;transition:width .3s"></div>'+
+      '</div>'+
+      '<div style="margin-top:6px;font-size:12px;color:#64748b">'+
+        'Posts: +'+posts+' new'+(current?' | Current: '+esc(current):'')+
+      '</div>'+
+    '</div>';
+}
+
+async function _pollParseStatus(){
+  try{
+    var data=await api('/parse/status');
+    var state=data.state||{};
+    _renderProgress(state);
+    if(!state.running&&state.finished_at){
+      clearInterval(_parsePollInterval);
+      _parsePollInterval=null;
+      $('parse-btn').disabled=false;
+      loadAll();
+      return;
+    }
+  }catch(e){console.error('poll error',e);}
+}
+
 async function triggerParse(){
   var btn=$('parse-btn');
-  var status=$('parse-status');
   btn.disabled=true;
-  status.textContent='Запуск парсинга...';
+  _renderProgress({running:true,channels_total:0,channels_done:0,current_operation:'Starting...'});
   try{
     var data=await api('/parse/trigger');
     if(data.success){
-      status.textContent='Парсинг запущен! Следующий через 5 мин.';
-      setTimeout(function(){btn.disabled=false;status.textContent='';},5000);
+      if(_parsePollInterval) clearInterval(_parsePollInterval);
+      _parsePollInterval=setInterval(_pollParseStatus,3000);
+      _pollParseStatus();
     }else{
-      status.textContent='Ошибка: '+(data.error||'unknown');
+      _renderProgress({running:false,error:data.error});
       btn.disabled=false;
     }
   }catch(e){
-    status.textContent='Ошибка: '+(e.message||e);
+    $('parse-status').innerHTML='<span style="color:#f87171">Error: '+esc(e.message||'')+'</span>';
     btn.disabled=false;
   }
 }
@@ -2601,8 +2652,32 @@ async def api_test():
 
 
 # ─── API: Parse trigger ──────────────────────────────────────
-_parse_task = None
-_parse_status = {"running": False, "started_at": None, "finished_at": None, "error": None, "channels_parsed": 0}
+# Rich parse state for live progress tracking
+_parse_state = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "current_channel": None,
+    "current_operation": None,
+    "channels_total": 0,
+    "channels_done": 0,
+    "posts_new_total": 0,
+    "posts_parsed_total": 0,
+    "error": None,
+}
+
+def _update_parse_state(**kwargs):
+    """Callback: parser calls this to update live status."""
+    global _parse_state
+    for k, v in kwargs.items():
+        if k == "increment_channels_done" and v:
+            _parse_state["channels_done"] = _parse_state.get("channels_done", 0) + v
+        elif k == "increment_posts_new" and v:
+            _parse_state["posts_new_total"] = _parse_state.get("posts_new_total", 0) + v
+        elif k == "increment_posts_parsed" and v:
+            _parse_state["posts_parsed_total"] = _parse_state.get("posts_parsed_total", 0) + v
+        elif k in _parse_state:
+            _parse_state[k] = v
 
 @app.get("/api/parse/trigger", dependencies=[Depends(_get_auth_user)])
 async def api_parse_trigger(background_tasks: BackgroundTasks):
@@ -2610,30 +2685,57 @@ async def api_parse_trigger(background_tasks: BackgroundTasks):
     
     Returns immediately — parsing runs in background without blocking web.
     """
+    global _parse_state
+    if _parse_state["running"]:
+        return {"success": False, "error": "Parsing already running", "state": _parse_state}
+    
     # Ensure DB is initialized
     await _ensure_db()
+    
+    # Reset state
+    _parse_state = {
+        "running": True,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "current_channel": None,
+        "current_operation": "Starting...",
+        "channels_total": 0,
+        "channels_done": 0,
+        "posts_new_total": 0,
+        "posts_parsed_total": 0,
+        "error": None,
+    }
     
     # Add parsing task to background — doesn't block HTTP response
     background_tasks.add_task(_run_parser_background)
     
-    return {"success": True, "message": "Parsing started in background (check /channels for updates)"}
+    return {"success": True, "message": "Parsing started", "state": _parse_state}
 
 async def _run_parser_background():
     """Background parsing task — runs in event loop without blocking web."""
+    global _parse_state
     logger.info("[bg-parse] Starting background parse...")
     try:
         parser = _get_parser()
         await parser.init_db()
+        # Inject callback so parser reports live progress
+        parser._progress_callback = _update_parse_state
         results = await parser.parse_all(history=False)
-        logger.info("[bg-parse] Completed: %d channels parsed", len(results))
+        _parse_state["running"] = False
+        _parse_state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        _parse_state["current_operation"] = "Complete"
+        logger.info("[bg-parse] Completed: %d channels", len(results))
     except Exception as e:
         logger.error("[bg-parse] Error: %s", e)
+        _parse_state["error"] = str(e)
+        _parse_state["running"] = False
+        _parse_state["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
 @app.get("/api/parse/status", dependencies=[Depends(_get_auth_user)])
 async def api_parse_status():
-    """Get current parsing status."""
-    return {"status": _parse_status}
+    """Get current parsing status (for live progress polling)."""
+    return {"state": _parse_state}
 
 
 # ─── API: Add channel ────────────────────────────────────────
