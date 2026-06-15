@@ -601,6 +601,7 @@ async function loadTags(hours){hours=hours||tagHours;if(loading.tags)return;load
 document.querySelectorAll('#tag-period button').forEach(function(btn){btn.addEventListener('click',function(){document.querySelectorAll('#tag-period button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');loadTags(parseInt(btn.dataset.h))})});
 
 loadChannels();
+loadChannelStats();
 loadPosts();
 })();
 </script>
