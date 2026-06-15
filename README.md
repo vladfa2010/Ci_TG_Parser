@@ -12,7 +12,7 @@
 | **Приватные каналы** | Поддержка `https://t.me/c/{id}` — каналы без @username |
 | **Управление каналами через веб** | Добавление / включение / выключение / удаление через UI на `/channels` |
 | **Авторизация** | Cookie-сессии для браузера + Basic Auth для API. Предустановленный юзер `vlad` |
-| **Retry + Health tracking** | 3 попытки с exponential backoff. Автоотключение канала после 3 ошибок |
+| **Live parse progress** | Панель статуса: текущий канал, % выполнения, новых постов, время |
 | **Глобальная дедупликация** | Посты дедуплицируются по хэшу текста между всеми каналами |
 | **Cross-channel аналитика** | Сравнение каналов по активности, просмотрам, хэштегам |
 
@@ -98,7 +98,6 @@ TG_STRING_SESSION=<строка сессии>
 **Env vars:**
 ```
 DATABASE_URL=<из citg-db>
-CHANNELS=markettwits
 MAX_CONCURRENT_CHANNELS=10
 HISTORY=0
 ```
@@ -109,6 +108,8 @@ TG_API_ID=<твой API ID>
 TG_API_HASH=<твой API hash>
 TG_STRING_SESSION=<строка сессии>
 ```
+
+> Каналы добавляются только через веб-интерфейс. `CHANNELS` env var больше не используется.
 
 ### 4. Генерация TG_STRING_SESSION (локально)
 
@@ -128,8 +129,14 @@ python generate_session.py
 После деплоя `citg-web` автоматически:
 - Создаст таблицы в БД
 - Создаст юзера `vlad` с паролем `!1234567890`
+- Реактивирует все ранее деактивированные каналы (one-time recovery)
 
 Открой `https://your-app.onrender.com/login` и войди.
+
+### 6. Добавление каналов
+
+> Важно: каналы добавляются **только через веб-интерфейс** (`/channels`).
+> Env var `CHANNELS` больше не используется как fallback.
 
 ---
 
@@ -139,12 +146,13 @@ python generate_session.py
 
 1. Открой `/channels` (через меню)
 2. В поле ввода вставь любой формат:
-   - `https://t.me/c/3147415698/1997`
-   - `https://t.me/markettwits`
+   - `https://t.me/c/3147415698/1997` (приватный канал)
+   - `https://t.me/channelname` (публичный канал)
    - `https://web.telegram.org/a/#-1003147415698`
    - `3147415698` (bare numeric ID)
-   - `@markettwits`
+   - `@channelname`
 3. Нажми **"+ Добавить канал"**
+4. Канал появится в списке → нажми **🔄 Запустить парсинг**
 
 ### Через API (curl)
 
@@ -170,7 +178,7 @@ curl -u "vlad:!1234567890" -X DELETE \
 
 | Тип | Пример ссылки | База данных |
 |-----|---------------|-------------|
-| Публичный | `https://t.me/markettwits` | `username = 'markettwits'` |
+| Публичный | `https://t.me/channelname` | `username = 'channelname'` |
 | Приватный | `https://t.me/c/3147415698/1997` | `numeric_id = 3147415698` |
 
 ---
@@ -201,13 +209,17 @@ curl -u "vlad:!1234567890" -X DELETE \
 - `GET /api/channels` — список каналов с метриками
 - `GET /api/channel/add?identifier=` — добавить канал
 - `GET /api/channel/toggle/{id}` — включить/выключить
-- `DELETE /api/channel/delete/{id}` — удалить
+- `DELETE /api/channel/delete/{id}` — удалить (каскадно удаляет посты и логи)
 - `GET /api/channels/comparison` — cross-channel сравнение
 
 ### Посты
 - `GET /api/stats` — статистика
 - `GET /api/posts` — список постов
 - `GET /api/tags` — хэштеги
+
+### Парсинг
+- `GET /api/parse/trigger` — запустить парсинг всех активных каналов
+- `GET /api/parse/status` — статус текущего парсинга (polling)
 
 ### Прочее
 - `GET /api/test` — проверка работоспособности
@@ -226,7 +238,6 @@ curl -u "vlad:!1234567890" -X DELETE \
 | `TG_API_HASH` | да | — | Telegram API hash |
 | `TG_STRING_SESSION` | да | — | Строковая сессия |
 | `PORT` | нет | 10000 | Порт для веб-сервера |
-| `CHANNELS` | нет | `markettwits` | Начальные каналы (fallback) |
 | `MAX_CONCURRENT_CHANNELS` | нет | 10 | Параллельных каналов |
 | `HISTORY` | нет | 0 | Парсить всю историю (1) |
 
