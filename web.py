@@ -2082,8 +2082,8 @@ async function triggerParse(){
   try{
     var data=await api('/parse/trigger');
     if(data.success){
-      status.textContent='Парсинг запущен! Каналов: '+data.status.channels_parsed;
-      setTimeout(function(){btn.disabled=false;},3000);
+      status.textContent='Парсинг запущен! Следующий через 5 мин.';
+      setTimeout(function(){btn.disabled=false;status.textContent='';},5000);
     }else{
       status.textContent='Ошибка: '+(data.error||'unknown');
       btn.disabled=false;
@@ -2606,34 +2606,28 @@ _parse_status = {"running": False, "started_at": None, "finished_at": None, "err
 
 @app.get("/api/parse/trigger", dependencies=[Depends(_get_auth_user)])
 async def api_parse_trigger(background_tasks: BackgroundTasks):
-    """Trigger parsing of all active channels in background."""
-    global _parse_task, _parse_status
-    if _parse_status["running"]:
-        return {"success": False, "error": "Parsing already running", "status": _parse_status}
+    """Trigger parsing of all active channels via BackgroundTasks.
     
-    # Ensure DB is initialized before parsing
+    Returns immediately — parsing runs in background without blocking web.
+    """
+    # Ensure DB is initialized
     await _ensure_db()
     
-    async def _do_parse():
-        global _parse_status
-        _parse_status = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None, "error": None, "channels_parsed": 0}
-        try:
-            parser = _get_parser()
-            await parser.init_db()
-            results = await parser.parse_all(history=False)
-            _parse_status["channels_parsed"] = len(results)
-            _parse_status["running"] = False
-            _parse_status["finished_at"] = datetime.now(timezone.utc).isoformat()
-            logger.info(f"[parse/trigger] Completed: {len(results)} channels")
-        except Exception as e:
-            logger.error(f"[parse/trigger] Error: {e}")
-            _parse_status["error"] = str(e)
-            _parse_status["running"] = False
-            _parse_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+    # Add parsing task to background — doesn't block HTTP response
+    background_tasks.add_task(_run_parser_background)
     
-    import asyncio
-    _parse_task = asyncio.create_task(_do_parse())
-    return {"success": True, "message": "Parsing started in background", "status": _parse_status}
+    return {"success": True, "message": "Parsing started in background (check /channels for updates)"}
+
+async def _run_parser_background():
+    """Background parsing task — runs in event loop without blocking web."""
+    logger.info("[bg-parse] Starting background parse...")
+    try:
+        parser = _get_parser()
+        await parser.init_db()
+        results = await parser.parse_all(history=False)
+        logger.info("[bg-parse] Completed: %d channels parsed", len(results))
+    except Exception as e:
+        logger.error("[bg-parse] Error: %s", e)
 
 
 @app.get("/api/parse/status", dependencies=[Depends(_get_auth_user)])
