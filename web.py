@@ -563,7 +563,7 @@ var sel=$('ch-filter');
 chs.forEach(function(ch){
 var opt=document.createElement('option');
 // Use username for public, numeric_id for private channels
-opt.value=ch.username||(ch.numeric_id!=null?String(ch.numeric_id):'');
+opt.value=ch.username||(ch.numeric_id!=null?String(ch.numeric_id):String(ch.telegram_id)||'');
 opt.textContent=(ch.title||ch.username||(ch.numeric_id!=null?'c/'+ch.numeric_id:'@channel'))+(ch.is_active?'':' [off]');
 sel.appendChild(opt);
 });
@@ -587,6 +587,8 @@ document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListen
 // Posts
 var _postBusy=false;
 async function loadPosts(){
+window.loadPosts=loadPosts;
+
   if(_postBusy)return;
   _postBusy=true;
   $('loader-sub').textContent='Loading posts...';
