@@ -508,7 +508,7 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 <!-- Channel Filter -->
 <div class="ch-sel">
 <label>Channel:</label>
-<select id="ch-filter" onchange="page=1;loadPosts();loadChannelStats();">
+<select id="ch-filter" onchange="loading.posts=false;page=1;loadPosts();loadChannelStats();">
 <option value="">All channels</option>
 </select>
 <span id="ch-info" style="color:#64748b;font-size:12px"></span>
@@ -589,7 +589,7 @@ $('ch-info').textContent='';
 document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListener('click',function(){var tab=btn.dataset.tab;document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');$('tab-posts').style.display=tab==='posts'?'':'none';$('tab-tags').style.display=tab==='tags'?'':'none';if(tab==='tags')loadTags()})});
 
 // Posts
-async function loadPosts(){if(loading.posts)return;loading.posts=true;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value,ch=$('ch-filter').value;try{var chQ=ch?'&channel='+encodeURIComponent(ch):'';var data=await api('/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+chQ);var stats=await api('/stats'+(ch?'?channel='+encodeURIComponent(ch):''));$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');$('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');var chUrl=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'@channel';var chLink='<a class="post-ch" href="'+chUrl+'" target="_blank">'+chLabel+'</a>';return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span>'+chLink+'<span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){console.error(e);showError('p-list',e.message)}finally{loading.posts=false}}
+async function loadPosts(){if(loading.posts)return;loading.posts=true;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value,ch=$('ch-filter').value;try{var chQ=ch?'&channel='+encodeURIComponent(ch):'';console.log('[loadPosts] channel='+ch+' url=/posts?page='+page+chQ);var data=await api('/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+chQ);if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts for this channel</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');var chUrl=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'@channel';var chLink='<a class="post-ch" href="'+chUrl+'" target="_blank">'+chLabel+'</a>';return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span>'+chLink+'<span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){console.error(e);showError('p-list',e.message)}finally{loading.posts=false}}
 window.goPage=function(p){page=p;loadPosts()};
 
 // Tags -- period selector state
@@ -3168,9 +3168,11 @@ async def api_posts(
     search: str = "", sort: str = "new",
     channel: Optional[str] = Query(None)
 ):
+    logger.info("[api/posts] channel=%r ch_filter=%r ch_params=%r", channel, ch_filter if 'ch_filter' in dir() else '-', '-')
     try:
         async with async_session() as session:
             ch_filter, ch_params = _channel_where_clause(channel)
+            logger.info("[api/posts] channel=%r ch_filter=%r ch_params=%r", channel, ch_filter, ch_params)
             search_filter = ""
             search_params = {}
             if search:
