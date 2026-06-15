@@ -272,9 +272,12 @@ class MultiChannelParser:
     # ------------------------------------------------------------------
 
     async def _ensure_client(self) -> TelegramClient:
-        """Возвращает подключённого TelegramClient."""
+        """Возвращает подключённого TelegramClient. Lazy signal setup."""
         if self._client is not None and self._client.is_connected():
             return self._client
+
+        # Lazy signal handler registration (guaranteed running loop here)
+        self._setup_signal_handlers()
 
         if self._client is not None:
             await self._client.disconnect()

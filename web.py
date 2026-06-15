@@ -197,16 +197,16 @@ app = FastAPI()
 
 import secrets as _secrets
 
-# Derive a stable auth key from DATABASE_URL (hashed) or generate random.
-# Never use raw DATABASE_URL as key — it would allow session forgery.
-_db_url = cfg.DATABASE_URL or ""
+# Derive a stable auth key from DB URL (hashed) or generate random.
+# Never use raw DB URL as key — it would allow session forgery.
+_db_url = cfg.database_url_async or ""
 if _db_url:
     AUTH_SECRET_KEY = hashlib.sha256(
         (_db_url + "citg-auth-v2-salt").encode()
     ).hexdigest()[:32]
 else:
     AUTH_SECRET_KEY = _secrets.token_hex(32)
-    logger.warning("[security] DATABASE_URL not set, using random auth secret. Sessions will invalidate on restart.")
+    logger.warning("[security] DB URL not set, using random auth secret. Sessions will invalidate on restart.")
 
 # ─── Rate Limiter (simple in-memory) ─────────────────────────
 import time as _time
@@ -562,8 +562,8 @@ var sel=$('ch-filter');
 chs.forEach(function(ch){
 var opt=document.createElement('option');
 // Use username for public, numeric_id for private channels
-opt.value=ch.username||String(ch.numeric_id)||'';
-opt.textContent=(ch.title||ch.username||('c/'+ch.numeric_id))+(ch.is_active?'':' [off]');
+opt.value=ch.username||(ch.numeric_id!=null?String(ch.numeric_id):'');
+opt.textContent=(ch.title||ch.username||(ch.numeric_id!=null?'c/'+ch.numeric_id:'@channel'))+(ch.is_active?'':' [off]');
 sel.appendChild(opt);
 });
 }catch(e){console.error('channels load error:',e);}
@@ -2893,12 +2893,11 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 cfg.TG_API_ID,
                 cfg.TG_API_HASH,
             )
-            await client.connect()
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                return json_response({"success": False, "error": "Telegram session unauthorized. Regenerate TG_STRING_SESSION."}, 500)
-
             try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    return json_response({"success": False, "error": "Telegram session unauthorized. Regenerate TG_STRING_SESSION."}, 500)
+
                 # ── 5. Resolve entity ─────────────────────────
                 entity = None
 
@@ -3139,10 +3138,16 @@ async def api_stats(channel: Optional[str] = Query(None)):
 
             channel_title = None
             if channel:
-                ch_title = (await session.execute(
-                    text("SELECT title FROM channels WHERE username = :ch"),
-                    {"ch": channel}
-                )).scalar()
+                if channel.isdigit():
+                    ch_title = (await session.execute(
+                        text("SELECT title FROM channels WHERE numeric_id = :ch"),
+                        {"ch": int(channel)}
+                    )).scalar()
+                else:
+                    ch_title = (await session.execute(
+                        text("SELECT title FROM channels WHERE username = :ch"),
+                        {"ch": channel}
+                    )).scalar()
                 channel_title = ch_title
 
             return {

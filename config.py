@@ -64,12 +64,11 @@ class Settings(BaseSettings):
     TG_API_ID: int = Field(
         0,
         description="Telegram API ID (положительное целое число)",
-        ge=1,
+        ge=0,
     )
     TG_API_HASH: str = Field(
         "",
         description="Telegram API hash",
-        min_length=1,
     )
     DATABASE_URL: str = Field(
         ...,
