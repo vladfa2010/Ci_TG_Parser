@@ -16,7 +16,6 @@ import re
 import hashlib
 import secrets
 import hmac
-from contextlib import asynccontextmanager
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -133,17 +132,18 @@ DATABASE_URL = cfg.database_url_async
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-app = FastAPI()
+# ─── Lazy DB init (called on first API request) ─────────────────────
+_db_initialized = False
 
-# Background DB init — doesn't block FastAPI startup
-async def _init_db_background():
-    """Create tables, ensure admin user — runs in background."""
+async def _ensure_db():
+    """Create tables and admin user on first call."""
+    global _db_initialized
+    if _db_initialized:
+        return
+    _db_initialized = True
     try:
-        await asyncio.sleep(2)  # Let FastAPI start first
-        logger.info("[db-init] Starting background init...")
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            logger.info("[db-init] Tables OK")
             try:
                 await conn.execute(text("""
                     ALTER TABLE parse_logs 
@@ -151,7 +151,6 @@ async def _init_db_background():
                 """))
             except Exception:
                 pass
-        logger.info("[db-init] DB ready")
         async with async_session() as session:
             result = await session.execute(select(User))
             if result.scalars().first() is None:
@@ -159,12 +158,12 @@ async def _init_db_background():
                 admin.set_password("!1234567890")
                 session.add(admin)
                 await session.commit()
-                logger.info("[db-init] Admin user 'vlad' created")
-        logger.info("[db-init] Complete")
+                logger.info("[lazy-init] Admin user 'vlad' created")
     except Exception as e:
-        logger.critical("[db-init] ERROR: %s: %s", type(e).__name__, e)
-        import traceback
-        traceback.print_exc()
+        logger.error("[lazy-init] DB init error: %s", e)
+
+
+app = FastAPI()
 
 @app.on_event("startup")
 async def startup():
@@ -322,6 +321,7 @@ async def _get_auth_user(
     credentials: HTTPBasicCredentials = Depends(security),
 ) -> str:
     """Universal auth: cookie session (browser) OR Basic Auth (curl/API)."""
+    await _ensure_db()
     # 1. Try cookie session (for logged-in browser users doing AJAX)
     token = request.cookies.get(SESSION_COOKIE_NAME)
     if token:
