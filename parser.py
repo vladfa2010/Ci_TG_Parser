@@ -787,16 +787,15 @@ class MultiChannelParser:
                 return ch
             logger.warning("[_lookup_channel] '%s' NOT found (bare tid=%s)", identifier, int_id)
 
-        # Fallback: list ALL active channels to help debug
+        # CRITICAL: Log ALL channels to debug why lookup fails
         result = await db_session.execute(
-            select(Channel.telegram_id, Channel.numeric_id, Channel.username, Channel.title)
-            .where(Channel.is_active == True)
-            .limit(10)
+            select(Channel.id, Channel.telegram_id, Channel.numeric_id, Channel.username, Channel.title, Channel.is_active)
         )
-        rows = result.all()
-        logger.warning("[_lookup_channel] Active channels in DB (%d shown):", len(rows))
-        for row in rows:
-            logger.warning("  tid=%s numeric=%s username=%s title=%s", row.telegram_id, row.numeric_id, row.username, row.title)
+        all_rows = result.all()
+        logger.error("[_lookup_channel] '%s' NOT FOUND. ALL %d channels in DB:", identifier, len(all_rows))
+        for row in all_rows:
+            logger.error("  id=%s tid=%s numeric=%s user=%s title=%s active=%s",
+                row.id, row.telegram_id, row.numeric_id, row.username, row.title, row.is_active)
 
         return None
 
@@ -817,8 +816,8 @@ class MultiChannelParser:
         """
         async with self._semaphore:
             # Пауза между каналами (чтобы не спамить Telegram API)
-            # Увеличена до 5 секунд для приватных каналов чтобы избежать FloodWait
-            await asyncio.sleep(5)
+            # Увеличена до 15 секунд — критично чтобы избежать FloodWait
+            await asyncio.sleep(15)
             
             if self._is_shutting_down:
                 return username, ParseResult(
@@ -843,12 +842,10 @@ class MultiChannelParser:
                     if channel:
                         logger.debug("[%s] Канал найден в БД: tid=%s", username, channel.telegram_id)
                     else:
-                        # 2. Fallback: sync через Telegram API (get_entity — медленно)
-                        logger.info("[%s] Канал не найден в БД, sync через Telegram...", username)
-                        channel = await self._with_retry(
-                            lambda: self.sync_channel(db_session, username),
-                            channel_name=username,
-                            operation="sync_channel",
+                        # 2. Канал не в БД — пропускаем чтобы избежать FloodWait
+                        logger.error("[%s] Канал не найден в БД — ПРОПУСКАЕМ (чтобы избежать FloodWait). Добавьте канал через веб.", username)
+                        return username, ParseResult(
+                            error_message="Канал не найден в БД — добавьте через веб-интерфейс"
                         )
 
                     # Проверяем, не деактивирован ли канал
