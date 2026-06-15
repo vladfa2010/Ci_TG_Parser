@@ -161,6 +161,21 @@ async def _ensure_db():
                 except Exception:
                     pass  # Already done by another instance
 
+                # Migration: add sender_name to posts if missing
+                try:
+                    result = await conn.execute(text("""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name = 'posts' AND column_name = 'sender_name'
+                    """))
+                    if not result.fetchone():
+                        await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                        await conn.execute(text(
+                            "ALTER TABLE posts ADD COLUMN sender_name VARCHAR(255)"
+                        ))
+                        logger.info("[migrate] posts.sender_name column added")
+                except Exception:
+                    pass
+
         async with async_session() as session:
             # Reactivate all channels once on startup (recovers from auto-deactivation bug)
             result = await session.execute(
@@ -3216,7 +3231,8 @@ async def api_posts(
 
             result = await session.execute(text(f"""
                 SELECT p.telegram_message_id, p.text, p.views_count,
-                       p.hashtags, p.published_at, p.sender_name,
+                       p.hashtags, p.published_at,
+                       NULLIF(p.sender_name, '') as sender_name,
                        c.username as channel_username, c.title as channel_title,
                        c.channel_type, c.numeric_id
                 FROM posts p
