@@ -135,14 +135,15 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def startup():
-    """Create tables, ensure admin user."""
+# Background DB init — doesn't block FastAPI startup
+async def _init_db_background():
+    """Create tables, ensure admin user — runs in background."""
     try:
-        logger.info("[startup] Initializing...")
+        await asyncio.sleep(2)  # Let FastAPI start first
+        logger.info("[db-init] Starting background init...")
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            logger.info("[startup] Tables OK")
+            logger.info("[db-init] Tables OK")
             try:
                 await conn.execute(text("""
                     ALTER TABLE parse_logs 
@@ -150,8 +151,7 @@ async def startup():
                 """))
             except Exception:
                 pass
-        logger.info("[startup] DB ready")
-
+        logger.info("[db-init] DB ready")
         async with async_session() as session:
             result = await session.execute(select(User))
             if result.scalars().first() is None:
@@ -159,12 +159,18 @@ async def startup():
                 admin.set_password("!1234567890")
                 session.add(admin)
                 await session.commit()
-                logger.info("[startup] Admin user 'vlad' created")
-        logger.info("[startup] Complete")
+                logger.info("[db-init] Admin user 'vlad' created")
+        logger.info("[db-init] Complete")
     except Exception as e:
-        logger.critical("[startup] ERROR: %s: %s", type(e).__name__, e)
+        logger.critical("[db-init] ERROR: %s: %s", type(e).__name__, e)
         import traceback
         traceback.print_exc()
+
+@app.on_event("startup")
+async def startup():
+    """Schedule background DB init — returns immediately."""
+    asyncio.create_task(_init_db_background())
+    logger.info("[startup] DB init scheduled in background")
 
 import secrets as _secrets
 AUTH_SECRET_KEY = cfg.DATABASE_URL or _secrets.token_hex(32)
