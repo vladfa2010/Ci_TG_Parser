@@ -614,6 +614,17 @@ class MultiChannelParser:
                 if dup_check.scalar_one_or_none() is not None:
                     continue
 
+                # --- Sender info ---
+                sender_name: Optional[str] = None
+                if message.sender:
+                    sender = message.sender
+                    if hasattr(sender, 'first_name'):
+                        sender_name = (sender.first_name or '') + (' ' + sender.last_name if sender.last_name else '')
+                        if not sender_name.strip() and hasattr(sender, 'username') and sender.username:
+                            sender_name = '@' + sender.username
+                    elif hasattr(sender, 'title'):
+                        sender_name = sender.title
+
                 # --- Forward info ---
                 forward_from: Optional[str] = None
                 if message.forward and message.forward.chat:
@@ -639,6 +650,7 @@ class MultiChannelParser:
                     mentions=_extract_mentions(text),
                     urls=_extract_urls(text),
                     forward_from=forward_from,
+                    sender_name=sender_name,
                     has_media=message.media is not None,
                     media_type=_get_media_type(message),
                     published_at=message.date,

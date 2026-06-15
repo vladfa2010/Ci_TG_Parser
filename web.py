@@ -457,9 +457,10 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 .posts{display:flex;flex-direction:column;gap:12px}
 .post{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px}
 .post:hover{border-color:#334155}
-.post-head{display:flex;gap:16px;margin-bottom:8px;font-size:13px;color:#64748b;flex-wrap:wrap}
-.post-ch{color:#00d4aa;font-weight:600;text-decoration:none}
+.post-head{display:flex;gap:12px;margin-bottom:8px;font-size:13px;color:#64748b;flex-wrap:wrap;align-items:center}
+.post-ch{color:#00d4aa;font-weight:600;text-decoration:none;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .post-ch:hover{text-decoration:underline}
+.post-sender{color:#94a3b8;font-size:12px}
 .post-body{color:#e2e8f0;white-space:pre-wrap;word-break:break-word;line-height:1.6}
 .post-tags{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
 .tag{background:#1e293b;color:#00d4aa;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500}
@@ -550,6 +551,7 @@ setTimeout(hideLoader,6000);
 function showError(id,msg){$(id).innerHTML='<div class="err"><h3>Failed to load</h3><p>'+esc(msg)+'</p><button onclick="location.reload()">Reload Page</button></div>';hideLoader()}
 function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
+function fmtViews(n){n=n||0;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
 
 var _postAbort=null;
 async function api(path,attempt){attempt=attempt||1;try{var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.error)throw new Error(d.error);return d}catch(e){if(attempt<3){await new Promise(function(r){setTimeout(r,1000*attempt)});return api(path,attempt+1)}throw e}}
@@ -608,7 +610,7 @@ window.loadPosts=loadPosts;
         var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');
         var chUrl=p.numeric_id?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';
         var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'channel';
-        return'<div class="post"><div class="post-head"><span>#'+p.id+'</span><a class="post-ch" href="'+chUrl+'" target="_blank">'+chLabel+'</a><span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>';
+        return'<div class="post"><div class="post-head"><span style="color:#64748b">#'+p.id+'</span><a class="post-ch" href="'+chUrl+'" target="_blank" title="'+esc(chLabel)+'">'+esc(p.channel_title||chLabel)+'</a>'+(p.sender_name?'<span class="post-sender">by '+esc(p.sender_name)+'</span>':'')+'<span style="color:#00d4aa;font-weight:600">'+fmtViews(p.views)+'</span><span style="color:#64748b;font-size:12px">'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>';
       }).join('');
     }
     $('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+(chCount===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';
@@ -3214,7 +3216,8 @@ async def api_posts(
 
             result = await session.execute(text(f"""
                 SELECT p.telegram_message_id, p.text, p.views_count,
-                       p.hashtags, p.published_at, c.username as channel_username,
+                       p.hashtags, p.published_at, p.sender_name,
+                       c.username as channel_username, c.title as channel_title,
                        c.channel_type, c.numeric_id
                 FROM posts p
                 JOIN channels c ON p.channel_id = c.id
@@ -3230,7 +3233,9 @@ async def api_posts(
                     "views": r["views_count"],
                     "hashtags": r["hashtags"] or [],
                     "published": r["published_at"].isoformat() if r["published_at"] else None,
+                    "sender_name": r["sender_name"],
                     "channel_username": r["channel_username"],
+                    "channel_title": r["channel_title"],
                     "channel_type": r["channel_type"],
                     "numeric_id": r["numeric_id"],
                 } for r in rows

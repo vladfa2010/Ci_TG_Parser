@@ -306,6 +306,11 @@ class Post(Base):
         nullable=True,
         comment="Original source if this is a forwarded post",
     )
+    sender_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Name of the sender (user or channel that posted the message)",
+    )
     has_media: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
