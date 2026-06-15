@@ -330,17 +330,34 @@ def json_response(data, status=200):
 
 
 def _channel_filter_clause(channel: Optional[str]) -> tuple[str, dict]:
-    """Build SQL channel filter clause and params for JOIN with channels table."""
-    if channel:
-        return "AND c.username = :channel", {"channel": channel}
-    return "", {}
+    """Build SQL channel filter clause and params for JOIN with channels table.
+    
+    Supports both username (public) and numeric_id (private) lookups.
+    """
+    if not channel:
+        return "", {}
+    if channel.isdigit():
+        return "AND (c.numeric_id = :ch_num OR c.telegram_id = :ch_tid)", {
+            "ch_num": int(channel),
+            "ch_tid": int(f"-100{channel}"),
+        }
+    return "AND c.username = :channel", {"channel": channel}
 
 
 def _channel_where_clause(channel: Optional[str]) -> tuple[str, dict]:
-    """Build SQL channel filter for WHERE clauses with channels table."""
-    if channel:
-        return "AND c.username = :channel", {"channel": channel}
-    return "", {}
+    """Build SQL channel filter for WHERE clauses with channels table.
+    
+    Supports both username (public) and numeric_id (private) lookups.
+    """
+    if not channel:
+        return "", {}
+    # If channel looks like a number → filter by numeric_id, else by username
+    if channel.isdigit():
+        return "AND (c.numeric_id = :ch_num OR c.telegram_id = :ch_tid)", {
+            "ch_num": int(channel),
+            "ch_tid": int(f"-100{channel}"),
+        }
+    return "AND c.username = :channel", {"channel": channel}
 
 
 # ─── Universal Authentication ────────────────────────────────
@@ -544,8 +561,9 @@ var chs=data.channels||[];
 var sel=$('ch-filter');
 chs.forEach(function(ch){
 var opt=document.createElement('option');
-opt.value=ch.username||'';
-opt.textContent=(ch.title||ch.username)+(ch.is_active?'':' [off]');
+// Use username for public, numeric_id for private channels
+opt.value=ch.username||String(ch.numeric_id)||'';
+opt.textContent=(ch.title||ch.username||('c/'+ch.numeric_id))+(ch.is_active?'':' [off]');
 sel.appendChild(opt);
 });
 }catch(e){console.error('channels load error:',e);}
