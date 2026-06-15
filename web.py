@@ -576,21 +576,48 @@ try{
 var ch=$('ch-filter').value;
 var q=ch?'?channel='+encodeURIComponent(ch):'';
 var stats=await api('/stats'+q);
-$('subtitle').textContent=fmt(stats.total_posts)+' posts | Last: '+(stats.last_parsed||'-');
 $('p-stats').innerHTML='<div class="stat"><div class="stat-v">'+fmt(stats.total_posts)+'</div><div class="stat-l">Total</div></div><div class="stat"><div class="stat-v">'+fmt(stats.today_posts)+'</div><div class="stat-l">Today</div></div><div class="stat"><div class="stat-v">'+fmt(stats.week_posts)+'</div><div class="stat-l">Week</div></div><div class="stat"><div class="stat-v">'+fmt(stats.avg_views)+'</div><div class="stat-l">Avg</div></div><div class="stat"><div class="stat-v">'+fmt(stats.total_parses)+'</div><div class="stat-l">Parses</div></div>';
-if(stats.channel_title){
-$('ch-info').textContent='('+esc(stats.channel_title)+')';
-}else{
-$('ch-info').textContent='';
-}
-}catch(e){if(e.name!=='AbortError')console.error('stats error:',e);}
+$('ch-info').textContent=stats.channel_title?'('+esc(stats.channel_title)+')':'';
+}catch(e){console.error('stats error:',e);}
 }
 
 // Nav
 document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListener('click',function(){var tab=btn.dataset.tab;document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');$('tab-posts').style.display=tab==='posts'?'':'none';$('tab-tags').style.display=tab==='tags'?'':'none';if(tab==='tags')loadTags()})});
 
 // Posts
-var _lpSeq=0,_postsAbort=null;async function loadPosts(){var mySeq=++_lpSeq;$('loader-sub').textContent='Loading posts...';var q=$('q').value,sort=$('sort').value,ch=$('ch-filter').value;try{var chQ=ch?'&channel='+encodeURIComponent(ch):'';console.log('[loadPosts] ch='+ch+' q='+q);try{if(_postsAbort)_postsAbort.abort();_postsAbort=new AbortController();var r=await fetch('/api/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+chQ,{cache:'no-store',credentials:'include',signal:_postsAbort.signal});if(!r.ok)throw new Error('HTTP '+r.status);var data=await r.json();if(data.error)throw new Error(data.error);}catch(e){if(e.name==='AbortError')return;throw e;}if(mySeq!==_lpSeq){console.log('[loadPosts] stale, ignoring');return;}if(!data.posts||!data.posts.length){$('p-list').innerHTML='<div class="empty">No posts for this channel</div>'}else{$('p-list').innerHTML=data.posts.map(function(p){var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');var chUrl=(p.channel_type==='private'&&p.numeric_id)?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'@channel';var chLink='<a class="post-ch" href="'+chUrl+'" target="_blank">'+chLabel+'</a>';return'<div class="post"><div class="post-head"><span>ID:'+p.id+'</span>'+chLink+'<span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>'}).join('')}$('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+((data.posts||[]).length===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';hideLoader()}catch(e){if(e.name!=='AbortError'){console.error(e);showError('p-list',e.message)}}finally{loading.posts=false}}
+var _postBusy=false;
+async function loadPosts(){
+  if(_postBusy)return;
+  _postBusy=true;
+  $('loader-sub').textContent='Loading posts...';
+  try{
+    var q=$('q').value,ch=$('ch-filter').value,sort=$('sort').value;
+    var url='/api/posts?page='+page+'&search='+encodeURIComponent(q)+'&sort='+sort+(ch?'&channel='+encodeURIComponent(ch):'');
+    var r=await fetch(url,{cache:'no-store',credentials:'include'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    var data=await r.json();
+    if(data.error)throw new Error(data.error);
+    var chCount=data.posts?data.posts.length:0;
+    $('subtitle').textContent=(ch?'Channel: '+esc(ch)+' | ':'')+chCount+' posts shown';
+    if(!data.posts||!data.posts.length){
+      $('p-list').innerHTML='<div class="empty">'+(ch?'No posts for channel '+esc(ch):'No posts')+'</div>';
+    }else{
+      $('p-list').innerHTML=data.posts.map(function(p){
+        var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');
+        var chUrl=p.numeric_id?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';
+        var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'channel';
+        return'<div class="post"><div class="post-head"><span>#'+p.id+'</span><a class="post-ch" href="'+chUrl+'" target="_blank">'+chLabel+'</a><span>views:'+fmt(p.views)+'</span><span>'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>';
+      }).join('');
+    }
+    $('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+(chCount===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';
+    hideLoader();
+  }catch(e){
+    console.error('loadPosts error:',e);
+    showError('p-list',e.message);
+  }finally{
+    _postBusy=false;
+  }
+}
 window.goPage=function(p){page=p;loadPosts()};
 
 // Tags -- period selector state
