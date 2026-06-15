@@ -2611,6 +2611,9 @@ async def api_parse_trigger(background_tasks: BackgroundTasks):
     if _parse_status["running"]:
         return {"success": False, "error": "Parsing already running", "status": _parse_status}
     
+    # Ensure DB is initialized before parsing
+    await _ensure_db()
+    
     async def _do_parse():
         global _parse_status
         _parse_status = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "finished_at": None, "error": None, "channels_parsed": 0}
