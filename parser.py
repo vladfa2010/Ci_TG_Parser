@@ -582,10 +582,16 @@ class MultiChannelParser:
             # --- Rate limit перед началом iter_messages ---
             await asyncio.sleep(0.5)
 
+            # --- Fix: private channels with bare positive ID need -100 prefix ---
+            entity_id = channel.telegram_id
+            if entity_id > 0 and not channel.username:
+                entity_id = int(f"-100{entity_id}")
+                logger.debug("[%s] Fixed bare positive ID → %s", username, entity_id)
+
             # --- Итерируем сообщения (по ID канала, без повторного get_entity) ---
             msg_counter = 0
             async for message in client.iter_messages(
-                channel.telegram_id,
+                entity_id,
                 limit=limit,
                 min_id=min_id if not history else 0,
             ):
