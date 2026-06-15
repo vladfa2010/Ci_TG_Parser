@@ -234,6 +234,21 @@ class MultiChannelParser:
                 except Exception:
                     pass  # Already done by another instance
 
+            # Migration: add sender_name to posts if missing
+            try:
+                result = await conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'posts' AND column_name = 'sender_name'
+                """))
+                if not result.fetchone():
+                    await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                    await conn.execute(text(
+                        "ALTER TABLE posts ADD COLUMN sender_name VARCHAR(255)"
+                    ))
+                    logger.info("[migrate] posts.sender_name column added")
+            except Exception:
+                pass
+
         logger.info("База данных инициализирована")
         # Create default admin user if not exists
         await self._ensure_admin_user()
