@@ -508,7 +508,7 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 <!-- Channel Filter -->
 <div class="ch-sel">
 <label>Channel:</label>
-<select id="ch-filter" onchange="loading.posts=false;page=1;loadPosts();loadChannelStats();">
+<select id="ch-filter" onchange="page=1;loadPosts();loadChannelStats();">
 <option value="">All channels</option>
 </select>
 <span id="ch-info" style="color:#64748b;font-size:12px"></span>
