@@ -162,6 +162,24 @@ async def _ensure_db():
                     pass  # Already done by another instance
 
         async with async_session() as session:
+            # Reactivate all channels once on startup (recovers from auto-deactivation bug)
+            result = await session.execute(
+                text("""
+                    UPDATE channels 
+                    SET is_active = TRUE, parse_error_count = 0,
+                        last_error_message = NULL, last_error_at = NULL
+                    WHERE is_active = FALSE OR parse_error_count > 0
+                    RETURNING id, username
+                """)
+            )
+            reactivated = result.mappings().all()
+            if reactivated:
+                logger.info("[migrate] Reactivated %d channels: %s",
+                    len(reactivated),
+                    [r["username"] or str(r["id"]) for r in reactivated]
+                )
+                await session.commit()
+
             result = await session.execute(select(User))
             if result.scalars().first() is None:
                 admin = User(username="vlad", is_active=True)
