@@ -821,9 +821,11 @@ class MultiChannelParser:
         Возвращает (username, ParseResult).
         """
         async with self._semaphore:
-            # Пауза между каналами (чтобы не спамить Telegram API)
-            # Увеличена до 15 секунд — критично чтобы избежать FloodWait
-            await asyncio.sleep(15)
+            # Пауза между каналами — прерывается по SIGTERM
+            # 5 секунд: баланс между FloodWait защитой и Render 30-sec timeout
+            await self._shutdown_event.wait(5)
+            if self._is_shutting_down:
+                return username, ParseResult(error_message="Shutdown before start")
             
             if self._is_shutting_down:
                 return username, ParseResult(
@@ -957,6 +959,11 @@ class MultiChannelParser:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
 
+        # Check for shutdown before starting
+        if self._is_shutting_down:
+            logger.warning("Shutdown requested before parsing started")
+            return {}
+
         total_start = time.monotonic()
         logger.info(
             "=== Запуск парсинга: %d каналов (concurrency=%d) ===",
@@ -970,31 +977,32 @@ class MultiChannelParser:
                 current_operation=f"Starting {len(channel_list)} channels...",
             )
 
-        # Собираем задачи — все запускаются сразу, но Semaphore=1
-        # гарантирует последовательное выполнение
-        tasks = [
-            self._parse_one_channel_wrapped(ch, limit, history)
-            for ch in channel_list
-        ]
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Собираем результаты
+        # Парсим каналы ПОСЛЕДОВАТЕЛЬНО — можно прервать по SIGTERM
+        # между каналами, не ждать завершения всех как с gather
         results: dict[str, ParseResult] = {}
         total_parsed = 0
         total_new = 0
         total_errors = 0
 
-        for item in results_list:
-            if isinstance(item, Exception):
+        for ch in channel_list:
+            if self._is_shutting_down:
+                logger.warning("Shutdown during parse — %d/%d channels done",
+                    len(results), len(channel_list))
+                break
+
+            try:
+                username, result = await self._parse_one_channel_wrapped(
+                    ch, limit, history
+                )
+                results[username] = result
+                total_parsed += result.posts_parsed
+                total_new += result.posts_new
+                if result.error_message:
+                    total_errors += 1
+            except Exception as e:
                 total_errors += 1
-                logger.error("Задача канала упала с исключением: %s", item)
-                continue
-            username, result = item
-            results[username] = result
-            total_parsed += result.posts_parsed
-            total_new += result.posts_new
-            if result.error_message:
-                total_errors += 1
+                logger.error("Канал %s упал: %s", ch, e)
+                results[ch] = ParseResult(error_message=str(e))
 
         total_duration = int((time.monotonic() - total_start) * 1000)
         logger.info(
