@@ -543,6 +543,7 @@ class MultiChannelParser:
             await asyncio.sleep(0.5)
 
             # --- Итерируем сообщения (по ID канала, без повторного get_entity) ---
+            msg_counter = 0
             async for message in client.iter_messages(
                 channel.telegram_id,
                 limit=limit,
@@ -559,8 +560,10 @@ class MultiChannelParser:
                 if not message.text and not message.media:
                     continue
 
-                # Rate limit между сообщениями
-                await asyncio.sleep(0.5)
+                # Rate limit: sleep каждые 50 сообщений (не на каждое!)
+                msg_counter += 1
+                if msg_counter % 50 == 0:
+                    await asyncio.sleep(0.5)
 
                 parsed_count += 1
 
@@ -761,6 +764,9 @@ class MultiChannelParser:
         Возвращает (username, ParseResult).
         """
         async with self._semaphore:
+            # Пауза между каналами (чтобы не спамить Telegram API)
+            await asyncio.sleep(2)
+            
             if self._is_shutting_down:
                 return username, ParseResult(
                     error_message="Shutdown before start"
