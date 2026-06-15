@@ -133,6 +133,8 @@ DATABASE_URL = cfg.database_url_async
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
+app = FastAPI()
+
 @app.on_event("startup")
 async def startup():
     """Create tables, ensure admin user."""
@@ -163,8 +165,6 @@ async def startup():
         logger.critical("[startup] ERROR: %s: %s", type(e).__name__, e)
         import traceback
         traceback.print_exc()
-
-app = FastAPI()
 
 import secrets as _secrets
 AUTH_SECRET_KEY = cfg.DATABASE_URL or _secrets.token_hex(32)
