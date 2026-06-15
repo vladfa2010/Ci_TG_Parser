@@ -3229,18 +3229,33 @@ async def api_posts(
 
             order_col = "p.views_count DESC" if sort == "views" else "p.published_at DESC"
 
-            result = await session.execute(text(f"""
-                SELECT p.telegram_message_id, p.text, p.views_count,
-                       p.hashtags, p.published_at,
-                       NULLIF(p.sender_name, '') as sender_name,
-                       c.username as channel_username, c.title as channel_title,
-                       c.channel_type, c.numeric_id
-                FROM posts p
-                JOIN channels c ON p.channel_id = c.id
-                WHERE 1=1 {ch_filter} {search_filter}
-                ORDER BY {order_col}
-                LIMIT :limit OFFSET :offset
-            """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
+            # Try with sender_name, fallback without it (column may not exist yet)
+            try:
+                result = await session.execute(text(f"""
+                    SELECT p.telegram_message_id, p.text, p.views_count,
+                           p.hashtags, p.published_at,
+                           NULLIF(p.sender_name, '') as sender_name,
+                           c.username as channel_username, c.title as channel_title,
+                           c.channel_type, c.numeric_id
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE 1=1 {ch_filter} {search_filter}
+                    ORDER BY {order_col}
+                    LIMIT :limit OFFSET :offset
+                """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
+            except Exception:
+                result = await session.execute(text(f"""
+                    SELECT p.telegram_message_id, p.text, p.views_count,
+                           p.hashtags, p.published_at,
+                           NULL as sender_name,
+                           c.username as channel_username, c.title as channel_title,
+                           c.channel_type, c.numeric_id
+                    FROM posts p
+                    JOIN channels c ON p.channel_id = c.id
+                    WHERE 1=1 {ch_filter} {search_filter}
+                    ORDER BY {order_col}
+                    LIMIT :limit OFFSET :offset
+                """), {**ch_params, **search_params, "limit": limit, "offset": (page - 1) * limit})
             rows = result.mappings().all()
             return {"posts": [
                 {
