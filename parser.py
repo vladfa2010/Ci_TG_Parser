@@ -474,11 +474,48 @@ class ChannelResolver:
 
             await session.commit()
 
+        # Fallback: для пропущенных каналов — пробуем get_entity напрямую
+        if skipped > 0:
+            logger.info("[resolver] Fallback get_entity для %d пропущенных каналов...", skipped)
+            for db_ch in db_channels:
+                if db_ch.access_hash:
+                    continue  # Уже обновлён
+                try:
+                    from telethon.tl.types import PeerChannel
+                    # Пробуем PeerChannel с numeric_id
+                    test_ids = []
+                    if db_ch.numeric_id:
+                        test_ids.append(db_ch.numeric_id)
+                    if db_ch.telegram_id:
+                        test_ids.append(abs(db_ch.telegram_id))
+
+                    for test_id in test_ids:
+                        try:
+                            entity = await self.client.get_entity(PeerChannel(test_id))
+                            if isinstance(entity, TlChannel):
+                                db_ch.access_hash = entity.access_hash
+                                db_ch.entity_resolved_at = utc_now()
+                                db_ch.telegram_id = entity.id  # обновляем на правильный ID
+                                updated += 1
+                                skipped -= 1
+                                logger.info("[resolver] Fallback OK: '%s' id=%d access_hash=%d",
+                                           db_ch.title, entity.id, entity.access_hash)
+                                break
+                        except Exception:
+                            continue
+                    if db_ch.access_hash:
+                        break  # Нашли — сохраняем
+                except Exception as e:
+                    logger.debug("[resolver] Fallback failed for '%s': %s", db_ch.title, e)
+
+            async with self.db_factory() as session:
+                await session.commit()
+
         logger.info(
             "[resolver] Обновлено access_hash: %d каналов (пропущено: %d)",
             updated, skipped,
         )
-        return []  # возвращаем пустой список — результат не нужен
+        return []
 
     async def get_active_channels(self) -> list[Any]:
         """Получить список активных каналов из БД.
@@ -1078,8 +1115,8 @@ class MultiChannelParser:
                 if self._progress_callback:
                     self._progress_callback(
                         increment_channels_done=1,
-                        increment_posts_new=result.new,
-                        increment_posts_parsed=result.parsed,
+                        increment_posts_new=getattr(result, 'new', 0),
+                        increment_posts_parsed=getattr(result, 'parsed', 0),
                         current_channel=channel.title or str(channel.id),
                     )
 
