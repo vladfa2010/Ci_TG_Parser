@@ -921,24 +921,50 @@ class MultiChannelParser:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
 
-        # --- Preload all dialogs to cache channel entities ---
-        # ONE API call gets access_hash for ALL channels.
-        # Private channels CANNOT be resolved without access_hash.
+        # --- Preload entities from Telethon session file + dialogs ---
+        # Private channels need access_hash. We get it from:
+        # 1. Telethon session file (SQLite) — entities cached from get_entity()
+        # 2. get_dialogs() — channels in recent dialogs
         entity_cache = {}
         try:
             client = await self._ensure_client()
-            dialogs = await client.get_dialogs(limit=200)
+            
+            # Method 1: Read from session file (get_entity cached entities)
+            session_entities = {}
+            try:
+                # Telethon stores entities in SQLite session file
+                for row in client.session._db.execute(
+                    "SELECT id, hash FROM entities WHERE substring(id, 1, 1) = '-'"
+                ):
+                    bare_id = abs(int(row[0])) % 1_000_000_000_000
+                    session_entities[bare_id] = int(row[1])
+            except Exception:
+                pass  # Not all session types have _db
+            
+            # Method 2: get_dialogs() for channels not in session file
+            dialogs = await client.get_dialogs(limit=None)
             for d in dialogs:
                 ent = d.entity
-                if hasattr(ent, 'id'):
-                    # Store by bare channel_id (strip -100 prefix)
+                if hasattr(ent, 'id') and hasattr(ent, 'access_hash'):
                     cid = ent.id
                     if cid < 0:
                         cid = abs(cid) % 1_000_000_000_000
                     entity_cache[cid] = ent
-            logger.info("[preload] Cached %d channel entities", len(entity_cache))
+                    if cid in session_entities:
+                        del session_entities[cid]
+            
+            logger.info("[preload] Session entities: %d, Dialogs: %d, Total: %d",
+                len(session_entities), len(entity_cache), len(session_entities) + len(entity_cache))
+            
+            # Add remaining session entities (not in dialogs)
+            for bare_id, access_hash in session_entities.items():
+                from telethon.tl.types import PeerChannel
+                # Create InputPeerChannel from cached data
+                from telethon.tl.types import InputPeerChannel
+                entity_cache[bare_id] = InputPeerChannel(bare_id, access_hash)
+                
         except Exception as e:
-            logger.warning("[preload] get_dialogs failed: %s", e)
+            logger.warning("[preload] Entity loading failed: %s", e)
 
         total_start = time.monotonic()
         logger.info(
