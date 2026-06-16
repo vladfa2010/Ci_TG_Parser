@@ -426,7 +426,7 @@ class ChannelResolver:
                 "username": entity.username,
             }
 
-        # Обновляем access_hash ТОЛЬКО для существующих каналов в БД
+        # Обновляем access_hash для существующих каналов/чатов в БД
         updated = 0
         skipped = 0
         try:
@@ -435,38 +435,44 @@ class ChannelResolver:
             return []
 
         async with self.db_factory() as session:
-            # Получаем ВСЕ активные каналы из БД
             result = await session.execute(
                 select(DbChannel).where(DbChannel.is_active == True)
             )
             db_channels = result.scalars().all()
 
             for db_ch in db_channels:
-                tg_id = db_ch.telegram_id
-                # Ищем по telegram_id, abs(telegram_id), и numeric_id
+                # Ищем по telegram_id, abs(telegram_id), numeric_id
                 found_id = None
-                if tg_id in tg_channels:
-                    found_id = tg_id
-                elif abs(tg_id) in tg_channels:
-                    found_id = abs(tg_id)
-                elif db_ch.numeric_id and db_ch.numeric_id in tg_channels:
-                    found_id = db_ch.numeric_id
+                search_ids = [db_ch.telegram_id]
+                if db_ch.telegram_id and db_ch.telegram_id < 0:
+                    search_ids.append(abs(db_ch.telegram_id))
+                if db_ch.numeric_id:
+                    search_ids.append(db_ch.numeric_id)
+
+                for sid in search_ids:
+                    if sid in tg_entities:
+                        found_id = sid
+                        break
 
                 if not found_id:
                     skipped += 1
-                    logger.warning("[resolver] Channel '%s' tid=%d (num_id=%s) NOT found in get_dialogs()", 
-                                  db_ch.title, tg_id, db_ch.numeric_id)
+                    logger.warning("[resolver] '%s' NOT found (searched: %s)", 
+                                  db_ch.title, search_ids)
                     continue
 
-                info = tg_channels[found_id]
-                db_ch.access_hash = info["access_hash"]
+                info = tg_entities[found_id]
+                db_ch.access_hash = info["access_hash"]  # None для Chat
                 db_ch.entity_resolved_at = utc_now()
                 db_ch.title = info["title"]
-                # Если telegram_id отличается — обновляем
-                if db_ch.telegram_id != found_id:
-                    logger.info("[resolver] Обновлён telegram_id %d → %d для '%s'", 
-                               db_ch.telegram_id, found_id, db_ch.title)
-                    db_ch.telegram_id = found_id
+                # Обновляем тип если нужно
+                if info["type"] == "chat":
+                    db_ch.channel_type = "chat"
+                elif info.get("username"):
+                    db_ch.channel_type = "public"
+                else:
+                    db_ch.channel_type = "private"
+                logger.info("[resolver] Обновлён '%s': type=%s, id=%d", 
+                           db_ch.title, info["type"], found_id)
                 if info["username"]:
                     db_ch.username = info["username"]
                     db_ch.channel_type = "public"
@@ -1081,6 +1087,7 @@ class MultiChannelParser:
                     i + 1, len(channels), channel.title, channel.id,
                 )
 
+                result = ParseResult()  # Инициализация — чтобы callback не падал
                 try:
                     input_peer = await self._resolver.build_input_peer(channel)
                     result = await self._parser.parse(channel, input_peer)
@@ -1097,29 +1104,29 @@ class MultiChannelParser:
                         self._rate_limiter.on_success()
 
                 except GlobalCooldownError as e:
-                    # Глобальный cooldown — останавливаем весь прогон
                     logger.warning(
                         "[%d/%d] GlobalCooldownError — останавливаем прогон: %s",
                         i + 1, len(channels), e,
                     )
+                    result = ParseResult(error=f"GlobalCooldown: {e}")
+                    results[channel.id] = result
                     break
 
                 except FloodWaitError as e:
-                    # FloodWait на уровне оркестратора
                     logger.warning(
                         "[%d/%d] FloodWait %d сек — активируем глобальную паузу",
                         i + 1, len(channels), e.seconds,
                     )
                     self._rate_limiter.on_flood_wait(e.seconds)
                     self._circuit.on_global_flood(e.seconds)
-                    results[channel.id] = ParseResult(
-                        error=f"FloodWait: {e.seconds}с", flood_wait_sec=e.seconds,
-                    )
+                    result = ParseResult(error=f"FloodWait: {e.seconds}с", flood_wait_sec=e.seconds)
+                    results[channel.id] = result
                     break
 
                 except Exception as e:
                     logger.exception("Ошибка парсинга канала %d: %s", channel.id, e)
-                    results[channel.id] = ParseResult(error=str(e))
+                    result = ParseResult(error=str(e))
+                    results[channel.id] = result
                     self._circuit.on_channel_failure(channel.id, type(e).__name__)
 
                 # Callback: прогресс после каждого канала

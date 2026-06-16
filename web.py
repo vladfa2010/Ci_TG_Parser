@@ -3039,11 +3039,27 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 # Ensure channel IDs have -100 prefix (Telegram format)
                 if isinstance(entity, TlChannel) and telegram_id > 0:
                     telegram_id = int(f"-100{telegram_id}")
-                # Compute numeric_id (without -100 prefix)
-                if telegram_id < 0:
-                    numeric_id = abs(telegram_id) % 1_000_000_000_000
+                # Определяем тип: Chat (basic group) vs Channel (broadcast/megagroup)
+                from telethon.tl.types import Chat as TlChat
+                if isinstance(entity, TlChat):
+                    channel_type = "chat"
+                    numeric_id = entity.id  # Chat ID = положительный
+                    logger.info(f"[channel/add] Type: Chat (basic group), id={entity.id}")
+                elif isinstance(entity, TlChannel):
+                    # Ensure channel IDs have -100 prefix
+                    if telegram_id > 0:
+                        telegram_id = int(f"-100{telegram_id}")
+                    if telegram_id < 0:
+                        numeric_id = abs(telegram_id) % 1_000_000_000_000
+                    else:
+                        numeric_id = telegram_id
+                    logger.info(f"[channel/add] Type: Channel, id={telegram_id}")
                 else:
-                    numeric_id = telegram_id
+                    channel_type = "private" if not has_username else "public"
+                    if telegram_id < 0:
+                        numeric_id = abs(telegram_id) % 1_000_000_000_000
+                    else:
+                        numeric_id = telegram_id
 
                 logger.info(f"[channel/add] Resolved: tid={telegram_id} numeric={numeric_id} type={channel_type} title='{entity.title}'")
 
