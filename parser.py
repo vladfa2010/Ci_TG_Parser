@@ -25,7 +25,6 @@ import asyncio
 import hashlib
 import logging
 import re
-import signal
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -137,14 +136,6 @@ class MultiChannelParser:
         self.session_str = session_str
         self.db_url = db_url
 
-        # Semaphore: 1 канал за раз чтобы избежать FloodWait
-        # (get_entity вызывается только для новых каналов — существующие берутся из БД)
-        self._semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
-
-        # Graceful shutdown
-        self._shutdown_event: asyncio.Event = asyncio.Event()
-        self._setup_signal_handlers()
-
         # Callback for live progress reporting (injected by web layer)
         self._progress_callback: Optional[Callable[..., None]] = None
 
@@ -154,37 +145,6 @@ class MultiChannelParser:
         # DB engine & session factory (инициализируются позже)
         self._engine = None
         self._session_factory = None
-
-    # ------------------------------------------------------------------
-    # Signal handling
-    # ------------------------------------------------------------------
-
-    def _setup_signal_handlers(self) -> None:
-        """Регистрирует обработчики SIGTERM / SIGINT для graceful shutdown.
-
-        Called lazily on first _ensure_client() to guarantee a running loop.
-        """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return  # No loop yet — will retry on _ensure_client()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                loop.add_signal_handler(sig, self._signal_handler, sig)
-            except (NotImplementedError, ValueError):
-                # Windows не поддерживает add_signal_handler
-                # ValueError: signal only works in main thread
-                pass
-
-    def _signal_handler(self, sig: int) -> None:
-        """Устанавливает shutdown event при получении сигнала."""
-        sig_name = signal.Signals(sig).name
-        logger.warning("Получен сигнал %s — инициируем graceful shutdown", sig_name)
-        self._shutdown_event.set()
-
-    @property
-    def _is_shutting_down(self) -> bool:
-        return self._shutdown_event.is_set()
 
     # ------------------------------------------------------------------
     # Database
@@ -602,12 +562,7 @@ class MultiChannelParser:
                 limit=limit,
                 min_id=min_id if not history else 0,
             ):
-                # Graceful shutdown check
-                if self._is_shutting_down:
-                    logger.info(
-                        "[%s] Прерывание по shutdown signal", username
-                    )
-                    break
+                # Rate limit: sleep каждые 50 сообщений
 
                 # Пропускаем посты без текста и без медиа
                 if not message.text and not message.media:
@@ -816,106 +771,47 @@ class MultiChannelParser:
     # Core: parse all channels
     # ------------------------------------------------------------------
 
-    async def _parse_one_channel_wrapped(
+    async def _parse_one_channel(
         self,
         username: str,
-        limit: Optional[int],
-        history: bool,
+        limit: Optional[int] = None,
+        history: bool = False,
     ) -> tuple[str, ParseResult]:
-        """Обертка для парсинга одного канала с Semaphore.
+        """Парсит один канал. При ошибке — rollback сессии, лог, идем дальше."""
+        start_ts = time.monotonic()
 
-        Создаёт отдельную БД-сессию, синхронизирует канал и парсит его.
-        Возвращает (username, ParseResult).
-        """
-        async with self._semaphore:
-            # Пауза между каналами — проверяем shutdown каждые 0.5 сек
-            for _ in range(10):  # 5 секунд total
-                if self._is_shutting_down:
-                    return username, ParseResult(error_message="Shutdown before start")
-                await asyncio.sleep(0.5)
-            
-            if self._is_shutting_down:
-                return username, ParseResult(
-                    error_message="Shutdown before start"
+        # Report: starting this channel
+        if self._progress_callback:
+            self._progress_callback(
+                current_channel=username,
+                current_operation=f"Parsing {username}...",
+            )
+
+        # Fresh DB session per channel — isolated, safe to rollback
+        async with self._db_session() as db_session:
+            channel: Optional[Channel] = None
+            try:
+                # 1. Ищем канал в БД
+                channel = await self._lookup_channel(db_session, username)
+                if not channel:
+                    return username, ParseResult(error_message="Канал не найден в БД")
+                if not channel.is_active:
+                    return username, ParseResult(error_message="Канал деактивирован")
+
+                # 2. Парсим
+                result = await self.parse_single_channel(
+                    db_session, channel, limit=limit, history=history
                 )
 
-            # Report: starting this channel
-            if self._progress_callback:
-                self._progress_callback(
-                    current_channel=username,
-                    current_operation=f"Parsing {username}...",
-                )
-
-            start_ts = time.monotonic()
-            async with self._db_session() as db_session:
-                result: ParseResult
-                channel: Optional[Channel] = None
-
-                try:
-                    # 1. Сначала ищем в БД БЕЗ get_entity (быстро, без FloodWait)
-                    channel = await self._lookup_channel(db_session, username)
-                    if channel:
-                        logger.debug("[%s] Канал найден в БД: tid=%s", username, channel.telegram_id)
-                        # Обновляем метаданные (title, subscriber_count) — быстрый get_entity
-                        try:
-                            await self._with_retry(
-                                lambda: self.sync_channel(db_session, username),
-                                channel_name=username,
-                                operation="sync_channel_update",
-                            )
-                        except Exception as sync_err:
-                            logger.warning("[%s] sync_channel не удался (не критично): %s", username, sync_err)
-                    else:
-                        # 2. Канал не в БД — пропускаем чтобы избежать FloodWait
-                        logger.error("[%s] Канал не найден в БД — ПРОПУСКАЕМ. Добавьте канал через веб.", username)
-                        return username, ParseResult(
-                            error_message="Канал не найден в БД — добавьте через веб-интерфейс"
-                        )
-
-                    # Проверяем, не деактивирован ли канал
-                    if not channel.is_active:
-                        logger.warning(
-                            "[%s] Канал деактивирован, пропускаем", username
-                        )
-                        result = ParseResult(
-                            error_message="Канал деактивирован"
-                        )
-                    else:
-                        # Парсим канал
-                        result = await self.parse_single_channel(
-                            db_session, channel, limit=limit, history=history
-                        )
-
-                except ValueError:
-                    result = ParseResult(
-                        error_message="Канал не существует или недоступен"
-                    )
-                    logger.error("[%s] %s", username, result.error_message)
-
-                except Exception as e:
-                    result = ParseResult(
-                        error_message=f"{type(e).__name__}: {e}"
-                    )
-                    logger.exception(
-                        "[%s] Ошибка на этапе синхронизации: %s",
-                        username,
-                        e,
-                    )
-
-                # Создаём лог ТОЛЬКО после получения channel.id
-                log = ParseLog(
-                    started_at=_now(),
-                    channel_id=channel.id if channel else None,
-                    posts_parsed=result.posts_parsed,
-                    posts_new=result.posts_new,
-                    error_message=result.error_message,
-                    finished_at=_now(),
+                # 3. Лог
+                db_session.add(ParseLog(
+                    started_at=_now(), channel_id=channel.id,
+                    posts_parsed=result.posts_parsed, posts_new=result.posts_new,
+                    error_message=result.error_message, finished_at=_now(),
                     duration_ms=int((time.monotonic() - start_ts) * 1000),
-                )
-                db_session.add(log)
+                ))
                 await db_session.commit()
 
-                # Report: channel done (web layer will increment counters)
                 if self._progress_callback:
                     self._progress_callback(
                         increment_channels_done=1,
@@ -923,6 +819,28 @@ class MultiChannelParser:
                         increment_posts_parsed=result.posts_parsed,
                         current_operation=f"Done {username}: +{result.posts_new} posts",
                     )
+                return username, result
+
+            except Exception as e:
+                try:
+                    await db_session.rollback()
+                except Exception:
+                    pass
+
+                result = ParseResult(error_message=f"{type(e).__name__}: {e}")
+                logger.exception("[%s] Ошибка: %s", username, e)
+
+                # Log error
+                try:
+                    db_session.add(ParseLog(
+                        started_at=_now(), channel_id=channel.id if channel else None,
+                        posts_parsed=0, posts_new=0,
+                        error_message=result.error_message, finished_at=_now(),
+                        duration_ms=int((time.monotonic() - start_ts) * 1000),
+                    ))
+                    await db_session.commit()
+                except Exception:
+                    pass
 
                 return username, result
 
@@ -975,21 +893,10 @@ class MultiChannelParser:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
 
-        # Reset shutdown state — parser is reusable (singleton)
-        # Previous SIGTERM may have set these; we clear them for fresh run
-        self._is_shutting_down = False
-        self._shutdown_event.clear()
-
-        # Check for shutdown before starting
-        if self._is_shutting_down:
-            logger.warning("Shutdown requested before parsing started")
-            return {}
-
         total_start = time.monotonic()
         logger.info(
-            "=== Запуск парсинга: %d каналов (concurrency=%d) ===",
+            "=== Запуск парсинга: %d каналов ===",
             len(channel_list),
-            settings.MAX_CONCURRENT_CHANNELS,
         )
         if self._progress_callback:
             self._progress_callback(
@@ -998,23 +905,14 @@ class MultiChannelParser:
                 current_operation=f"Starting {len(channel_list)} channels...",
             )
 
-        # Парсим каналы ПОСЛЕДОВАТЕЛЬНО — можно прервать по SIGTERM
-        # между каналами, не ждать завершения всех как с gather
         results: dict[str, ParseResult] = {}
         total_parsed = 0
         total_new = 0
         total_errors = 0
 
         for ch in channel_list:
-            if self._is_shutting_down:
-                logger.warning("Shutdown during parse — %d/%d channels done",
-                    len(results), len(channel_list))
-                break
-
             try:
-                username, result = await self._parse_one_channel_wrapped(
-                    ch, limit, history
-                )
+                username, result = await self._parse_one_channel(ch, limit, history)
                 results[username] = result
                 total_parsed += result.posts_parsed
                 total_new += result.posts_new
@@ -1024,6 +922,9 @@ class MultiChannelParser:
                 total_errors += 1
                 logger.error("Канал %s упал: %s", ch, e)
                 results[ch] = ParseResult(error_message=str(e))
+
+            # Пауза между каналами (FloodWait защита)
+            await asyncio.sleep(5)
 
         total_duration = int((time.monotonic() - total_start) * 1000)
         logger.info(
@@ -1071,7 +972,7 @@ class MultiChannelParser:
         )
 
         try:
-            while not self._is_shutting_down:
+            while True:
                 logger.info("[%s] Запуск парсинга...", _now().isoformat())
 
                 try:
@@ -1082,17 +983,8 @@ class MultiChannelParser:
                 except Exception as e:
                     logger.exception("Ошибка в цикле парсинга: %s", e)
 
-                if self._is_shutting_down:
-                    break
-
                 logger.info("Сон %d сек до следующего запуска", settings.INTERVAL_SEC)
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_event.wait(),
-                        timeout=settings.INTERVAL_SEC,
-                    )
-                except asyncio.TimeoutError:
-                    pass  # Нормально — время вышло, переходим к следующему циклу
+                await asyncio.sleep(settings.INTERVAL_SEC)
 
         finally:
             logger.info("Завершение run_scheduled")
