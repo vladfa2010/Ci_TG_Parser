@@ -2955,7 +2955,7 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
-        from telethon.tl.types import PeerChannel
+        from telethon.tl.types import PeerChannel, Channel
         from telethon.errors import FloodWaitError
 
         async with async_session() as session:
@@ -2967,9 +2967,10 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 dup_where.append(Channel.numeric_id == num_id)
                 dup_where.append(Channel.telegram_id == int(f"-100{clean_id}"))
             elif clean_id.startswith('-') and clean_id[1:].isdigit():
-                # Negative ID like -740684703 → telegram_id = -740684703
+                # Negative ID like -740684703 → try both -100740684703 (channel) and -740684703 (chat)
                 int_id = int(clean_id)
-                dup_where.append(Channel.telegram_id == int_id)
+                dup_where.append(Channel.telegram_id == int_id)           # -740684703
+                dup_where.append(Channel.telegram_id == int(f"-100{abs(int_id)}"))  # -100740684703
                 dup_where.append(Channel.numeric_id == abs(int_id))
 
             from sqlalchemy import or_
@@ -2995,14 +2996,21 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 # ── 5. Resolve entity ─────────────────────────
                 entity = None
 
-                # Case A: bare negative ID like -740684703 (basic group/chat)
+                # Case A: negative ID like -740684703 → try -100 prefix first (channel format)
                 if clean_id.startswith('-') and clean_id[1:].isdigit():
+                    int_id = int(clean_id)
+                    # Try -100 prefix first (this is how Telegram stores channel IDs)
                     try:
-                        int_id = int(clean_id)
-                        logger.info(f"[channel/add] Trying bare negative ID: {int_id}")
-                        entity = await client.get_entity(int_id)
-                    except Exception as e_neg:
-                        logger.info(f"[channel/add] Bare negative ID failed: {e_neg}")
+                        full_id = int(f"-100{abs(int_id)}")
+                        logger.info(f"[channel/add] Trying -100 prefix: {full_id}")
+                        entity = await client.get_entity(full_id)
+                    except Exception as e_100:
+                        logger.info(f"[channel/add] -100 prefix failed: {e_100}, trying bare ID")
+                        try:
+                            logger.info(f"[channel/add] Trying bare negative ID: {int_id}")
+                            entity = await client.get_entity(int_id)
+                        except Exception as e_neg:
+                            logger.info(f"[channel/add] Bare negative ID failed: {e_neg}")
 
                 # Case B: positive digit like 3147415698 (channel without -100 prefix)
                 elif clean_id.isdigit():
@@ -3028,6 +3036,9 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 channel_type = "public" if has_username else "private"
                 telegram_id = entity.id
 
+                # Ensure channel IDs have -100 prefix (Telegram format)
+                if isinstance(entity, Channel) and telegram_id > 0:
+                    telegram_id = int(f"-100{telegram_id}")
                 # Compute numeric_id (without -100 prefix)
                 if telegram_id < 0:
                     numeric_id = abs(telegram_id) % 1_000_000_000_000
