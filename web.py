@@ -2064,6 +2064,7 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 <input type="text" id="ch-input" placeholder="Username или numeric ID канала..." onkeydown="if(event.key==='Enter')addChannel()">
 <button id="ch-add-btn" onclick="addChannel()">+ Добавить канал</button>
 <button id="parse-btn" onclick="triggerParse()" style="background:#0984e3;color:#fff;margin-left:8px">🔄 Запустить парсинг</button>
+<button id="clear-btn" onclick="clearAll()" style="background:#7f1d1d;color:#fff;margin-left:8px">🗑 Очистить все</button>
 </div>
 <div class="add-msg" id="add-msg"></div>
 <div class="add-msg" id="parse-status" style="color:#64748b;font-size:12px;margin-top:4px"></div>
@@ -2272,11 +2273,23 @@ async function deleteChannel(id){
   }catch(e){console.error(e);}
 }
 
+async function clearAll(){
+  if(!confirm('ВНИМАНИЕ: Это удалит ВСЕ каналы, посты, логи и ошибки из базы. Продолжить?')) return;
+  $('parse-status').textContent='Очистка базы...';
+  try{
+    var r=await fetch('/api/channel/clear-all',{method:'POST',cache:'no-store',credentials:'include'});
+    var data=await r.json();
+    if(data.success){$('parse-status').textContent='✅ База очищена. Страница перезагрузится...'; setTimeout(function(){location.reload();}, 2000);}
+    else{$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown');}
+  }catch(e){$('parse-status').textContent='❌ Ошибка сети: '+e; console.error(e);}
+}
+
 // Export functions for onclick handlers
 window.addChannel=addChannel;
 window.triggerParse=triggerParse;
 window.toggleChannel=toggleChannel;
 window.deleteChannel=deleteChannel;
+window.clearAll=clearAll;
 
 loadAll();
 })();
@@ -3080,6 +3093,32 @@ async def api_channels_delete(channel_id: int):
             return {"success": True, "deleted_id": channel_id}
     except Exception as e:
         logger.error(f"/channels/delete error: {e}"); traceback.print_exc()
+        return json_response({"success": False, "error": str(e)}, 500)
+
+
+
+# ─── API: Clear all data (admin only) ────────────────────────
+@app.post("/api/channel/clear-all", dependencies=[Depends(_get_auth_user)])
+async def api_channel_clear_all():
+    """Очистить ВСЕ данные: каналы, посты, логи, ошибки, группы. Сохраняет users."""
+    try:
+        async with async_session() as session:
+            result = await session.execute(text("""
+                TRUNCATE TABLE 
+                    channel_group_members,
+                    channel_groups,
+                    channel_errors,
+                    parse_logs,
+                    parse_state,
+                    posts,
+                    channels
+                CASCADE
+            """))
+            await session.commit()
+            logger.info("[clear-all] База полностью очищена (кроме users)")
+            return {"success": True, "message": "Все данные удалены. Добавьте каналы заново."}
+    except Exception as e:
+        logger.error(f"[clear-all] Error: {e}"); traceback.print_exc()
         return json_response({"success": False, "error": str(e)}, 500)
 
 
