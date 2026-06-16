@@ -399,117 +399,106 @@ class ChannelResolver:
         self.db_factory = db_session_factory
 
     async def sync_dialogs(self) -> list[dict[str, Any]]:
-        """Синхронизировать каналы через get_dialogs().
+        """Обновить access_hash для СУЩЕСТВУЮЩИХ каналов через get_dialogs().
+
+        ВАЖНО: НЕ создаёт новые каналы — только обновляет access_hash
+        для тех что уже есть в БД (is_active). Это предотвращает
+        парсинг всех 2446+ каналов аккаунта.
 
         Returns:
-            Список словарей {id, title, access_hash} для каждого канала.
+            Список каналов у которых обновлён access_hash.
         """
         logger.info("[resolver] Получаем диалоги через get_dialogs()...")
         dialogs = await self.client.get_dialogs(limit=None)
         logger.info("[resolver] Получено %d диалогов", len(dialogs))
 
-        channels: list[dict[str, Any]] = []
-        async with self.db_factory() as session:
-            for dialog in dialogs:
-                entity = dialog.entity
-                if not isinstance(entity, TlChannel):
-                    continue
-                if not entity.broadcast:
-                    continue  # Пропускаем группы, берём только каналы
+        # Строим маппинг: telegram_id → (access_hash, title, username)
+        tg_channels: dict[int, dict[str, Any]] = {}
+        for dialog in dialogs:
+            entity = dialog.entity
+            if not isinstance(entity, TlChannel):
+                continue
+            if not entity.broadcast:
+                continue
+            tg_channels[entity.id] = {
+                "access_hash": entity.access_hash,
+                "title": entity.title or "",
+                "username": entity.username,
+            }
 
-                channel_id = normalize_channel_id(entity.id)
-                access_hash = entity.access_hash
-
-                channels.append({
-                    "telegram_id": entity.id,
-                    "channel_id": channel_id,
-                    "title": entity.title or "",
-                    "username": entity.username,
-                    "access_hash": access_hash,
-                })
-
-                # Обновляем/создаём запись в БД
-                await self._upsert_channel(session, entity.id, channel_id,
-                                           entity.title, entity.username, access_hash)
-
-            await session.commit()
-
-        logger.info(
-            "[resolver] Синхронизировано %d каналов (broadcast)",
-            len(channels),
-        )
-        return channels
-
-    async def _upsert_channel(
-        self,
-        session: AsyncSession,
-        telegram_id: int,
-        channel_id: int,
-        title: str,
-        username: Optional[str],
-        access_hash: int,
-    ) -> None:
-        """Обновить или создать канал в БД."""
-        # Lazy import models to avoid circular deps
-        try:
-            from models import Channel as DbChannel
-        except ImportError:
-            return  # Will be handled by caller
-
-        result = await session.execute(
-            select(DbChannel).where(DbChannel.telegram_id == telegram_id)
-        )
-        db_ch = result.scalar_one_or_none()
-
-        if db_ch is None:
-            # Пробуем найти по username
-            if username:
-                result = await session.execute(
-                    select(DbChannel).where(DbChannel.username == username)
-                )
-                db_ch = result.scalar_one_or_none()
-
-        if db_ch is None:
-            db_ch = DbChannel(
-                telegram_id=telegram_id,
-                numeric_id=channel_id,
-                channel_type="private" if not username else "public",
-                username=username,
-                title=title,
-                is_active=True,
-                access_hash=access_hash,
-                entity_resolved_at=utc_now(),
-            )
-            session.add(db_ch)
-            logger.info(
-                "[resolver] Новый канал: %s (tid=%d, access_hash=%d)",
-                title, telegram_id, access_hash,
-            )
-        else:
-            db_ch.title = title
-            db_ch.username = username
-            db_ch.access_hash = access_hash
-            db_ch.entity_resolved_at = utc_now()
-            if db_ch.channel_type == "public" and not username:
-                db_ch.channel_type = "private"
-            elif db_ch.channel_type == "private" and username:
-                db_ch.channel_type = "public"
-            logger.debug("[resolver] Обновлён: %s", title)
-
-    async def get_active_channels(self) -> list[Any]:
-        """Получить список активных каналов из БД."""
+        # Обновляем access_hash ТОЛЬКО для существующих каналов в БД
+        updated = 0
+        skipped = 0
         try:
             from models import Channel as DbChannel
         except ImportError:
             return []
 
         async with self.db_factory() as session:
+            # Получаем ВСЕ активные каналы из БД
             result = await session.execute(
+                select(DbChannel).where(DbChannel.is_active == True)
+            )
+            db_channels = result.scalars().all()
+
+            for db_ch in db_channels:
+                tg_id = db_ch.telegram_id
+                if tg_id not in tg_channels:
+                    skipped += 1
+                    continue  # Канал из списка не найден в Telegram — skip
+
+                info = tg_channels[tg_id]
+                db_ch.access_hash = info["access_hash"]
+                db_ch.entity_resolved_at = utc_now()
+                db_ch.title = info["title"]
+                if info["username"]:
+                    db_ch.username = info["username"]
+                    db_ch.channel_type = "public"
+                updated += 1
+
+            await session.commit()
+
+        logger.info(
+            "[resolver] Обновлено access_hash: %d каналов (пропущено: %d)",
+            updated, skipped,
+        )
+        return []  # возвращаем пустой список — результат не нужен
+
+    async def get_active_channels(self) -> list[Any]:
+        """Получить список активных каналов из БД.
+
+        Если settings.channels_list задан — фильтруем по нему.
+        Иначе — все is_active каналы (обратная совместимость).
+        """
+        try:
+            from models import Channel as DbChannel
+            from config import settings as cfg
+        except ImportError:
+            return []
+
+        async with self.db_factory() as session:
+            query = (
                 select(DbChannel)
                 .where(DbChannel.is_active == True)
                 .order_by(DbChannel.last_parsed_at.asc().nullsfirst())
             )
-            return list(result.scalars().all())
+
+            # Если задан список каналов — фильтруем по username
+            channel_list = getattr(cfg, "channels_list", [])
+            if channel_list:
+                query = query.where(DbChannel.username.in_(channel_list))
+                logger.info(
+                    "[resolver] Фильтр по списку: %d каналов",
+                    len(channel_list),
+                )
+
+            result = await session.execute(query)
+            channels = list(result.scalars().all())
+            logger.info(
+                "[resolver] Активных каналов к парсингу: %d",
+                len(channels),
+            )
+            return channels
 
     async def build_input_peer(self, channel: Any) -> InputPeerChannel:
         """Построить InputPeerChannel из кэша БД — БЕЗ API call.
