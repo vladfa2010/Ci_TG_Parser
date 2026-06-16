@@ -1,0 +1,106 @@
+services:
+  # ─── Web Dashboard (FastAPI) ──────────────────────────────
+  - type: web
+    name: citg-web
+    runtime: docker
+    plan: starter
+    branch: v2-citg-rebrand
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: citg-db
+          property: connectionString
+      - key: APP_MODE
+        value: "web"
+      - key: PORT
+        value: "10000"
+
+  # ─── Cron Job: парсинг до 50 каналов (10 параллельно) ────
+  - type: cron
+    name: citg-cron
+    runtime: docker
+    plan: starter
+    branch: v2-citg-rebrand
+    schedule: "*/5 * * * *"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: citg-db
+          property: connectionString
+      # ─── Telegram API credentials ( Secrets ) ────────────
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_STRING_SESSION
+        sync: false
+      # ─── Channels & parsing config ──────────────────────
+      - key: CHANNELS
+        value: "markettwits"
+      - key: HISTORY
+        value: "0"
+      - key: SCHEDULE_MODE
+        value: "0"
+      - key: MAX_CONCURRENT_CHANNELS
+        value: "10"
+      - key: RETRY_ATTEMPTS
+        value: "3"
+
+  # ─── Background Worker: планировщик (альтернатива cron) ───
+  # Раскомментируй если хочешь заменить cron на постоянно
+  # работающий background worker с SCHEDULE_MODE=1
+  # - type: worker
+  #   name: citg-scheduler
+  #   runtime: docker
+  #   plan: starter
+  #   branch: v2-citg-rebrand
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: citg-db
+  #         property: connectionString
+  #     - key: TG_API_ID
+  #       sync: false
+  #     - key: TG_API_HASH
+  #       sync: false
+  #     - key: TG_STRING_SESSION
+  #       sync: false
+  #     - key: CHANNELS
+  #       value: "markettwits"
+  #     - key: SCHEDULE_MODE
+  #       value: "1"
+  #     - key: INTERVAL_SEC
+  #       value: "300"
+  #     - key: MAX_CONCURRENT_CHANNELS
+  #       value: "10"
+
+  # ─── Job: первоначальная загрузка истории (разовый запуск) ─
+  # Запусти вручную из Render Dashboard → Jobs → New Job
+  # Затем удали или отключи
+  # - type: job
+  #   name: citg-history
+  #   runtime: docker
+  #   plan: starter
+  #   branch: v2-citg-rebrand
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: citg-db
+  #         property: connectionString
+  #     - key: TG_API_ID
+  #       sync: false
+  #     - key: TG_API_HASH
+  #       sync: false
+  #     - key: TG_STRING_SESSION
+  #       sync: false
+  #     - key: CHANNELS
+  #       value: "markettwits"
+  #     - key: HISTORY
+  #       value: "1"
+  #     - key: MAX_CONCURRENT_CHANNELS
+  #       value: "3"
+
+databases:
+  - name: citg-db
+    plan: starter
+    ipAllowList: []

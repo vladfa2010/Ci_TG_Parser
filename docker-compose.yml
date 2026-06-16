@@ -1,0 +1,135 @@
+# =============================================
+# citg_v2 — Docker Compose
+# Services:
+#   postgres   — PostgreSQL 16 database
+#   parser     — single-run Telegram parser
+#   scheduler  — periodic parser (cron-like)
+#   web        — FastAPI dashboard
+#   init       — one-time database initialization
+# =============================================
+
+services:
+
+  # --- PostgreSQL Database ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: citg_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: citg
+      POSTGRES_PASSWORD: citg_secret
+      POSTGRES_DB: citg
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U citg -d citg"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    ports:
+      - "5432:5432"
+    networks:
+      - citg_network
+
+  # --- Single-Run Parser ---
+  parser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: citg_parser
+    environment:
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_SESSION: ${TG_SESSION:-session}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://citg:citg_secret@postgres:5432/citg}
+      HISTORY: ${HISTORY:-24}
+      LIMIT: ${LIMIT:-100}
+      CHANNELS: ${CHANNELS}
+    volumes:
+      - ./sessions:/app/sessions
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - citg_network
+
+  # --- Periodic Scheduler (cron-like) ---
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: citg_scheduler
+    restart: unless-stopped
+    environment:
+      APP_MODE: "scheduler"
+      SCHEDULE_MODE: "1"
+      INTERVAL_SEC: ${INTERVAL_SEC:-300}
+      CHANNELS: ${CHANNELS}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      TG_SESSION: ${TG_SESSION:-session}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://citg:citg_secret@postgres:5432/citg}
+      HISTORY: ${HISTORY:-24}
+      LIMIT: ${LIMIT:-100}
+    volumes:
+      - ./sessions:/app/sessions
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - scheduler
+    networks:
+      - citg_network
+
+  # --- Web Dashboard (FastAPI) ---
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: citg_web
+    restart: unless-stopped
+    environment:
+      APP_MODE: web
+      PORT: 8000
+      DATABASE_URL: ${DATABASE_URL:-postgresql://citg:citg_secret@postgres:5432/citg}
+    ports:
+      - "8000:8000"
+    command: uvicorn web:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      - postgres
+    networks:
+      - citg_network
+
+  # --- Database Initialization (one-time) ---
+  init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: citg_init
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://citg:citg_secret@postgres:5432/citg}
+    command: >
+      python -c "
+      import asyncio;
+      from parser import MultiChannelParser;
+      p = MultiChannelParser();
+      asyncio.run(p.init_db())
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - init
+    networks:
+      - citg_network
+
+# --- Named Volumes ---
+volumes:
+  postgres_data:
+    driver: local
+
+# --- Networks ---
+networks:
+  citg_network:
+    driver: bridge
