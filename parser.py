@@ -569,12 +569,14 @@ class MultiChannelParser:
             # Resolve entity — this caches it in Telethon session
             try:
                 resolved = await client.get_entity(entity_id)
-                logger.info("[%s] Entity cached: %s", username, resolved.title)
+                api_calls += 1
+                logger.info("[%s] Entity cached: %s (API call #%d)", username, resolved.title, api_calls)
             except Exception as resolve_err:
                 logger.warning("[%s] get_entity failed: %s", username, resolve_err)
 
             msg_counter = 0
             total_messages = 0
+            api_calls = 0  # Track API calls for this channel
             logger.info("[%s] Starting iter_messages with min_id=%s, limit=%s", username, min_id, limit)
             
             async for message in client.iter_messages(
@@ -622,24 +624,31 @@ class MultiChannelParser:
                 if dup_check.scalar_one_or_none() is not None:
                     continue
 
-                # --- Sender info ---
+                # --- Sender info (safe: no API calls) ---
                 sender_name: Optional[str] = None
-                if message.sender:
-                    sender = message.sender
-                    if hasattr(sender, 'first_name'):
-                        sender_name = (sender.first_name or '') + (' ' + sender.last_name if sender.last_name else '')
-                        if not sender_name.strip() and hasattr(sender, 'username') and sender.username:
-                            sender_name = '@' + sender.username
-                    elif hasattr(sender, 'title'):
-                        sender_name = sender.title
+                try:
+                    # message.sender may trigger API call — wrap in try
+                    if message.sender:
+                        sender = message.sender
+                        if hasattr(sender, 'first_name'):
+                            sender_name = (sender.first_name or '') + (' ' + sender.last_name if sender.last_name else '')
+                            if not sender_name.strip() and hasattr(sender, 'username') and sender.username:
+                                sender_name = '@' + sender.username
+                        elif hasattr(sender, 'title'):
+                            sender_name = sender.title
+                except Exception:
+                    sender_name = None  # Skip if API call needed
 
-                # --- Forward info ---
+                # --- Forward info (safe: no API calls) ---
                 forward_from: Optional[str] = None
-                if message.forward and message.forward.chat:
-                    forward_from = (
-                        message.forward.chat.username
-                        or message.forward.chat.title
-                    )
+                try:
+                    if message.forward and message.forward.chat:
+                        forward_from = (
+                            message.forward.chat.username
+                            or message.forward.chat.title
+                        )
+                except Exception:
+                    forward_from = None  # Skip if API call needed
 
                 # --- Создаём пост ---
                 post = Post(
@@ -651,7 +660,7 @@ class MultiChannelParser:
                     forwards_count=message.forwards or 0,
                     replies_count=(
                         message.replies.replies
-                        if message.replies
+                        if message.replies and hasattr(message.replies, 'replies')
                         else 0
                     ),
                     hashtags=_extract_hashtags(text),
@@ -676,7 +685,7 @@ class MultiChannelParser:
                         new_count,
                     )
 
-            logger.info("[%s] iter_messages done: total=%d, parsed=%d, new=%d", username, total_messages, parsed_count, new_count)
+            logger.info("[%s] iter_messages done: total=%d, parsed=%d, new=%d, api_calls=%d", username, total_messages, parsed_count, new_count, api_calls)
 
             # --- Финальный коммит ---
             await db_session.commit()
