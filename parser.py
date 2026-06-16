@@ -443,16 +443,30 @@ class ChannelResolver:
 
             for db_ch in db_channels:
                 tg_id = db_ch.telegram_id
-                logger.debug("[resolver] Checking channel '%s' tid=%d in dialogs", db_ch.title, tg_id)
-                if tg_id not in tg_channels:
+                # Ищем по telegram_id, abs(telegram_id), и numeric_id
+                found_id = None
+                if tg_id in tg_channels:
+                    found_id = tg_id
+                elif abs(tg_id) in tg_channels:
+                    found_id = abs(tg_id)
+                elif db_ch.numeric_id and db_ch.numeric_id in tg_channels:
+                    found_id = db_ch.numeric_id
+
+                if not found_id:
                     skipped += 1
-                    logger.warning("[resolver] Channel '%s' tid=%d NOT found in get_dialogs()", db_ch.title, tg_id)
+                    logger.warning("[resolver] Channel '%s' tid=%d (num_id=%s) NOT found in get_dialogs()", 
+                                  db_ch.title, tg_id, db_ch.numeric_id)
                     continue
 
-                info = tg_channels[tg_id]
+                info = tg_channels[found_id]
                 db_ch.access_hash = info["access_hash"]
                 db_ch.entity_resolved_at = utc_now()
                 db_ch.title = info["title"]
+                # Если telegram_id отличается — обновляем
+                if db_ch.telegram_id != found_id:
+                    logger.info("[resolver] Обновлён telegram_id %d → %d для '%s'", 
+                               db_ch.telegram_id, found_id, db_ch.title)
+                    db_ch.telegram_id = found_id
                 if info["username"]:
                     db_ch.username = info["username"]
                     db_ch.channel_type = "public"
@@ -509,7 +523,9 @@ class ChannelResolver:
             logger.warning("[resolver] Channel '%s' tid=%d нет access_hash, fallback get_entity...", 
                           channel.title, channel.telegram_id)
             try:
-                entity = await self.client.get_entity(channel.telegram_id)
+                # Явно указываем тип PeerChannel — иначе get_entity(int) может вернуть Chat
+                from telethon.tl.types import PeerChannel
+                entity = await self.client.get_entity(PeerChannel(channel.telegram_id))
                 if isinstance(entity, TlChannel):
                     channel.access_hash = entity.access_hash
                     channel.entity_resolved_at = utc_now()
