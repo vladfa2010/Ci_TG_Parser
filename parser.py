@@ -399,41 +399,105 @@ class ChannelResolver:
         self.db_factory = db_session_factory
 
     async def sync_dialogs(self) -> list[dict[str, Any]]:
-        """Обновить access_hash для СУЩЕСТВУЮЩИХ каналов/чатов через get_dialogs().
-
-        НЕ создаёт новые каналы — только обновляет access_hash.
-        Поддерживает Chat (basic group, без access_hash) и Channel (с access_hash).
+        """Синхронизировать каналы через get_dialogs().
 
         Returns:
-            Пустой список (результат не нужен, изменения в БД).
+            Список словарей {id, title, access_hash} для каждого канала.
         """
         logger.info("[resolver] Получаем диалоги через get_dialogs()...")
         dialogs = await self.client.get_dialogs(limit=None)
         logger.info("[resolver] Получено %d диалогов", len(dialogs))
 
-        # Строим маппинг: id → {type, access_hash, title, username}
-        from telethon.tl.types import Chat as TlChat
-        tg_map: dict[int, dict[str, Any]] = {}
-        for dialog in dialogs:
-            entity = dialog.entity
-            if isinstance(entity, TlChannel):
-                tg_map[entity.id] = {
-                    "type": "channel",
-                    "access_hash": entity.access_hash,
+        channels: list[dict[str, Any]] = []
+        async with self.db_factory() as session:
+            for dialog in dialogs:
+                entity = dialog.entity
+                if not isinstance(entity, TlChannel):
+                    continue
+                if not entity.broadcast:
+                    continue  # Пропускаем группы, берём только каналы
+
+                channel_id = normalize_channel_id(entity.id)
+                access_hash = entity.access_hash
+
+                channels.append({
+                    "telegram_id": entity.id,
+                    "channel_id": channel_id,
                     "title": entity.title or "",
                     "username": entity.username,
-                }
-            elif isinstance(entity, TlChat):
-                tg_map[entity.id] = {
-                    "type": "chat",
-                    "access_hash": None,
-                    "title": entity.title or "",
-                    "username": None,
-                }
+                    "access_hash": access_hash,
+                })
 
-        # Обновляем существующие каналы/чаты в БД
-        updated = 0
-        skipped = 0
+                # Обновляем/создаём запись в БД
+                await self._upsert_channel(session, entity.id, channel_id,
+                                           entity.title, entity.username, access_hash)
+
+            await session.commit()
+
+        logger.info(
+            "[resolver] Синхронизировано %d каналов (broadcast)",
+            len(channels),
+        )
+        return channels
+
+    async def _upsert_channel(
+        self,
+        session: AsyncSession,
+        telegram_id: int,
+        channel_id: int,
+        title: str,
+        username: Optional[str],
+        access_hash: int,
+    ) -> None:
+        """Обновить или создать канал в БД."""
+        # Lazy import models to avoid circular deps
+        try:
+            from models import Channel as DbChannel
+        except ImportError:
+            return  # Will be handled by caller
+
+        result = await session.execute(
+            select(DbChannel).where(DbChannel.telegram_id == telegram_id)
+        )
+        db_ch = result.scalar_one_or_none()
+
+        if db_ch is None:
+            # Пробуем найти по username
+            if username:
+                result = await session.execute(
+                    select(DbChannel).where(DbChannel.username == username)
+                )
+                db_ch = result.scalar_one_or_none()
+
+        if db_ch is None:
+            db_ch = DbChannel(
+                telegram_id=telegram_id,
+                numeric_id=channel_id,
+                channel_type="private" if not username else "public",
+                username=username,
+                title=title,
+                is_active=True,
+                access_hash=access_hash,
+                entity_resolved_at=utc_now(),
+            )
+            session.add(db_ch)
+            logger.info(
+                "[resolver] Новый канал: %s (tid=%d, access_hash=%d)",
+                title, telegram_id, access_hash,
+            )
+        else:
+            db_ch.title = title
+            db_ch.username = username
+            db_ch.access_hash = access_hash
+            db_ch.entity_resolved_at = utc_now()
+            if db_ch.channel_type == "public" and not username:
+                db_ch.channel_type = "private"
+            elif db_ch.channel_type == "private" and username:
+                db_ch.channel_type = "public"
+            logger.debug("[resolver] Обновлён: %s", title)
+
+    async def get_active_channels(self) -> list[Any]:
+        """Получить список активных каналов из БД."""
         try:
             from models import Channel as DbChannel
         except ImportError:
@@ -441,104 +505,36 @@ class ChannelResolver:
 
         async with self.db_factory() as session:
             result = await session.execute(
-                select(DbChannel).where(DbChannel.is_active == True)
-            )
-            db_channels = result.scalars().all()
-
-            for db_ch in db_channels:
-                # Ищем по telegram_id, abs(telegram_id), numeric_id
-                found_id = None
-                info = None
-                search_ids = [db_ch.telegram_id]
-                if db_ch.telegram_id and db_ch.telegram_id < 0:
-                    search_ids.append(abs(db_ch.telegram_id))
-                if db_ch.numeric_id:
-                    search_ids.append(db_ch.numeric_id)
-
-                for sid in search_ids:
-                    if sid in tg_map:
-                        found_id = sid
-                        info = tg_map[sid]
-                        break
-
-                if not found_id:
-                    skipped += 1
-                    logger.warning("[resolver] '%s' NOT found (searched: %s)",
-                                  db_ch.title, search_ids)
-                    continue
-
-                # Обновляем поля
-                db_ch.access_hash = info["access_hash"]  # None для Chat
-                db_ch.entity_resolved_at = utc_now()
-                db_ch.title = info["title"]
-                if info["type"] == "chat":
-                    db_ch.channel_type = "chat"
-                elif info.get("username"):
-                    db_ch.channel_type = "public"
-                    db_ch.username = info["username"]
-                else:
-                    db_ch.channel_type = "private"
-                updated += 1
-
-            await session.commit()
-
-        logger.info("[resolver] Обновлено: %d (пропущено: %d)", updated, skipped)
-        return []
-
-    async def get_active_channels(self) -> list[Any]:
-        """Получить список активных каналов из БД.
-
-        Если settings.channels_list задан — фильтруем по нему.
-        Иначе — все is_active каналы (обратная совместимость).
-        """
-        try:
-            from models import Channel as DbChannel
-            from config import settings as cfg
-        except ImportError:
-            return []
-
-        async with self.db_factory() as session:
-            query = (
                 select(DbChannel)
                 .where(DbChannel.is_active == True)
                 .order_by(DbChannel.last_parsed_at.asc().nullsfirst())
             )
-
-            # Если задан список каналов — фильтруем по username
-            channel_list = getattr(cfg, "channels_list", [])
-            if channel_list:
-                query = query.where(DbChannel.username.in_(channel_list))
-                logger.info(
-                    "[resolver] Фильтр по списку: %d каналов",
-                    len(channel_list),
-                )
-
-            result = await session.execute(query)
-            channels = list(result.scalars().all())
-            logger.info(
-                "[resolver] Активных каналов к парсингу: %d",
-                len(channels),
-            )
-            return channels
+            return list(result.scalars().all())
 
     async def build_input_peer(self, channel: Any):
-        """Построить input peer для канала или чата.""
-
-        Returns InputPeerChannel для каналов, InputPeerChat для чатов."""
+        """Построить input peer. Chat первым — порядок ВАЖЕН.
+        
+        Chat (basic group): telegram_id > 0 → InputPeerChat (no access_hash)
+        Channel: telegram_id < 0 → InputPeerChannel (needs access_hash)
+        """
         from telethon.tl.types import InputPeerChat
-        """Построить InputPeerChannel из кэша БД — с fallback на get_entity()."""
+        
+        tid = channel.telegram_id
+        
+        # === 1. Chat (basic group) — telegram_id is positive ===
+        if tid is not None and tid > 0:
+            logger.info("[resolver] InputPeerChat(chat_id=%d) для '%s' [Chat]", tid, channel.title)
+            return InputPeerChat(tid)
+        
+        # === 2. Channel — needs access_hash ===
         if not channel.access_hash:
-            # Fallback: попытаться получить access_hash через get_entity
-            logger.warning("[resolver] Channel '%s' tid=%d нет access_hash, fallback get_entity...", 
-                          channel.title, channel.telegram_id)
+            logger.warning("[resolver] '%s' tid=%d: нет access_hash, fallback...", channel.title, tid)
             try:
-                # Явно указываем тип PeerChannel — иначе get_entity(int) может вернуть Chat
                 from telethon.tl.types import PeerChannel
-                entity = await self.client.get_entity(PeerChannel(channel.telegram_id))
+                entity = await self.client.get_entity(PeerChannel(abs(tid) % 1_000_000_000_000))
                 if isinstance(entity, TlChannel):
                     channel.access_hash = entity.access_hash
                     channel.entity_resolved_at = utc_now()
-                    # Сохраняем в БД
                     async with self.db_factory() as session:
                         result = await session.execute(
                             select(type(channel)).where(type(channel).id == channel.id)
@@ -547,23 +543,14 @@ class ChannelResolver:
                         db_ch.access_hash = entity.access_hash
                         db_ch.entity_resolved_at = utc_now()
                         await session.commit()
-                    logger.info("[resolver] Got access_hash for '%s' via fallback", channel.title)
+                    logger.info("[resolver] Got access_hash для '%s'", channel.title)
                 else:
-                    raise ValueError(f"Entity is not a Channel: {type(entity)}")
+                    raise ValueError(f"Entity is {type(entity).__name__}, not Channel")
             except Exception as e:
-                raise ValueError(
-                    f"Канал {channel.id} ({channel.title}) не имеет access_hash "
-                    f"и fallback get_entity() тоже не сработал: {e}"
-                )
-
-        # Чаты (не каналы) — используем InputPeerChat
-        if getattr(channel, 'channel_type', None) == 'chat' or not channel.access_hash:
-            # Для чатов: telegram_id это chat_id (обычно отрицательный)
-            chat_id = abs(channel.telegram_id) if channel.telegram_id < 0 else channel.telegram_id
-            # Для чатов access_hash не нужен
-            return InputPeerChat(chat_id)
-
-        channel_id = normalize_channel_id(channel.telegram_id)
+                raise ValueError(f"'{channel.title}' (tid={tid}): нет access_hash, ошибка: {e}")
+        
+        channel_id = normalize_channel_id(tid)
+        logger.debug("[resolver] InputPeerChannel(id=%d) для '%s'", channel_id, channel.title)
         return InputPeerChannel(channel_id, channel.access_hash)
 
 
@@ -587,7 +574,7 @@ class ChannelParser:
     async def parse(
         self,
         channel: Any,
-        input_peer: InputPeerChannel,
+        input_peer: Any,  # InputPeerChannel | InputPeerChat
     ) -> ParseResult:
         """Парсит один канал инкрементально.
 
@@ -842,9 +829,6 @@ class MultiChannelParser:
         self._resolver: Optional[ChannelResolver] = None
         self._parser: Optional[ChannelParser] = None
 
-        # Progress callback for web UI live tracking
-        self._progress_callback: Optional[Callable[..., None]] = None
-
     # ─── Lifecycle ──────────────────────────────────────────
 
     async def init_db(self) -> None:
@@ -865,51 +849,11 @@ class MultiChannelParser:
             expire_on_commit=False,
         )
 
-        # Create tables + auto-migrate (add missing columns)
+        # Create tables
         try:
             from models import Base
             async with self._engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
-
-                # ─── Auto-migration v3: add access_hash + entity_resolved_at ───
-                # These columns are needed for InputPeerChannel caching
-                for col_name, col_type in [
-                    ("access_hash", "BIGINT"),
-                    ("entity_resolved_at", "TIMESTAMPTZ"),
-                ]:
-                    result = await conn.execute(text(f"""
-                        SELECT column_name FROM information_schema.columns
-                        WHERE table_name = 'channels' AND column_name = '{col_name}'
-                    """))
-                    if not result.fetchone():
-                        await conn.execute(text(
-                            f"ALTER TABLE channels ADD COLUMN {col_name} {col_type}"
-                        ))
-                        logger.info("[migrate] channels.%s → added (%s)", col_name, col_type)
-                    else:
-                        logger.debug("[migrate] channels.%s already exists", col_name)
-
-                # Create parse_state table if missing (for parser state tracking)
-                result = await conn.execute(text("""
-                    SELECT table_name FROM information_schema.tables
-                    WHERE table_name = 'parse_state'
-                """))
-                if not result.fetchone():
-                    await conn.execute(text("""
-                        CREATE TABLE parse_state (
-                            id INTEGER PRIMARY KEY DEFAULT 1,
-                            last_run_at TIMESTAMPTZ,
-                            last_run_channels INTEGER DEFAULT 0,
-                            last_run_new_posts INTEGER DEFAULT 0,
-                            last_run_duration_sec INTEGER DEFAULT 0,
-                            last_error TEXT,
-                            global_cooldown_until TIMESTAMPTZ,
-                            total_api_calls BIGINT DEFAULT 0,
-                            total_flood_waits INTEGER DEFAULT 0
-                        )
-                    """))
-                    logger.info("[migrate] parse_state table created")
-
         except ImportError:
             logger.warning("Models not available — skipping table creation")
 
@@ -950,20 +894,6 @@ class MultiChannelParser:
             logger.info("[client] Отключён")
 
     # ─── Core: parse all channels ───────────────────────────
-
-    async def _check_global_lock(self) -> bool:
-        """Проверить — не идёт ли очистка из веба."""
-        try:
-            from models import ParseState
-            async with self._db_factory() as session:
-                result = await session.execute(select(ParseState))
-                state = result.scalar_one_or_none()
-                if state and state.global_lock:
-                    logger.warning("[lock] Парсинг пропущен — идёт очистка из веба")
-                    return False
-        except Exception:
-            pass
-        return True
 
     async def run_once(self) -> dict[int, ParseResult]:
         """Один прогон парсера по всем активным каналам.
@@ -1010,13 +940,6 @@ class MultiChannelParser:
 
             logger.info("Каналов к парсингу: %d", len(channels))
 
-            # Callback: сообщаем вебу общее количество каналов
-            if self._progress_callback:
-                self._progress_callback(
-                    channels_total=len(channels),
-                    current_operation=f"Parsing {len(channels)} channels...",
-                )
-
             # Шаг 3: Парсим последовательно
             for i, channel in enumerate(channels):
                 # Jitter перед каналом
@@ -1049,7 +972,6 @@ class MultiChannelParser:
                     i + 1, len(channels), channel.title, channel.id,
                 )
 
-                result = ParseResult()  # Инициализация — чтобы callback не падал
                 try:
                     input_peer = await self._resolver.build_input_peer(channel)
                     result = await self._parser.parse(channel, input_peer)
@@ -1066,39 +988,30 @@ class MultiChannelParser:
                         self._rate_limiter.on_success()
 
                 except GlobalCooldownError as e:
+                    # Глобальный cooldown — останавливаем весь прогон
                     logger.warning(
                         "[%d/%d] GlobalCooldownError — останавливаем прогон: %s",
                         i + 1, len(channels), e,
                     )
-                    result = ParseResult(error=f"GlobalCooldown: {e}")
-                    results[channel.id] = result
                     break
 
                 except FloodWaitError as e:
+                    # FloodWait на уровне оркестратора
                     logger.warning(
                         "[%d/%d] FloodWait %d сек — активируем глобальную паузу",
                         i + 1, len(channels), e.seconds,
                     )
                     self._rate_limiter.on_flood_wait(e.seconds)
                     self._circuit.on_global_flood(e.seconds)
-                    result = ParseResult(error=f"FloodWait: {e.seconds}с", flood_wait_sec=e.seconds)
-                    results[channel.id] = result
+                    results[channel.id] = ParseResult(
+                        error=f"FloodWait: {e.seconds}с", flood_wait_sec=e.seconds,
+                    )
                     break
 
                 except Exception as e:
                     logger.exception("Ошибка парсинга канала %d: %s", channel.id, e)
-                    result = ParseResult(error=str(e))
-                    results[channel.id] = result
+                    results[channel.id] = ParseResult(error=str(e))
                     self._circuit.on_channel_failure(channel.id, type(e).__name__)
-
-                # Callback: прогресс после каждого канала
-                if self._progress_callback:
-                    self._progress_callback(
-                        increment_channels_done=1,
-                        increment_posts_new=getattr(result, 'new', 0),
-                        increment_posts_parsed=getattr(result, 'parsed', 0),
-                        current_channel=channel.title or str(channel.id),
-                    )
 
                 # Пауза между каналами (adaptive)
                 if i < len(channels) - 1:
@@ -1129,18 +1042,6 @@ class MultiChannelParser:
         await self._save_run_state(len(results), total_new, duration_sec, total_errors)
 
         return results
-
-    async def parse_all(self, history: bool = False) -> dict[int, ParseResult]:
-        """API для web.py: запускает run_once() с прогресс-колбэком.
-
-        Args:
-            history: Если True — игнорируется (v3 всегда инкрементальный).
-
-        Returns:
-            dict[int, ParseResult]: результаты по каналам.
-        """
-        logger.info("[parse_all] Запуск из web.py (history=%s)", history)
-        return await self.run_once()
 
     async def run_scheduled(self) -> None:
         """Периодический запуск парсера."""
