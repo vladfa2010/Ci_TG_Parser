@@ -831,11 +831,51 @@ class MultiChannelParser:
             expire_on_commit=False,
         )
 
-        # Create tables
+        # Create tables + auto-migrate (add missing columns)
         try:
             from models import Base
             async with self._engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
+
+                # ─── Auto-migration v3: add access_hash + entity_resolved_at ───
+                # These columns are needed for InputPeerChannel caching
+                for col_name, col_type in [
+                    ("access_hash", "BIGINT"),
+                    ("entity_resolved_at", "TIMESTAMPTZ"),
+                ]:
+                    result = await conn.execute(text(f"""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name = 'channels' AND column_name = '{col_name}'
+                    """))
+                    if not result.fetchone():
+                        await conn.execute(text(
+                            f"ALTER TABLE channels ADD COLUMN {col_name} {col_type}"
+                        ))
+                        logger.info("[migrate] channels.%s → added (%s)", col_name, col_type)
+                    else:
+                        logger.debug("[migrate] channels.%s already exists", col_name)
+
+                # Create parse_state table if missing (for parser state tracking)
+                result = await conn.execute(text("""
+                    SELECT table_name FROM information_schema.tables
+                    WHERE table_name = 'parse_state'
+                """))
+                if not result.fetchone():
+                    await conn.execute(text("""
+                        CREATE TABLE parse_state (
+                            id INTEGER PRIMARY KEY DEFAULT 1,
+                            last_run_at TIMESTAMPTZ,
+                            last_run_channels INTEGER DEFAULT 0,
+                            last_run_new_posts INTEGER DEFAULT 0,
+                            last_run_duration_sec INTEGER DEFAULT 0,
+                            last_error TEXT,
+                            global_cooldown_until TIMESTAMPTZ,
+                            total_api_calls BIGINT DEFAULT 0,
+                            total_flood_waits INTEGER DEFAULT 0
+                        )
+                    """))
+                    logger.info("[migrate] parse_state table created")
+
         except ImportError:
             logger.warning("Models not available — skipping table creation")
 
