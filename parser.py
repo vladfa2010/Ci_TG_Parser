@@ -546,14 +546,21 @@ class MultiChannelParser:
             await asyncio.sleep(0.5)
 
             # --- Итерируем сообщения (по ID канала, без повторного get_entity) ---
-            # Use PeerChannel for negative IDs to ensure correct entity type
-            if channel.telegram_id < 0 and not channel.username:
+            # Private channels (no username) MUST use PeerChannel with -100 prefix
+            # regardless of how telegram_id is stored in DB (positive or negative)
+            if not channel.username:
                 from telethon.tl.types import PeerChannel
-                entity_id = PeerChannel(abs(channel.telegram_id))
-                logger.info("[%s] Using PeerChannel(%s) for iter_messages", username, abs(channel.telegram_id))
+                if channel.telegram_id > 0:
+                    # Bare positive ID in DB — add -100 prefix
+                    channel_id = int(f"-100{channel.telegram_id}")
+                else:
+                    channel_id = channel.telegram_id
+                entity_id = PeerChannel(abs(channel_id))
+                logger.info("[%s] Private channel → PeerChannel(%s) [DB tid=%s]", username, abs(channel_id), channel.telegram_id)
             else:
+                # Public channel — use username/telegram_id directly
                 entity_id = channel.telegram_id
-                logger.info("[%s] Using entity_id=%s for iter_messages", username, entity_id)
+                logger.info("[%s] Public channel → entity_id=%s", username, entity_id)
             
             msg_counter = 0
             total_messages = 0
