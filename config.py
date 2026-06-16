@@ -1,8 +1,15 @@
 """
-Централизованная конфигурация Telegram-Parser.
+Централизованная конфигурация Telegram-Parser (citg_v3).
 
 Модуль предоставляет единую точку доступа ко всем настройкам приложения
 через pydantic-settings с валидацией переменных окружения.
+
+Новое в v3:
+    - CHANNEL_DELAY_SEC — пауза между каналами (default: 10)
+    - API_CALL_DELAY_MS — задержка между API calls в мс (default: 1000)
+    - FLOOD_COOLDOWN_MIN — глобальный cooldown при FloodWait в мин (default: 30)
+    - BATCH_COMMIT_SIZE — размер пачки для коммита в БД (default: 50)
+    - JITTER_SEC — максимальный jitter перед каналом в сек (default: 10.0)
 
 Использование:
     from config import settings
@@ -51,6 +58,13 @@ class Settings(BaseSettings):
         LOG_LEVEL: Уровень логирования.
         PORT: Порт веб-сервера.
         APP_MODE: Режим работы ("parser" или "web").
+
+        --- Parser v3 settings ---
+        CHANNEL_DELAY_SEC: Пауза между каналами (сек).
+        API_CALL_DELAY_MS: Задержка между API calls (мс).
+        FLOOD_COOLDOWN_MIN: Глобальный cooldown при FloodWait (мин).
+        BATCH_COMMIT_SIZE: Размер пачки для коммита в БД.
+        JITTER_SEC: Максимальный jitter перед каналом (сек).
     """
 
     model_config = SettingsConfigDict(
@@ -76,7 +90,7 @@ class Settings(BaseSettings):
         min_length=1,
     )
 
-    # --- Опциональные поля ---
+    # --- Опциональные поля (legacy) ---
 
     TG_STRING_SESSION: str = Field(
         default="",
@@ -137,6 +151,34 @@ class Settings(BaseSettings):
     APP_MODE: str = Field(
         default="parser",
         description="Режим работы: 'parser' или 'web'",
+    )
+
+    # --- Parser v3 settings ---
+
+    CHANNEL_DELAY_SEC: int = Field(
+        default=10,
+        description="Пауза между каналами (секунды)",
+        ge=0,
+    )
+    API_CALL_DELAY_MS: int = Field(
+        default=1000,
+        description="Задержка между API calls (миллисекунды)",
+        ge=0,
+    )
+    FLOOD_COOLDOWN_MIN: int = Field(
+        default=30,
+        description="Глобальный cooldown при FloodWait (минуты)",
+        ge=1,
+    )
+    BATCH_COMMIT_SIZE: int = Field(
+        default=50,
+        description="Размер пачки для коммита в БД (количество постов)",
+        ge=1,
+    )
+    JITTER_SEC: float = Field(
+        default=10.0,
+        description="Максимальный jitter перед началом парсинга канала (секунды)",
+        ge=0,
     )
 
     # --- Валидаторы ---
@@ -276,6 +318,26 @@ class Settings(BaseSettings):
             return url
         return url
 
+    # --- v3: convenience properties ---
+
+    @property
+    def api_call_delay_sec(self) -> float:
+        """API_CALL_DELAY_MS в секундах (float).
+
+        Returns:
+            Задержка в секундах (например, 1000 -> 1.0).
+        """
+        return self.API_CALL_DELAY_MS / 1000.0
+
+    @property
+    def flood_cooldown_sec(self) -> int:
+        """FLOOD_COOLDOWN_MIN в секундах.
+
+        Returns:
+            Cooldown в секундах (например, 30 -> 1800).
+        """
+        return self.FLOOD_COOLDOWN_MIN * 60
+
     # --- Методы ---
 
     def validate_parser(self) -> None:
@@ -287,6 +349,8 @@ class Settings(BaseSettings):
             - DATABASE_URL не пустой и корректный
             - channels_list не пустой
             - RETRY_ATTEMPTS >= 0
+            - v3: BATCH_COMMIT_SIZE >= 1
+            - v3: FLOOD_COOLDOWN_MIN >= 1
 
         Raises:
             ValueError: Если какое-либо обязательное поле не заполнено
@@ -317,64 +381,21 @@ class Settings(BaseSettings):
         if self.RETRY_ATTEMPTS < 0:
             errors.append("RETRY_ATTEMPTS не может быть отрицательным")
 
+        # v3 validation
+        if self.BATCH_COMMIT_SIZE < 1:
+            errors.append("BATCH_COMMIT_SIZE должен быть >= 1")
+
+        if self.FLOOD_COOLDOWN_MIN < 1:
+            errors.append("FLOOD_COOLDOWN_MIN должен быть >= 1 минута")
+
         if errors:
             raise ValueError(
-                "Конфигурация парсера содержит ошибки:\n  - "
+                "Конфигурация парсера не валидна:\n  - "
                 + "\n  - ".join(errors)
             )
 
-    def logging_config(self) -> dict[str, Any]:
-        """Возвращает словарь конфигурации логгера в формате dictConfig.
-
-        Конфигурация включает:
-            - Форматтер с timestamp, уровнем, именем модуля и сообщением
-            - StreamHandler для вывода в stdout
-            - Уровень логирования из LOG_LEVEL
-
-        Returns:
-            Словарь конфигурации logging.dictConfig.
-        """
-        return {
-            "version": 1,
-            "disable_existing_loggers": False,
-            "formatters": {
-                "standard": {
-                    "format": (
-                        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-                    ),
-                    "datefmt": "%Y-%m-%d %H:%M:%S",
-                },
-                "detailed": {
-                    "format": (
-                        "%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d "
-                        "| %(message)s"
-                    ),
-                    "datefmt": "%Y-%m-%d %H:%M:%S",
-                },
-            },
-            "handlers": {
-                "console": {
-                    "class": "logging.StreamHandler",
-                    "level": self.LOG_LEVEL,
-                    "formatter": "standard",
-                    "stream": "ext://sys.stdout",
-                },
-            },
-            "loggers": {
-                "": {
-                    "handlers": ["console"],
-                    "level": self.LOG_LEVEL,
-                    "propagate": False,
-                },
-            },
-        }
+        logger.info("Конфигурация парсера валидна: %d каналов", len(self.channels_list))
 
 
-# --- Глобальный singleton ---
+# Singleton instance
 settings = Settings()
-
-
-__all__ = [
-    "Settings",
-    "settings",
-]

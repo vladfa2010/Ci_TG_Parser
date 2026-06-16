@@ -1,5 +1,18 @@
+# ============================================================================
+# Render.com deployment config — citg_v3
+# ============================================================================
+# Ключевые изменения v3:
+#   - cron: */5 -> */20 минут (реже, чтобы успевать пройти 20 каналов)
+#   - MAX_CONCURRENT_CHANNELS: 10 -> 1 (последовательно, без semaphore)
+#   - Новые env vars: CHANNEL_DELAY_SEC, API_CALL_DELAY_MS и т.д.
+#
+# Применить: render blueprint apply render_v3.yaml
+# ============================================================================
+
 services:
-  # ─── Web Dashboard (FastAPI) ──────────────────────────────
+  # --------------------------------------------------------------------------
+  # Web Dashboard (FastAPI)
+  # --------------------------------------------------------------------------
   - type: web
     name: citg-web
     runtime: docker
@@ -15,40 +28,60 @@ services:
       - key: PORT
         value: "10000"
 
-  # ─── Cron Job: парсинг до 50 каналов (10 параллельно) ────
+  # --------------------------------------------------------------------------
+  # Cron Job: парсинг 20 private каналов (последовательно)
+  # --------------------------------------------------------------------------
+  # v3: Раз в 20 минут достаточно:
+  #   20 каналов * (10 сек задержка + ~5-10 сек парсинг + 10 сек jitter)
+  #   = ~8-10 минут на прогон + запас на FloodWait
   - type: cron
     name: citg-cron
     runtime: docker
     plan: starter
     branch: v2-citg-rebrand
-    schedule: "*/5 * * * *"
+    # v3: было */5 * * * *, стало */20 * * * *
+    schedule: "*/20 * * * *"
     envVars:
       - key: DATABASE_URL
         fromDatabase:
           name: citg-db
           property: connectionString
-      # ─── Telegram API credentials ( Secrets ) ────────────
+      # --- Telegram API credentials (Secrets) ---
       - key: TG_API_ID
         sync: false
       - key: TG_API_HASH
         sync: false
       - key: TG_STRING_SESSION
         sync: false
-      # ─── Channels & parsing config ──────────────────────
+      # --- Channels & parsing config ---
       - key: CHANNELS
         value: "markettwits"
       - key: HISTORY
         value: "0"
       - key: SCHEDULE_MODE
         value: "0"
+      # v3: последовательно — не более 1 канала за раз
       - key: MAX_CONCURRENT_CHANNELS
-        value: "10"
+        value: "1"
       - key: RETRY_ATTEMPTS
         value: "3"
+      # --- Parser v3 settings ---
+      - key: CHANNEL_DELAY_SEC
+        value: "10"
+      - key: API_CALL_DELAY_MS
+        value: "1000"
+      - key: FLOOD_COOLDOWN_MIN
+        value: "30"
+      - key: BATCH_COMMIT_SIZE
+        value: "50"
+      - key: JITTER_SEC
+        value: "10"
 
-  # ─── Background Worker: планировщик (альтернатива cron) ───
+  # --------------------------------------------------------------------------
+  # Background Worker: планировщик (альтернатива cron)
   # Раскомментируй если хочешь заменить cron на постоянно
   # работающий background worker с SCHEDULE_MODE=1
+  # --------------------------------------------------------------------------
   # - type: worker
   #   name: citg-scheduler
   #   runtime: docker
@@ -72,11 +105,24 @@ services:
   #     - key: INTERVAL_SEC
   #       value: "300"
   #     - key: MAX_CONCURRENT_CHANNELS
+  #       value: "1"
+  #     # v3 settings
+  #     - key: CHANNEL_DELAY_SEC
+  #       value: "10"
+  #     - key: API_CALL_DELAY_MS
+  #       value: "1000"
+  #     - key: FLOOD_COOLDOWN_MIN
+  #       value: "30"
+  #     - key: BATCH_COMMIT_SIZE
+  #       value: "50"
+  #     - key: JITTER_SEC
   #       value: "10"
 
-  # ─── Job: первоначальная загрузка истории (разовый запуск) ─
-  # Запусти вручную из Render Dashboard → Jobs → New Job
+  # --------------------------------------------------------------------------
+  # Job: первоначальная загрузка истории (разовый запуск)
+  # Запусти вручную из Render Dashboard -> Jobs -> New Job
   # Затем удали или отключи
+  # --------------------------------------------------------------------------
   # - type: job
   #   name: citg-history
   #   runtime: docker
@@ -98,8 +144,16 @@ services:
   #     - key: HISTORY
   #       value: "1"
   #     - key: MAX_CONCURRENT_CHANNELS
-  #       value: "3"
+  #       value: "1"
+  #     # v3 settings
+  #     - key: CHANNEL_DELAY_SEC
+  #       value: "10"
+  #     - key: API_CALL_DELAY_MS
+  #       value: "1000"
 
+# ------------------------------------------------------------------------------
+# Database
+# ------------------------------------------------------------------------------
 databases:
   - name: citg-db
     plan: starter

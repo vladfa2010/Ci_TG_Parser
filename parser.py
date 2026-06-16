@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-MultiChannelParser — асинхронный многоканальный парсер Telegram.
+CITG Parser v3 — многоканальный парсер Telegram-каналов.
 
-Ключевые возможности:
-    * Параллельный парсинг каналов через asyncio.Semaphore
-    * Retry logic с exponential backoff
-    * Per-channel health tracking (авто-отключение при 3+ ошибках)
-    * Глобальная дедупликация постов по text_hash
-    * Graceful shutdown (SIGTERM / SIGINT)
-    * Rate limiting между API-запросами
+Ключевые особенности:
+  * Кэширование access_hash в БД (обход get_entity() для private channels)
+  * AdaptiveRateLimiter — адаптивный rate limiting
+  * CircuitBreaker — per-channel + global защита от FloodWait
+  * Последовательный парсинг с jitter (безопасно для 20+ каналов)
+  * Zero API calls на resolve sender — используем message.post_author
 
-Использование::
-
-    from parser import MultiChannelParser
-
-    parser = MultiChannelParser()
-    await parser.run_once()          # Один прогон
-    await parser.run_scheduled()     # Периодический запуск
+Архитектура:
+  ChannelResolver   → get_dialogs() + кэш access_hash в БД
+  ChannelParser     → iter_messages(InputPeerChannel) без get_entity()
+  MultiChannelParser→ оркестратор: sequential + circuit breaker + rate limit
 """
 
 from __future__ import annotations
@@ -24,19 +20,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
-from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy import select, text, BigInteger, Integer, DateTime, Text, String, Boolean, ForeignKey, Index, PrimaryKeyConstraint
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
 from telethon import TelegramClient
 from telethon.errors import (
     ChannelInvalidError,
@@ -46,1059 +41,1085 @@ from telethon.errors import (
     SessionRevokedError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.types import Message
+from telethon.tl.types import (
+    Message,
+    Channel as TlChannel,
+    InputPeerChannel,
+    PeerChannel,
+)
 
-from config import settings
-from models import Base, Channel, ChannelError, ParseLog, Post, User
+# ─── Configuration ──────────────────────────────────────────
+# Lazy import to avoid circular deps
+_config = None
+
+def _get_config():
+    global _config
+    if _config is None:
+        try:
+            from config import settings as _config
+        except ImportError:
+            # Fallback for standalone testing
+            class _FallbackConfig:
+                TG_API_ID = int(__import__('os').getenv('TG_API_ID', 0))
+                TG_API_HASH = __import__('os').getenv('TG_API_HASH', '')
+                TG_STRING_SESSION = __import__('os').getenv('TG_STRING_SESSION', '')
+                DATABASE_URL = __import__('os').getenv('DATABASE_URL', 'postgresql+asyncpg://localhost/citg')
+                SCHEDULE_MODE = __import__('os').getenv('SCHEDULE_MODE', 'false').lower() == 'true'
+                INTERVAL_SEC = int(__import__('os').getenv('INTERVAL_SEC', 1200))
+                MAX_CONCURRENT_CHANNELS = int(__import__('os').getenv('MAX_CONCURRENT_CHANNELS', 1))
+                RETRY_ATTEMPTS = int(__import__('os').getenv('RETRY_ATTEMPTS', 2))
+                CHANNEL_DELAY_SEC = int(__import__('os').getenv('CHANNEL_DELAY_SEC', 10))
+                API_CALL_DELAY_MS = int(__import__('os').getenv('API_CALL_DELAY_MS', 1000))
+                FLOOD_COOLDOWN_MIN = int(__import__('os').getenv('FLOOD_COOLDOWN_MIN', 30))
+                BATCH_COMMIT_SIZE = int(__import__('os').getenv('BATCH_COMMIT_SIZE', 50))
+                JITTER_SEC = float(__import__('os').getenv('JITTER_SEC', 10.0))
+                LOG_LEVEL = __import__('os').getenv('LOG_LEVEL', 'INFO')
+                LIMIT = None
+                HISTORY = False
+                database_url_async = property(lambda self: self.DATABASE_URL)
+                @property
+                def channels_list(self): return []
+            _config = _FallbackConfig()
+    return _config
+
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ─── Helpers ────────────────────────────────────────────────
 
-
-def _now() -> datetime:
-    """Текущее UTC время (вызывается каждый раз — не кэшируется)."""
+def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _extract_hashtags(text: str) -> list[str]:
-    r"""Извлекает хэштеги (#\S+) из текста."""
+def extract_hashtags(text: str) -> list[str]:
     return re.findall(r"#\S+", text) if text else []
 
 
-def _extract_mentions(text: str) -> list[str]:
-    """Извлекает @упоминания из текста."""
+def extract_mentions(text: str) -> list[str]:
     return re.findall(r"@\w+", text) if text else []
 
 
-def _extract_urls(text: str) -> list[str]:
-    """Извлекает http(s)-ссылки из текста."""
+def extract_urls(text: str) -> list[str]:
     return re.findall(r"https?://[^\s]+", text) if text else []
 
 
-def _make_text_hash(text: str) -> str:
-    """SHA-256 хэш текста для дедупликации."""
-    return hashlib.sha256(text.encode()).hexdigest() if text else ""
+def hash_text(text: str) -> Optional[str]:
+    return hashlib.sha256(text.encode()).hexdigest() if text else None
 
 
-def _get_media_type(message: Message) -> Optional[str]:
-    """Определяет тип медиа в сообщении."""
+def get_media_type(message: Message) -> Optional[str]:
     if not message.media:
         return None
     if message.photo:
         return "photo"
     if message.video:
         return "video"
+    if message.audio:
+        return "audio"
+    if message.voice:
+        return "voice"
     if message.document:
         return "document"
+    if message.poll:
+        return "poll"
+    if message.geo:
+        return "geo"
+    if message.web_preview:
+        return "web_preview"
     return "other"
 
 
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
+def normalize_channel_id(telegram_id: int) -> int:
+    """Преобразует telegram_id (например -1003147415698) в channel_id (3147415698)."""
+    if telegram_id < 0:
+        return abs(telegram_id) % 1_000_000_000_000
+    return telegram_id
 
+
+# ─── Dataclasses ────────────────────────────────────────────
 
 @dataclass
 class ParseResult:
-    """Результат парсинга одного канала."""
-
-    posts_parsed: int = 0          # Всего обработано постов
-    posts_new: int = 0             # Новых вставлено
-    error_message: Optional[str] = None
+    parsed: int = 0
+    new: int = 0
+    error: Optional[str] = None
     duration_ms: int = 0
+    flood_wait_sec: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
+# ─── AdaptiveRateLimiter ────────────────────────────────────
+
+class GlobalCooldownError(Exception):
+    """Глобальный cooldown активен — нельзя делать API calls."""
+    pass
 
 
-class MultiChannelParser:
-    """Многоканальный асинхронный парсер Telegram-каналов.
+class AdaptiveRateLimiter:
+    """Адаптивный rate limiter: замедляется при ошибках, ускоряется при успехе.
 
     Args:
-        api_id: Telegram API ID.
-        api_hash: Telegram API hash.
-        session_str: Строковая сессия Telethon.
-        db_url: URL подключения к PostgreSQL (asyncpg).
+        min_delay: Минимальная задержка между API calls (сек).
+        max_delay: Максимальная задержка (сек).
+        initial_delay: Начальная задержка (сек).
     """
 
     def __init__(
         self,
-        api_id: int = settings.TG_API_ID,
-        api_hash: str = settings.TG_API_HASH,
-        session_str: str = settings.TG_STRING_SESSION,
-        db_url: str = settings.database_url_async,
+        min_delay: float = 0.5,
+        max_delay: float = 30.0,
+        initial_delay: float = 1.0,
     ) -> None:
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.session_str = session_str
-        self.db_url = db_url
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.current_delay = initial_delay
+        self.last_call_time = 0.0
+        self.flood_wait_until = 0.0
+        self.consecutive_errors = 0
+        self.total_calls = 0
+        self.total_errors = 0
+        self.total_flood_waits = 0
 
-        # Callback for live progress reporting (injected by web layer)
-        self._progress_callback: Optional[Callable[..., None]] = None
+    async def before_call(self) -> None:
+        """Проверить cooldown и выждать адаптивную задержку.
 
-        # Telethon client (инициализируется позже)
+        Raises:
+            GlobalCooldownError: Если активен глобальный cooldown от FloodWait.
+        """
+        now = time.monotonic()
+
+        # Глобальный cooldown
+        if now < self.flood_wait_until:
+            wait = self.flood_wait_until - now
+            raise GlobalCooldownError(f"Глобальный cooldown: {wait:.0f} сек")
+
+        # Адаптивная задержка между calls
+        elapsed = now - self.last_call_time
+        if elapsed < self.current_delay:
+            await asyncio.sleep(self.current_delay - elapsed)
+
+        self.last_call_time = time.monotonic()
+        self.total_calls += 1
+
+    def on_success(self) -> None:
+        """Уменьшить задержку при успешном API call."""
+        self.current_delay = max(
+            self.min_delay,
+            self.current_delay * 0.95,
+        )
+        if self.consecutive_errors > 0:
+            self.consecutive_errors = max(0, self.consecutive_errors - 1)
+
+    def on_error(self, error: Exception) -> None:
+        """Увеличить задержку при ошибке."""
+        self.consecutive_errors += 1
+        self.total_errors += 1
+        multiplier = min(2 ** self.consecutive_errors, 8)
+        self.current_delay = min(self.max_delay, self.current_delay * multiplier)
+        logger.debug(
+            "RateLimiter: ошибка #%d, задержка %.2f сек",
+            self.consecutive_errors,
+            self.current_delay,
+        )
+
+    def on_flood_wait(self, seconds: int) -> None:
+        """Установить глобальный cooldown при FloodWait от Telegram."""
+        self.total_flood_waits += 1
+        self.flood_wait_until = time.monotonic() + seconds + 5  # +5 сек buffer
+        self.consecutive_errors += 1
+        new_delay = max(seconds, self.current_delay * 2)
+        self.current_delay = min(self.max_delay, new_delay)
+        logger.warning(
+            "RateLimiter: FloodWait %d сек, cooldown до %s, задержка %.2f сек",
+            seconds,
+            datetime.fromtimestamp(self.flood_wait_until).strftime("%H:%M:%S"),
+            self.current_delay,
+        )
+
+    @property
+    def is_cooldown_active(self) -> bool:
+        return time.monotonic() < self.flood_wait_until
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "current_delay_sec": round(self.current_delay, 2),
+            "consecutive_errors": self.consecutive_errors,
+            "total_calls": self.total_calls,
+            "total_errors": self.total_errors,
+            "total_flood_waits": self.total_flood_waits,
+            "cooldown_active": self.is_cooldown_active,
+            "cooldown_until": datetime.fromtimestamp(
+                self.flood_wait_until, tz=timezone.utc
+            ).isoformat() if self.flood_wait_until > 0 else None,
+        }
+
+
+# ─── CircuitBreaker ─────────────────────────────────────────
+
+@dataclass
+class ChannelCircuit:
+    state: str = "closed"           # "closed" | "open" | "half-open"
+    failure_count: int = 0
+    last_failure_at: float = 0.0
+    opened_at: float = 0.0
+    total_failures: int = 0
+
+
+class CircuitBreaker:
+    """Circuit breaker: per-channel + global защита.
+
+    Per-channel: 3 ошибки → circuit OPEN на 30 мин.
+    Global: FloodWait > 60 сек → остановка всех каналов на 30 мин.
+    """
+
+    # Per-channel thresholds
+    CHANNEL_THRESHOLD = 3           # Ошибок до открытия
+    CHANNEL_OPEN_MINUTES = 30       # Минут circuit open
+    CHANNEL_MAX_FAILURES = 10       # Деактивация канала
+
+    # Global thresholds
+    GLOBAL_FLOOD_THRESHOLD = 60     # FloodWait сек → глобальная пауза
+    GLOBAL_COOLDOWN_MINUTES = 30    # Минут глобальной паузы
+
+    def __init__(self) -> None:
+        self._channels: dict[int, ChannelCircuit] = {}
+        self._global_opened_at: float = 0.0
+        self._global_flood_seconds: int = 0
+
+    def _get(self, channel_id: int) -> ChannelCircuit:
+        if channel_id not in self._channels:
+            self._channels[channel_id] = ChannelCircuit()
+        return self._channels[channel_id]
+
+    def is_channel_open(self, channel_id: int) -> bool:
+        """Проверить, открыт ли circuit для канала (про skip)."""
+        circ = self._get(channel_id)
+        if circ.state == "open":
+            minutes_open = (time.monotonic() - circ.opened_at) / 60
+            if minutes_open >= self.CHANNEL_OPEN_MINUTES:
+                circ.state = "half-open"
+                logger.info("[circuit] Канал %d: half-open (прошло %d мин)",
+                           channel_id, int(minutes_open))
+                return False
+            return True
+        return False
+
+    def is_global_open(self) -> bool:
+        """Проверить, активна ли глобальная пауза."""
+        if self._global_opened_at == 0:
+            return False
+        minutes_open = (time.monotonic() - self._global_opened_at) / 60
+        if minutes_open >= self.GLOBAL_COOLDOWN_MINUTES:
+            self._global_opened_at = 0.0
+            logger.info("[circuit] Глобальная пауза завершена")
+            return False
+        return True
+
+    def on_channel_success(self, channel_id: int) -> None:
+        circ = self._get(channel_id)
+        if circ.state == "half-open":
+            circ.state = "closed"
+            circ.failure_count = 0
+            logger.info("[circuit] Канал %d: circuit closed (восстановлен)", channel_id)
+        elif circ.state == "closed":
+            if circ.failure_count > 0:
+                circ.failure_count = max(0, circ.failure_count - 1)
+
+    def on_channel_failure(self, channel_id: int, error_type: str) -> None:
+        circ = self._get(channel_id)
+        circ.failure_count += 1
+        circ.total_failures += 1
+        circ.last_failure_at = time.monotonic()
+
+        if circ.state == "half-open":
+            circ.state = "open"
+            circ.opened_at = time.monotonic()
+            logger.warning(
+                "[circuit] Канал %d: circuit OPEN (half-open → ошибка %s)",
+                channel_id, error_type,
+            )
+        elif circ.failure_count >= self.CHANNEL_THRESHOLD and circ.state == "closed":
+            circ.state = "open"
+            circ.opened_at = time.monotonic()
+            logger.warning(
+                "[circuit] Канал %d: circuit OPEN (%d ошибок)",
+                channel_id, circ.failure_count,
+            )
+
+    def on_global_flood(self, seconds: int) -> None:
+        """Активировать глобальную паузу."""
+        if seconds >= self.GLOBAL_FLOOD_THRESHOLD:
+            self._global_opened_at = time.monotonic()
+            self._global_flood_seconds = seconds
+            logger.error(
+                "[circuit] ГЛОБАЛЬНАЯ ПАУЗА на %d мин (FloodWait %d сек)",
+                self.GLOBAL_COOLDOWN_MINUTES, seconds,
+            )
+
+    def should_deactivate(self, channel_id: int) -> bool:
+        """Проверить, нужно ли деактивировать канал (>10 ошибок)."""
+        return self._get(channel_id).total_failures >= self.CHANNEL_MAX_FAILURES
+
+    def get_stats(self) -> dict[str, Any]:
+        return {
+            "global_cooldown_active": self.is_global_open(),
+            "global_cooldown_remaining_min": max(0, int(
+                self.GLOBAL_COOLDOWN_MINUTES -
+                (time.monotonic() - self._global_opened_at) / 60
+            )) if self._global_opened_at else 0,
+            "channel_circuits": {
+                str(cid): {
+                    "state": c.state,
+                    "failures": c.failure_count,
+                    "total_failures": c.total_failures,
+                }
+                for cid, c in self._channels.items()
+            },
+        }
+
+
+# ─── ChannelResolver ────────────────────────────────────────
+
+class ChannelResolver:
+    """Резолвинг каналов через get_dialogs() + кэш access_hash в БД.
+
+    Ключевой инсайт: StringSession не кэширует entities. При каждом
+    cold start entity cache пуст. Для 20 private channels get_entity()
+    вызовет FloodWait.
+
+    Решение: get_dialogs() — один bulk call → все каналы с access_hash.
+    Сохраняем в БД. При парсинге: InputPeerChannel(id, access_hash) из БД.
+    """
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        db_session_factory: async_sessionmaker,
+    ) -> None:
+        self.client = client
+        self.db_factory = db_session_factory
+
+    async def sync_dialogs(self) -> list[dict[str, Any]]:
+        """Синхронизировать каналы через get_dialogs().
+
+        Returns:
+            Список словарей {id, title, access_hash} для каждого канала.
+        """
+        logger.info("[resolver] Получаем диалоги через get_dialogs()...")
+        dialogs = await self.client.get_dialogs(limit=None)
+        logger.info("[resolver] Получено %d диалогов", len(dialogs))
+
+        channels: list[dict[str, Any]] = []
+        async with self.db_factory() as session:
+            for dialog in dialogs:
+                entity = dialog.entity
+                if not isinstance(entity, TlChannel):
+                    continue
+                if not entity.broadcast:
+                    continue  # Пропускаем группы, берём только каналы
+
+                channel_id = normalize_channel_id(entity.id)
+                access_hash = entity.access_hash
+
+                channels.append({
+                    "telegram_id": entity.id,
+                    "channel_id": channel_id,
+                    "title": entity.title or "",
+                    "username": entity.username,
+                    "access_hash": access_hash,
+                })
+
+                # Обновляем/создаём запись в БД
+                await self._upsert_channel(session, entity.id, channel_id,
+                                           entity.title, entity.username, access_hash)
+
+            await session.commit()
+
+        logger.info(
+            "[resolver] Синхронизировано %d каналов (broadcast)",
+            len(channels),
+        )
+        return channels
+
+    async def _upsert_channel(
+        self,
+        session: AsyncSession,
+        telegram_id: int,
+        channel_id: int,
+        title: str,
+        username: Optional[str],
+        access_hash: int,
+    ) -> None:
+        """Обновить или создать канал в БД."""
+        # Lazy import models to avoid circular deps
+        try:
+            from models import Channel as DbChannel
+        except ImportError:
+            return  # Will be handled by caller
+
+        result = await session.execute(
+            select(DbChannel).where(DbChannel.telegram_id == telegram_id)
+        )
+        db_ch = result.scalar_one_or_none()
+
+        if db_ch is None:
+            # Пробуем найти по username
+            if username:
+                result = await session.execute(
+                    select(DbChannel).where(DbChannel.username == username)
+                )
+                db_ch = result.scalar_one_or_none()
+
+        if db_ch is None:
+            db_ch = DbChannel(
+                telegram_id=telegram_id,
+                numeric_id=channel_id,
+                channel_type="private" if not username else "public",
+                username=username,
+                title=title,
+                is_active=True,
+                access_hash=access_hash,
+                entity_resolved_at=utc_now(),
+            )
+            session.add(db_ch)
+            logger.info(
+                "[resolver] Новый канал: %s (tid=%d, access_hash=%d)",
+                title, telegram_id, access_hash,
+            )
+        else:
+            db_ch.title = title
+            db_ch.username = username
+            db_ch.access_hash = access_hash
+            db_ch.entity_resolved_at = utc_now()
+            if db_ch.channel_type == "public" and not username:
+                db_ch.channel_type = "private"
+            elif db_ch.channel_type == "private" and username:
+                db_ch.channel_type = "public"
+            logger.debug("[resolver] Обновлён: %s", title)
+
+    async def get_active_channels(self) -> list[Any]:
+        """Получить список активных каналов из БД."""
+        try:
+            from models import Channel as DbChannel
+        except ImportError:
+            return []
+
+        async with self.db_factory() as session:
+            result = await session.execute(
+                select(DbChannel)
+                .where(DbChannel.is_active == True)
+                .order_by(DbChannel.last_parsed_at.asc().nullsfirst())
+            )
+            return list(result.scalars().all())
+
+    async def build_input_peer(self, channel: Any) -> InputPeerChannel:
+        """Построить InputPeerChannel из кэша БД — БЕЗ API call.
+
+        Args:
+            channel: Экземпляр модели Channel из БД.
+
+        Returns:
+            InputPeerChannel готовый для iter_messages().
+
+        Raises:
+            ValueError: Если access_hash отсутствует.
+        """
+        if not channel.access_hash:
+            raise ValueError(
+                f"Канал {channel.id} ({channel.title}) не имеет access_hash. "
+                f"Запустите sync_dialogs() сначала."
+            )
+
+        channel_id = normalize_channel_id(channel.telegram_id)
+        return InputPeerChannel(channel_id, channel.access_hash)
+
+
+# ─── ChannelParser ──────────────────────────────────────────
+
+class ChannelParser:
+    """Парсинг одного канала: iter_messages без лишних API calls."""
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        db_session_factory: async_sessionmaker,
+        rate_limiter: AdaptiveRateLimiter,
+        batch_size: int = 50,
+    ) -> None:
+        self.client = client
+        self.db_factory = db_session_factory
+        self.rate_limiter = rate_limiter
+        self.batch_size = batch_size
+
+    async def parse(
+        self,
+        channel: Any,
+        input_peer: InputPeerChannel,
+    ) -> ParseResult:
+        """Парсит один канал инкрементально.
+
+        Архитектура (исправление C1, C2, C4):
+          1. Короткая сессия БД: получаем last_msg_id + загружаем text_hash'и в память
+          2. Читаем сообщения из Telegram в список (сессия БД ЗАКРЫТА)
+          3. Короткая сессия БД: dedup + insert batch
+
+        Args:
+            channel: Модель Channel из БД.
+            input_peer: InputPeerChannel из кэша (без get_entity!).
+
+        Returns:
+            ParseResult с количеством обработанных и новых постов.
+        """
+        start_ts = time.monotonic()
+        result = ParseResult()
+
+        try:
+            from models import Post as DbPost, ParseLog
+        except ImportError as e:
+            result.error = f"Models import error: {e}"
+            return result
+
+        # ─── Шаг 1: Короткая сессия — last_msg_id + text_hash'и в память ───
+        last_msg_id: Optional[int] = None
+        existing_hashes: set[str] = set()
+        existing_msg_ids: set[int] = set()
+
+        try:
+            async with self.db_factory() as session:
+                last_msg_id = await self._get_last_message_id(session, channel.id)
+
+                # Предзагружаем ВСЕ text_hash'и канала в память (фикс C2: N+1)
+                hash_result = await session.execute(
+                    select(DbPost.text_hash)
+                    .where(
+                        (DbPost.channel_id == channel.id)
+                        & (DbPost.text_hash.isnot(None))
+                    )
+                )
+                existing_hashes = {row[0] for row in hash_result.all() if row[0]}
+
+                # Предзагружаем ВСЕ telegram_message_id канала
+                id_result = await session.execute(
+                    select(DbPost.telegram_message_id)
+                    .where(DbPost.channel_id == channel.id)
+                )
+                existing_msg_ids = {row[0] for row in id_result.all()}
+
+                logger.info(
+                    "[parse] Канал '%s' [%d]: min_id=%s, "
+                    "cached_hashes=%d, cached_msg_ids=%d",
+                    channel.title, channel.id,
+                    last_msg_id if last_msg_id else "(вся история)",
+                    len(existing_hashes), len(existing_msg_ids),
+                )
+        except Exception as e:
+            logger.warning("[parse] Ошибка загрузки кэша: %s", e)
+            existing_hashes = set()
+            existing_msg_ids = set()
+
+        # ─── Шаг 2: Читаем из Telegram (сессия БД ЗАКРЫТА) ───
+        raw_posts: list[dict[str, Any]] = []
+        parsed = 0
+
+        try:
+            kwargs = {"limit": None}
+            if last_msg_id:
+                kwargs["min_id"] = last_msg_id
+
+            await self.rate_limiter.before_call()
+
+            async for msg in self.client.iter_messages(input_peer, **kwargs):
+                parsed += 1
+
+                text = msg.text or ""
+                text_hash = hash_text(text)
+
+                # Дедупликация в памяти (O(1), без БД)
+                if text_hash and text_hash in existing_hashes:
+                    continue
+                if msg.id in existing_msg_ids:
+                    continue
+
+                # Собираем данные (не создаём SQLAlchemy объект — просто dict)
+                raw_posts.append({
+                    "telegram_message_id": msg.id,
+                    "text": text,
+                    "text_hash": text_hash,
+                    "views_count": msg.views or 0,
+                    "forwards_count": msg.forwards or 0,
+                    "replies_count": (
+                        msg.replies.replies
+                        if msg.replies and hasattr(msg.replies, "replies")
+                        else 0
+                    ),
+                    "hashtags": extract_hashtags(text),
+                    "mentions": extract_mentions(text),
+                    "urls": extract_urls(text),
+                    "forward_from": (
+                        msg.forward.chat.username or msg.forward.chat.title
+                        if msg.forward and msg.forward.chat else None
+                    ),
+                    "sender_name": msg.post_author,
+                    "has_media": msg.media is not None,
+                    "media_type": get_media_type(msg),
+                    "published_at": msg.date,
+                    "edited_at": msg.edit_date,
+                })
+
+                # Rate limit каждые 100 сообщений (фикс C4)
+                if parsed % 100 == 0:
+                    await self.rate_limiter.before_call()
+                    self.rate_limiter.on_success()
+
+                # Safety limit: не более 5000 сообщений за раз
+                if len(raw_posts) >= 5000:
+                    logger.warning(
+                        "[parse] Канал '%s': достигнут лимит 5000 сообщений",
+                        channel.title,
+                    )
+                    break
+
+        except FloodWaitError as e:
+            result.error = f"FloodWait: {e.seconds} сек"
+            result.flood_wait_sec = e.seconds
+            self.rate_limiter.on_flood_wait(e.seconds)
+            logger.warning(
+                "[parse] Канал '%s' [%d]: FloodWait %d сек",
+                channel.title, channel.id, e.seconds,
+            )
+            return result
+
+        except (ChannelInvalidError, ChannelPrivateError) as e:
+            result.error = f"Channel inaccessible: {type(e).__name__}"
+            logger.error(
+                "[parse] Канал '%s' [%d]: Недоступен — %s",
+                channel.title, channel.id, e,
+            )
+            return result
+
+        except Exception as e:
+            result.error = f"{type(e).__name__}: {e}"
+            logger.exception(
+                "[parse] Канал '%s' [%d]: Ошибка чтения из Telegram",
+                channel.title, channel.id,
+            )
+            return result
+
+        # ─── Шаг 3: Короткая сессия БД — insert batch ───
+        try:
+            new_posts = 0
+            async with self.db_factory() as session:
+                for i in range(0, len(raw_posts), self.batch_size):
+                    batch = raw_posts[i:i + self.batch_size]
+                    db_posts = [
+                        DbPost(channel_id=channel.id, **item)
+                        for item in batch
+                    ]
+                    session.add_all(db_posts)
+                    await session.commit()
+                    new_posts += len(batch)
+                    logger.debug(
+                        "[parse] Канал '%s': коммит %d/%d",
+                        channel.title, new_posts, len(raw_posts),
+                    )
+
+                # Обновляем канал
+                channel.total_posts_parsed = (channel.total_posts_parsed or 0) + new_posts
+                channel.last_parsed_at = utc_now()
+                channel.parse_error_count = 0
+                channel.last_error_message = None
+                channel.last_error_at = None
+                await session.commit()
+
+                # Логируем прогон
+                duration_ms = int((time.monotonic() - start_ts) * 1000)
+                session.add(ParseLog(
+                    channel_id=channel.id,
+                    posts_parsed=parsed,
+                    posts_new=new_posts,
+                    duration_ms=duration_ms,
+                    started_at=datetime.fromtimestamp(start_ts, tz=timezone.utc),
+                    finished_at=utc_now(),
+                ))
+                await session.commit()
+
+                result.parsed = parsed
+                result.new = new_posts
+                result.duration_ms = duration_ms
+
+                logger.info(
+                    "[parse] Канал '%s' [%d]: обработано=%d, новых=%d, за %d мс",
+                    channel.title, channel.id, parsed, new_posts, duration_ms,
+                )
+
+        except Exception as e:
+            result.error = f"Insert error: {type(e).__name__}: {e}"
+            logger.exception(
+                "[parse] Канал '%s' [%d]: Ошибка записи в БД",
+                channel.title, channel.id,
+            )
+
+        return result
+
+    async def _get_last_message_id(self, session: AsyncSession, channel_id: int) -> Optional[int]:
+        try:
+            from models import Post as DbPost
+        except ImportError:
+            return None
+        result = await session.execute(
+            select(DbPost.telegram_message_id)
+            .where(DbPost.channel_id == channel_id)
+            .order_by(DbPost.telegram_message_id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+# ─── MultiChannelParser ─────────────────────────────────────
+
+class MultiChannelParser:
+    """Оркестратор: последовательный парсинг 20+ каналов с защитой."""
+
+    def __init__(
+        self,
+        api_id: Optional[int] = None,
+        api_hash: Optional[str] = None,
+        session_str: Optional[str] = None,
+        db_url: Optional[str] = None,
+    ) -> None:
+        cfg = _get_config()
+        self.api_id = api_id or cfg.TG_API_ID
+        self.api_hash = api_hash or cfg.TG_API_HASH
+        self.session_str = session_str or cfg.TG_STRING_SESSION
+        self.db_url = db_url or getattr(cfg, "database_url_async", cfg.DATABASE_URL)
+
+        self.channel_delay_sec = getattr(cfg, "CHANNEL_DELAY_SEC", 10)
+        self.api_call_delay_ms = getattr(cfg, "API_CALL_DELAY_MS", 1000)
+        self.flood_cooldown_min = getattr(cfg, "FLOOD_COOLDOWN_MIN", 30)
+        self.batch_size = getattr(cfg, "BATCH_COMMIT_SIZE", 50)
+        self.jitter_sec = getattr(cfg, "JITTER_SEC", 10.0)
+        self.schedule_interval_sec = getattr(cfg, "INTERVAL_SEC", 1200)
+
+        # Components (initialized in init_db)
+        self._engine: Any = None
+        self._db_factory: Any = None
         self._client: Optional[TelegramClient] = None
+        self._rate_limiter: Optional[AdaptiveRateLimiter] = None
+        self._circuit: Optional[CircuitBreaker] = None
+        self._resolver: Optional[ChannelResolver] = None
+        self._parser: Optional[ChannelParser] = None
 
-        # DB engine & session factory (инициализируются позже)
-        self._engine = None
-        self._session_factory = None
-
-    # ------------------------------------------------------------------
-    # Database
-    # ------------------------------------------------------------------
+    # ─── Lifecycle ──────────────────────────────────────────
 
     async def init_db(self) -> None:
-        """Создаёт engine, session factory и таблицы (если не существуют).
-
-        Idempotent: safe to call multiple times. Disposes old engine
-        to prevent connection leaks.
-        """
+        """Инициализировать engine, таблицы, компоненты."""
         if self._engine is not None:
             await self._engine.dispose()
 
         self._engine = create_async_engine(
             self.db_url,
             echo=False,
-            pool_size=10,
-            max_overflow=20,
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,
         )
-        self._session_factory = async_sessionmaker(
+        self._db_factory = async_sessionmaker(
             self._engine,
             class_=AsyncSession,
             expire_on_commit=False,
         )
 
-        # create_all вне транзакции — избегаем deadlock при параллельных инстансах
-        async with self._engine.connect() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.commit()
+        # Create tables
+        try:
+            from models import Base
+            async with self._engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+        except ImportError:
+            logger.warning("Models not available — skipping table creation")
 
-        # One-time migration: make parse_logs.channel_id nullable
-        # Check first to avoid AccessExclusiveLock contention
-        async with self._engine.begin() as conn:
-            result = await conn.execute(text("""
-                SELECT is_nullable FROM information_schema.columns
-                WHERE table_name = 'parse_logs' AND column_name = 'channel_id'
-            """))
-            row = result.fetchone()
-            if row and row[0] == 'NO':
-                await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
-                try:
-                    await conn.execute(text(
-                        "ALTER TABLE parse_logs ALTER COLUMN channel_id DROP NOT NULL"
-                    ))
-                    logger.info("[migrate] parse_logs.channel_id → nullable")
-                except Exception:
-                    pass  # Already done by another instance
+        # Init components
+        initial_delay = self.api_call_delay_ms / 1000.0
+        self._rate_limiter = AdaptiveRateLimiter(
+            min_delay=0.5,
+            max_delay=30.0,
+            initial_delay=initial_delay,
+        )
+        self._circuit = CircuitBreaker()
 
-            # Migration: add sender_name to posts if missing
-            try:
-                result = await conn.execute(text("""
-                    SELECT column_name FROM information_schema.columns
-                    WHERE table_name = 'posts' AND column_name = 'sender_name'
-                """))
-                if not result.fetchone():
-                    await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
-                    await conn.execute(text(
-                        "ALTER TABLE posts ADD COLUMN sender_name VARCHAR(255)"
-                    ))
-                    logger.info("[migrate] posts.sender_name column added")
-            except Exception:
-                pass
+        logger.info("[init] База данных инициализирована (URL: %s...)", self.db_url[:30])
 
-        logger.info("База данных инициализирована")
-        # Create default admin user if not exists
-        await self._ensure_admin_user()
-
-    async def _ensure_admin_user(self) -> None:
-        """Create default admin 'vlad' if no users exist."""
-        async with self._db_session() as session:
-            result = await session.execute(select(User))
-            if result.scalars().first() is None:
-                # No users yet — create default admin
-                admin = User(
-                    username="vlad",
-                    is_active=True,
-                )
-                admin.set_password("!1234567890")
-                session.add(admin)
-                await session.commit()
-                logger.info("Default admin user 'vlad' created")
-            else:
-                logger.debug("Users already exist, skipping default admin creation")
-
-    @asynccontextmanager
-    async def _db_session(self):
-        """Async context manager для сессии БД."""
-        if self._session_factory is None:
-            raise RuntimeError("init_db() не был вызван")
-        async with self._session_factory() as session:
-            try:
-                yield session
-            except Exception:
-                await session.rollback()
-                raise
-
-    # ------------------------------------------------------------------
-    # Telegram client
-    # ------------------------------------------------------------------
-
-    async def _ensure_client(self) -> TelegramClient:
-        """Возвращает подключённого TelegramClient."""
+    async def ensure_client(self) -> TelegramClient:
+        """Подключить TelegramClient."""
         if self._client is not None and self._client.is_connected():
             return self._client
 
         if self._client is not None:
             await self._client.disconnect()
 
-        session = (
-            StringSession(self.session_str)
-            if self.session_str
-            else settings.TG_SESSION
-        )
+        session = StringSession(self.session_str) if self.session_str else None
         self._client = TelegramClient(session, self.api_id, self.api_hash)
         await self._client.start()
+
         me = await self._client.get_me()
         logger.info(
-            "TelegramClient подключён как %s (@%s)",
-            me.first_name,
-            me.username,
+            "[client] Подключён как %s (@%s, id=%d)",
+            me.first_name, me.username, me.id,
         )
         return self._client
 
-    async def _disconnect_client(self) -> None:
-        """Отключает TelegramClient."""
-        if self._client is not None and self._client.is_connected():
+    async def disconnect_client(self) -> None:
+        """Отключить TelegramClient."""
+        if self._client and self._client.is_connected():
             await self._client.disconnect()
-            logger.info("TelegramClient отключён")
+            logger.info("[client] Отключён")
 
-    # ------------------------------------------------------------------
-    # Channel sync
-    # ------------------------------------------------------------------
+    # ─── Core: parse all channels ───────────────────────────
 
-    async def sync_channel(self, db_session: AsyncSession, identifier: str) -> Channel:
-        """Получает (или создаёт) запись Channel в БД, синхронизируя метаданные.
+    async def run_once(self) -> dict[int, ParseResult]:
+        """Один прогон парсера по всем активным каналам.
 
-        Args:
-            db_session: Активная сессия SQLAlchemy.
-            identifier: Username или numeric ID канала (без @).
-
-        Returns:
-            Экземпляр Channel (существующий или новый).
-        """
-        client = await self._ensure_client()
-
-        # Конвертируем numeric ID в полный telegram ID
-        entity_id = identifier
-        if identifier.isdigit():
-            # Numeric ID → -100{ID} (приватный канал)
-            entity_id = int(f"-100{identifier}")
-            logger.debug("[sync_channel] numeric ID '%s' → telegram ID %s", identifier, entity_id)
-        elif identifier.startswith('-') and identifier[1:].isdigit():
-            # Bare negative ID (группа/чат)
-            entity_id = int(identifier)
-            logger.debug("[sync_channel] bare negative ID → %s", entity_id)
-
-        try:
-            # Use PeerChannel for negative IDs to ensure correct entity type
-            if isinstance(entity_id, int) and entity_id < 0:
-                from telethon.tl.types import PeerChannel
-                entity = await client.get_entity(PeerChannel(abs(entity_id)))
-                logger.debug("[sync_channel] Used PeerChannel(%s) for %s", abs(entity_id), identifier)
-            else:
-                entity = await client.get_entity(entity_id)
-        except FloodWaitError as e:
-            logger.warning("[sync_channel] FloodWait %d сек для %s — пропускаем", e.seconds, identifier)
-            raise ValueError(f"FloodWait: {e.seconds} сек — канал временно недоступен")
-
-        # Определяем тип канала и numeric_id
-        has_username = bool(getattr(entity, "username", None))
-        channel_type = "public" if has_username else "private"
-
-        # Вычисляем numeric_id (без -100 префикса) для приватных каналов
-        telegram_id = entity.id
-        numeric_id = None
-        if telegram_id < 0:
-            numeric_id = abs(telegram_id) % 1_000_000_000_000
-        else:
-            numeric_id = telegram_id
-
-        # Ищем канал по telegram_id или username
-        if has_username:
-            result = await db_session.execute(
-                select(Channel).where(Channel.username == entity.username)
-            )
-        else:
-            result = await db_session.execute(
-                select(Channel).where(Channel.telegram_id == telegram_id)
-            )
-        channel: Optional[Channel] = result.scalar_one_or_none()
-
-        if channel is None:
-            channel = Channel(
-                telegram_id=telegram_id,
-                numeric_id=numeric_id,
-                channel_type=channel_type,
-                username=entity.username if has_username else None,
-                title=entity.title,
-                description=getattr(entity, "about", None),
-                subscriber_count=getattr(entity, "participants_count", 0),
-                is_active=True,
-                parse_error_count=0,
-                last_error_message=None,
-                last_error_at=None,
-                total_posts_parsed=0,
-                last_parsed_at=None,
-            )
-            db_session.add(channel)
-            await db_session.flush()
-            logger.info(
-                "Канал создан: %s (type=%s, tid=%s, numeric=%s)",
-                entity.username or str(numeric_id),
-                channel_type,
-                telegram_id,
-                numeric_id,
-            )
-        else:
-            channel.title = entity.title
-            channel.subscriber_count = getattr(entity, "participants_count", 0)
-            channel.numeric_id = numeric_id
-            channel.channel_type = channel_type
-            # При успешном sync — сбрасываем error_count (канал жив)
-            if channel.parse_error_count > 0:
-                channel.parse_error_count = 0
-                channel.last_error_message = None
-            logger.debug("Канал обновлён: %s", entity.username or str(numeric_id))
-
-        return channel
-
-    # ------------------------------------------------------------------
-    # Retry helper
-    # ------------------------------------------------------------------
-
-    async def _with_retry(
-        self,
-        coro_factory,
-        channel_name: str,
-        operation: str,
-    ):
-        """Выполняет корутину с retry и exponential backoff.
-
-        Args:
-            coro_factory: Callable, возвращающий awaitable (фабрика, не сам объект!).
-            channel_name: Имя канала для логирования.
-            operation: Описание операции для логирования.
+        Алгоритм:
+          1. Подключиться к Telegram
+          2. get_dialogs() → синхронизировать access_hash
+          3. Получить активные каналы из БД
+          4. Последовательно парсить каждый (с jitter + rate limit)
+          5. Отключиться
 
         Returns:
-            Результат выполнения корутины.
-
-        Raises:
-            Последнее исключение, если все попытки исчерпаны.
+            Словарь {channel_id: ParseResult}.
         """
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, settings.RETRY_ATTEMPTS + 1):
-            try:
-                return await coro_factory()
-            except FloodWaitError as e:
-                wait = e.seconds
-                logger.warning(
-                    "[%s] FloodWaitError (%s) — ждём %d сек (попытка %d/%d)",
-                    channel_name,
-                    operation,
-                    wait,
-                    attempt,
-                    settings.RETRY_ATTEMPTS,
-                )
-                await asyncio.sleep(wait)
-                last_exc = e
-            except (SessionRevokedError, SessionPasswordNeededError) as e:
-                logger.error(
-                    "[%s] Ошибка сессии (%s): %s",
-                    channel_name,
-                    type(e).__name__,
-                    e,
-                )
-                raise
-            except ValueError as e:
-                # Приватные / удалённые / несуществующие каналы
-                logger.error(
-                    "[%s] Недоступный канал (%s): %s",
-                    channel_name,
-                    operation,
-                    e,
-                )
-                raise
-            except Exception as e:
-                last_exc = e
-                delay = settings.RETRY_DELAY_BASE * (2 ** (attempt - 1))
-                logger.warning(
-                    "[%s] Ошибка %s (попытка %d/%d): %s — retry через %ds",
-                    channel_name,
-                    operation,
-                    attempt,
-                    settings.RETRY_ATTEMPTS,
-                    e,
-                    delay,
-                )
-                if attempt < settings.RETRY_ATTEMPTS:
-                    await asyncio.sleep(delay)
-
-        raise last_exc  # type: ignore[misc]
-
-    # ------------------------------------------------------------------
-    # Error tracking
-    # ------------------------------------------------------------------
-
-    async def _record_channel_error(
-        self,
-        db_session: AsyncSession,
-        channel: Channel,
-        error_type: str,
-        error_message: str,
-    ) -> None:
-        """Записывает ошибку в channel_errors и обновляет счётчик в канале."""
-        error = ChannelError(
-            channel_id=channel.id,
-            error_type=error_type,
-            error_message=error_message,
-        )
-        db_session.add(error)
-
-        channel.parse_error_count += 1
-        channel.last_error_message = error_message
-        channel.last_error_at = _now()
-        await db_session.commit()
-
-    # ------------------------------------------------------------------
-    # Global text dedup cache
-    # ------------------------------------------------------------------
-
-    async def _is_text_hash_exists(
-        self,
-        db_session: AsyncSession,
-        text_hash: str,
-    ) -> bool:
-        """Проверяет глобально, существует ли пост с таким text_hash.
-
-        Returns:
-            True если такой хэш уже есть от ЛЮБОГО канала.
-        """
-        if not text_hash:
-            return False
-        result = await db_session.execute(
-            select(Post.id).where(Post.text_hash == text_hash).limit(1)
-        )
-        return result.scalar_one_or_none() is not None
-
-    # ------------------------------------------------------------------
-    # Per-channel parsing
-    # ------------------------------------------------------------------
-
-    async def parse_single_channel(
-        self,
-        db_session: AsyncSession,
-        channel: Channel,
-        limit: Optional[int] = None,
-        history: bool = False,
-        entity_cache: dict = None,
-    ) -> ParseResult:
-        """Парсит один канал с retry logic и rate limiting.
-
-        Args:
-            db_session: Активная сессия SQLAlchemy.
-            channel: Модель Channel (должна быть синхронизирована).
-            limit: Лимит постов (None — без ограничений).
-            history: Если True — парсить всю историю, иначе инкрементально.
-
-        Returns:
-            ParseResult с результатами парсинга.
-        """
-        result = ParseResult()
-        parsed_count = 0
-        new_count = 0
-        username = channel.username or str(channel.telegram_id)
-
-        try:
-            # --- Определяем min_id для инкрементального парсинга ---
-            min_id = 0
-            if not history:
-                res = await db_session.execute(
-                    select(Post.telegram_message_id)
-                    .where(Post.channel_id == channel.id)
-                    .order_by(Post.telegram_message_id.desc())
-                    .limit(1)
-                )
-                last_msg_id = res.scalar_one_or_none()
-                if last_msg_id:
-                    min_id = last_msg_id
-                    logger.info(
-                        "[%s] Инкрементальный парсинг: min_id=%d",
-                        username,
-                        min_id,
-                    )
-
-            # --- Используем telegram_id напрямую (entity уже получен в sync_channel) ---
-            client = await self._ensure_client()
-
-            # --- Rate limit перед началом iter_messages ---
-            await asyncio.sleep(0.5)
-
-            msg_counter = 0
-            total_messages = 0
-            api_calls = 0  # Track API calls for this channel
-            
-            # --- Get entity: public=username, private=from entity_cache ---
-            if channel.username:
-                entity_id = channel.username
-                logger.info("[%s] Public → @%s", username, channel.username)
-            else:
-                # Private channel — entity_cache from get_dialogs in parse_all()
-                if channel.telegram_id > 0:
-                    bare_id = channel.telegram_id
-                else:
-                    bare_id = abs(channel.telegram_id) % 1_000_000_000_000
-                
-                if bare_id in (entity_cache or {}):
-                    entity_id = entity_cache[bare_id]
-                    logger.info("[%s] Private → entity from cache (id=%s)", username, bare_id)
-                else:
-                    logger.error("[%s] Private channel %s NOT in member list — skipping", username, bare_id)
-                    result.error_message = f"Not a member (id={bare_id})"
-                    return result
-            logger.info("[%s] Starting iter_messages with min_id=%s, limit=%s", username, min_id, limit)
-            
-            async for message in client.iter_messages(
-                entity_id,
-                limit=limit,
-                min_id=min_id if not history else 0,
-            ):
-                total_messages += 1
-                # Rate limit: sleep каждые 50 сообщений
-
-                # Пропускаем посты без текста и без медиа
-                if not message.text and not message.media:
-                    continue
-
-                # Rate limit: sleep каждые 50 сообщений (не на каждое!)
-                msg_counter += 1
-                if msg_counter % 50 == 0:
-                    await asyncio.sleep(0.5)
-
-                parsed_count += 1
-
-                text = message.text or ""
-                text_hash = _make_text_hash(text)
-
-                # --- Глобальная дедупликация по text_hash ---
-                if text_hash:
-                    exists = await self._is_text_hash_exists(
-                        db_session, text_hash
-                    )
-                    if exists:
-                        logger.debug(
-                            "[%s] Дубликат по text_hash, пропуск: msg_id=%d",
-                            username,
-                            message.id,
-                        )
-                        continue
-
-                # --- Проверка уникальности (channel_id, telegram_message_id) ---
-                dup_check = await db_session.execute(
-                    select(Post.id).where(
-                        (Post.channel_id == channel.id)
-                        & (Post.telegram_message_id == message.id)
-                    )
-                )
-                if dup_check.scalar_one_or_none() is not None:
-                    continue
-
-                # --- Sender info (safe: no API calls) ---
-                sender_name: Optional[str] = None
-                try:
-                    # message.sender may trigger API call — wrap in try
-                    if message.sender:
-                        sender = message.sender
-                        if hasattr(sender, 'first_name'):
-                            sender_name = (sender.first_name or '') + (' ' + sender.last_name if sender.last_name else '')
-                            if not sender_name.strip() and hasattr(sender, 'username') and sender.username:
-                                sender_name = '@' + sender.username
-                        elif hasattr(sender, 'title'):
-                            sender_name = sender.title
-                except Exception:
-                    sender_name = None  # Skip if API call needed
-
-                # --- Forward info (safe: no API calls) ---
-                forward_from: Optional[str] = None
-                try:
-                    if message.forward and message.forward.chat:
-                        forward_from = (
-                            message.forward.chat.username
-                            or message.forward.chat.title
-                        )
-                except Exception:
-                    forward_from = None  # Skip if API call needed
-
-                # --- Создаём пост ---
-                post = Post(
-                    channel_id=channel.id,
-                    telegram_message_id=message.id,
-                    text=text,
-                    text_hash=text_hash,
-                    views_count=message.views or 0,
-                    forwards_count=message.forwards or 0,
-                    replies_count=(
-                        message.replies.replies
-                        if message.replies and hasattr(message.replies, 'replies')
-                        else 0
-                    ),
-                    hashtags=_extract_hashtags(text),
-                    mentions=_extract_mentions(text),
-                    urls=_extract_urls(text),
-                    forward_from=forward_from,
-                    sender_name=sender_name,
-                    has_media=message.media is not None,
-                    media_type=_get_media_type(message),
-                    published_at=message.date,
-                    edited_at=message.edit_date,
-                )
-                db_session.add(post)
-                new_count += 1
-
-                # --- Коммит каждые 100 постов ---
-                if new_count % 100 == 0:
-                    await db_session.commit()
-                    logger.info(
-                        "[%s] Сохранено %d новых постов...",
-                        username,
-                        new_count,
-                    )
-
-            logger.info("[%s] iter_messages done: total=%d, parsed=%d, new=%d, api_calls=%d", username, total_messages, parsed_count, new_count, api_calls)
-
-            # --- Финальный коммит ---
-            await db_session.commit()
-
-            # --- Обновляем канал ---
-            channel.total_posts_parsed += new_count
-            channel.last_parsed_at = _now()
-            channel.parse_error_count = 0
-            channel.last_error_message = None
-            await db_session.commit()
-
-            result.posts_parsed = parsed_count
-            result.posts_new = new_count
-            logger.info(
-                "[%s] Готово! Обработано: %d, Новых: %d",
-                username,
-                parsed_count,
-                new_count,
-            )
-
-        except ValueError as e:
-            # Приватный / удалённый / несуществующий канал
-            error_msg = f"Недоступный канал: {e}"
-            result.error_message = error_msg
-            logger.error("[%s] %s", username, error_msg)
-            await self._record_channel_error(
-                db_session, channel, "unavailable", error_msg
-            )
-
-        except FloodWaitError as e:
-            error_msg = f"FloodWait: {e.seconds} сек"
-            result.error_message = error_msg
-            logger.error("[%s] %s", username, error_msg)
-            await self._record_channel_error(
-                db_session, channel, "flood_wait", error_msg
-            )
-
-        except Exception as e:
-            error_msg = f"{type(e).__name__}: {e}"
-            result.error_message = error_msg
-            logger.exception("[%s] Критическая ошибка: %s", username, error_msg)
-            await self._record_channel_error(
-                db_session, channel, type(e).__name__.lower(), error_msg
-            )
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Channel lookup (NO get_entity — safe from FloodWait)
-    # ------------------------------------------------------------------
-
-    async def _lookup_channel(self, db_session: AsyncSession, identifier: str) -> Optional[Channel]:
-        """Ищет канал в БД по identifier БЕЗ вызова get_entity().
-
-        Returns:
-            Channel если найден, иначе None.
-        """
-        logger.debug("[_lookup_channel] Searching for: '%s'", identifier)
-
-        # По username
-        result = await db_session.execute(
-            select(Channel).where(Channel.username == identifier)
-        )
-        ch = result.scalar_one_or_none()
-        if ch:
-            logger.info("[_lookup_channel] '%s' found by username", identifier)
-            return ch
-
-        # По numeric_id (bare positive number like "3147415698")
-        if identifier.isdigit():
-            num_id = int(identifier)
-            result = await db_session.execute(
-                select(Channel).where(Channel.numeric_id == num_id)
-            )
-            ch = result.scalar_one_or_none()
-            if ch:
-                logger.info("[_lookup_channel] '%s' found by numeric_id=%s", identifier, num_id)
-                return ch
-            # По telegram_id (-1003147415698)
-            tid = int(f"-100{identifier}")
-            result = await db_session.execute(
-                select(Channel).where(Channel.telegram_id == tid)
-            )
-            ch = result.scalar_one_or_none()
-            if ch:
-                logger.info("[_lookup_channel] '%s' found by telegram_id=%s", identifier, tid)
-                return ch
-            logger.warning("[_lookup_channel] '%s' NOT found (numeric_id=%s, tid=%s)", identifier, num_id, tid)
-
-        # По bare negative ID (like "-740684703")
-        if identifier.startswith('-') and identifier[1:].isdigit():
-            int_id = int(identifier)
-            result = await db_session.execute(
-                select(Channel).where(Channel.telegram_id == int_id)
-            )
-            ch = result.scalar_one_or_none()
-            if ch:
-                logger.info("[_lookup_channel] '%s' found by bare negative tid=%s", identifier, int_id)
-                return ch
-            logger.warning("[_lookup_channel] '%s' NOT found (bare tid=%s)", identifier, int_id)
-
-        # CRITICAL: Log ALL channels to debug why lookup fails
-        result = await db_session.execute(
-            select(Channel.id, Channel.telegram_id, Channel.numeric_id, Channel.username, Channel.title, Channel.is_active)
-        )
-        all_rows = result.all()
-        logger.error("[_lookup_channel] '%s' NOT FOUND. ALL %d channels in DB:", identifier, len(all_rows))
-        for row in all_rows:
-            logger.error("  id=%s tid=%s numeric=%s user=%s title=%s active=%s",
-                row.id, row.telegram_id, row.numeric_id, row.username, row.title, row.is_active)
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Core: parse all channels
-    # ------------------------------------------------------------------
-
-    async def _parse_one_channel(
-        self,
-        username: str,
-        limit: Optional[int] = None,
-        history: bool = False,
-        entity_cache: dict = None,
-    ) -> tuple[str, ParseResult]:
-        """Парсит один канал. При ошибке — rollback сессии, лог, идем дальше."""
         start_ts = time.monotonic()
-        entity_cache = entity_cache or {}
 
-        # Report: starting this channel
-        if self._progress_callback:
-            self._progress_callback(
-                current_channel=username,
-                current_operation=f"Parsing {username}...",
-            )
+        if not self._engine:
+            await self.init_db()
 
-        # Fresh DB session per channel — isolated, safe to rollback
-        async with self._db_session() as db_session:
-            channel: Optional[Channel] = None
-            try:
-                # 1. Ищем канал в БД
-                channel = await self._lookup_channel(db_session, username)
-                if not channel:
-                    return username, ParseResult(error_message="Канал не найден в БД")
-                if not channel.is_active:
-                    return username, ParseResult(error_message="Канал деактивирован")
+        client = await self.ensure_client()
 
-                # 2. Парсим (pass entity_cache for private channels)
-                result = await self.parse_single_channel(
-                    db_session, channel, limit=limit, history=history,
-                    entity_cache=entity_cache,
+        # Компоненты
+        self._resolver = ChannelResolver(client, self._db_factory)
+        self._parser = ChannelParser(
+            client, self._db_factory,
+            self._rate_limiter, self.batch_size,
+        )
+
+        results: dict[int, ParseResult] = {}
+
+        try:
+            # Шаг 1: Синхронизируем access_hash
+            logger.info("=" * 60)
+            logger.info("CITG Parser v3 — старт прогона")
+            logger.info("=" * 60)
+
+            await self._resolver.sync_dialogs()
+
+            # Шаг 2: Получаем активные каналы
+            channels = await self._resolver.get_active_channels()
+            if not channels:
+                logger.warning("Нет активных каналов для парсинга")
+                return results
+
+            logger.info("Каналов к парсингу: %d", len(channels))
+
+            # Шаг 3: Парсим последовательно
+            for i, channel in enumerate(channels):
+                # Jitter перед каналом
+                jitter = random.uniform(0, self.jitter_sec)
+                logger.debug("Jitter: %.1f сек перед каналом '%s'", jitter, channel.title)
+                await asyncio.sleep(jitter)
+
+                # Проверяем circuit breaker
+                if self._circuit.is_channel_open(channel.id):
+                    logger.info(
+                        "[%d/%d] '%s' [%d]: circuit OPEN — пропускаем",
+                        i + 1, len(channels), channel.title, channel.id,
+                    )
+                    results[channel.id] = ParseResult(
+                        error="Circuit breaker: channel open",
+                    )
+                    continue
+
+                # Проверяем глобальный cooldown
+                if self._circuit.is_global_open():
+                    logger.warning(
+                        "[%d/%d] Глобальная пауза активна — останавливаемся",
+                        i + 1, len(channels),
+                    )
+                    break
+
+                # Парсим канал
+                logger.info(
+                    "[%d/%d] Парсим '%s' [%d]...",
+                    i + 1, len(channels), channel.title, channel.id,
                 )
 
-                # 3. Лог
-                db_session.add(ParseLog(
-                    started_at=_now(), channel_id=channel.id,
-                    posts_parsed=result.posts_parsed, posts_new=result.posts_new,
-                    error_message=result.error_message, finished_at=_now(),
-                    duration_ms=int((time.monotonic() - start_ts) * 1000),
-                ))
-                await db_session.commit()
+                try:
+                    input_peer = await self._resolver.build_input_peer(channel)
+                    result = await self._parser.parse(channel, input_peer)
+                    results[channel.id] = result
 
-                if self._progress_callback:
-                    self._progress_callback(
-                        increment_channels_done=1,
-                        increment_posts_new=result.posts_new,
-                        increment_posts_parsed=result.posts_parsed,
-                        current_operation=f"Done {username}: +{result.posts_new} posts",
+                    if result.error:
+                        self._circuit.on_channel_failure(
+                            channel.id, result.error[:50],
+                        )
+                        if result.flood_wait_sec > self._circuit.GLOBAL_FLOOD_THRESHOLD:
+                            self._circuit.on_global_flood(result.flood_wait_sec)
+                    else:
+                        self._circuit.on_channel_success(channel.id)
+                        self._rate_limiter.on_success()
+
+                except GlobalCooldownError as e:
+                    # Глобальный cooldown — останавливаем весь прогон
+                    logger.warning(
+                        "[%d/%d] GlobalCooldownError — останавливаем прогон: %s",
+                        i + 1, len(channels), e,
                     )
-                return username, result
+                    break
 
-            except Exception as e:
-                try:
-                    await db_session.rollback()
-                except Exception:
-                    pass
+                except FloodWaitError as e:
+                    # FloodWait на уровне оркестратора
+                    logger.warning(
+                        "[%d/%d] FloodWait %d сек — активируем глобальную паузу",
+                        i + 1, len(channels), e.seconds,
+                    )
+                    self._rate_limiter.on_flood_wait(e.seconds)
+                    self._circuit.on_global_flood(e.seconds)
+                    results[channel.id] = ParseResult(
+                        error=f"FloodWait: {e.seconds}с", flood_wait_sec=e.seconds,
+                    )
+                    break
 
-                result = ParseResult(error_message=f"{type(e).__name__}: {e}")
-                logger.exception("[%s] Ошибка: %s", username, e)
+                except Exception as e:
+                    logger.exception("Ошибка парсинга канала %d: %s", channel.id, e)
+                    results[channel.id] = ParseResult(error=str(e))
+                    self._circuit.on_channel_failure(channel.id, type(e).__name__)
 
-                # Log error
-                try:
-                    db_session.add(ParseLog(
-                        started_at=_now(), channel_id=channel.id if channel else None,
-                        posts_parsed=0, posts_new=0,
-                        error_message=result.error_message, finished_at=_now(),
-                        duration_ms=int((time.monotonic() - start_ts) * 1000),
-                    ))
-                    await db_session.commit()
-                except Exception:
-                    pass
+                # Пауза между каналами (adaptive)
+                if i < len(channels) - 1:
+                    pause = max(
+                        self.channel_delay_sec,
+                        self._rate_limiter.current_delay,
+                    )
+                    logger.debug("Пауза %.1f сек между каналами", pause)
+                    await asyncio.sleep(pause)
 
-                return username, result
-
-    async def _get_active_channels_from_db(self) -> list[str]:
-        """Получает список активных каналов из БД.
-
-        Returns:
-            Список идентификаторов (username или numeric_id как строка).
-        """
-        async with self._db_session() as db_session:
-            result = await db_session.execute(
-                select(Channel).where(Channel.is_active == True)
-            )
-            channels = result.scalars().all()
-            identifiers = []
-            for ch in channels:
-                # Используем username если есть, иначе numeric_id или telegram_id
-                if ch.username:
-                    identifiers.append(ch.username)
-                elif ch.numeric_id:
-                    identifiers.append(str(ch.numeric_id))
-                else:
-                    identifiers.append(str(ch.telegram_id))
-            return identifiers
-
-    async def parse_all(
-        self,
-        channels: Optional[list[str]] = None,
-        limit: Optional[int] = None,
-        history: bool = False,
-    ) -> dict[str, ParseResult]:
-        """Парсит все каналы параллельно.
-
-        Args:
-            channels: Список username каналов. Если None — берётся из БД (active).
-            limit: Лимит постов на канал.
-            history: Если True — парсить всю историю.
-
-        Returns:
-            Словарь {username: ParseResult}.
-        """
-        # Если channels переданы явно — используем их (для ручного запуска)
-        # Иначе берём активные каналы из БД
-        if channels:
-            channel_list = channels
-        else:
-            channel_list = await self._get_active_channels_from_db()
-
-        if not channel_list:
-            logger.warning("Список каналов пуст — нечего парсить")
-            return {}
-
-        # --- Preload entities from Telethon session file + dialogs ---
-        # Private channels need access_hash. We get it from:
-        # 1. Telethon session file (SQLite) — entities cached from get_entity()
-        # 2. get_dialogs() — channels in recent dialogs
-        entity_cache = {}
-        try:
-            client = await self._ensure_client()
-            
-            # Method 1: Read from session file (get_entity cached entities)
-            session_entities = {}
-            try:
-                # Telethon stores entities in SQLite session file
-                for row in client.session._db.execute(
-                    "SELECT id, hash FROM entities WHERE substring(id, 1, 1) = '-'"
-                ):
-                    bare_id = abs(int(row[0])) % 1_000_000_000_000
-                    session_entities[bare_id] = int(row[1])
-            except Exception:
-                pass  # Not all session types have _db
-            
-            # Method 2: get_dialogs() for channels not in session file
-            dialogs = await client.get_dialogs(limit=None)
-            for d in dialogs:
-                ent = d.entity
-                if hasattr(ent, 'id') and hasattr(ent, 'access_hash'):
-                    cid = ent.id
-                    if cid < 0:
-                        cid = abs(cid) % 1_000_000_000_000
-                    entity_cache[cid] = ent
-                    if cid in session_entities:
-                        del session_entities[cid]
-            
-            logger.info("[preload] Session entities: %d, Dialogs: %d, Total: %d",
-                len(session_entities), len(entity_cache), len(session_entities) + len(entity_cache))
-            
-            # Add remaining session entities (not in dialogs)
-            for bare_id, access_hash in session_entities.items():
-                from telethon.tl.types import PeerChannel
-                # Create InputPeerChannel from cached data
-                from telethon.tl.types import InputPeerChannel
-                entity_cache[bare_id] = InputPeerChannel(bare_id, access_hash)
-                
-        except Exception as e:
-            logger.warning("[preload] Entity loading failed: %s", e)
-
-        total_start = time.monotonic()
-        logger.info(
-            "=== Запуск парсинга: %d каналов ===",
-            len(channel_list),
-        )
-        if self._progress_callback:
-            self._progress_callback(
-                channels_total=len(channel_list),
-                channels_done=0,
-                current_operation=f"Starting {len(channel_list)} channels...",
-            )
-
-        results: dict[str, ParseResult] = {}
-        total_parsed = 0
-        total_new = 0
-        total_errors = 0
-
-        for ch in channel_list:
-            try:
-                username, result = await self._parse_one_channel(ch, limit, history)
-                results[username] = result
-                total_parsed += result.posts_parsed
-                total_new += result.posts_new
-                if result.error_message:
-                    total_errors += 1
-            except Exception as e:
-                total_errors += 1
-                logger.error("Канал %s упал: %s", ch, e)
-                results[ch] = ParseResult(error_message=str(e))
-
-            # Пауза между каналами (FloodWait защита)
-            await asyncio.sleep(5)
-
-        total_duration = int((time.monotonic() - total_start) * 1000)
-        logger.info(
-            "=== Все каналы завершены: parsed=%d, new=%d, errors=%d, "
-            "time=%dms ===",
-            total_parsed,
-            total_new,
-            total_errors,
-            total_duration,
-        )
-        return results
-
-    # ------------------------------------------------------------------
-    # Entry points
-    # ------------------------------------------------------------------
-
-    async def run_once(self) -> dict[str, ParseResult]:
-        """Одиночный прогон парсера.
-
-        Returns:
-            Словарь {username: ParseResult}.
-        """
-        settings.validate_parser()
-        await self.init_db()
-        await self._ensure_client()
-
-        try:
-            results = await self.parse_all(
-                limit=settings.LIMIT,
-                history=settings.HISTORY,
-            )
         finally:
-            await self._disconnect_client()
+            await self.disconnect_client()
+
+        # Summary
+        total_parsed = sum(r.parsed for r in results.values())
+        total_new = sum(r.new for r in results.values())
+        total_errors = sum(1 for r in results.values() if r.error)
+        duration_sec = int(time.monotonic() - start_ts)
+
+        logger.info("=" * 60)
+        logger.info("РЕЗУЛЬТАТЫ: каналов=%d, обработано=%d, новых=%d, ошибок=%d, время=%d сек",
+                    len(results), total_parsed, total_new, total_errors, duration_sec)
+        logger.info("RateLimiter: %s", self._rate_limiter.get_stats())
+        logger.info("CircuitBreaker: %s", self._circuit.get_stats())
+        logger.info("=" * 60)
+
+        # Сохраняем state
+        await self._save_run_state(len(results), total_new, duration_sec, total_errors)
 
         return results
 
     async def run_scheduled(self) -> None:
-        """Периодический запуск парсера по расписанию."""
-        settings.validate_parser()
-        await self.init_db()
-        await self._ensure_client()
-
+        """Периодический запуск парсера."""
         logger.info(
-            "Периодический парсинг: интервал=%d сек", settings.INTERVAL_SEC
+            "[scheduled] Периодический режим: интервал=%d сек (%d мин)",
+            self.schedule_interval_sec, self.schedule_interval_sec // 60,
         )
 
+        while True:
+            try:
+                await self.run_once()
+            except Exception as e:
+                logger.exception("[scheduled] Ошибка в цикле: %s", e)
+
+            logger.info(
+                "[scheduled] Сон %d сек до следующего прогона...",
+                self.schedule_interval_sec,
+            )
+            await asyncio.sleep(self.schedule_interval_sec)
+
+    async def _save_run_state(
+        self,
+        channels: int,
+        new_posts: int,
+        duration_sec: int,
+        errors: int,
+    ) -> None:
+        """Сохранить состояние прогона в ParseState."""
         try:
-            while True:
-                logger.info("[%s] Запуск парсинга...", _now().isoformat())
+            from models import ParseState
+            async with self._db_factory() as session:
+                result = await session.execute(select(ParseState))
+                state = result.scalar_one_or_none()
+                if state is None:
+                    state = ParseState()
+                    session.add(state)
 
-                try:
-                    await self.parse_all(
-                        limit=None,          # В режиме schedule — без лимита
-                        history=False,       # Только новые посты
+                state.last_run_at = utc_now()
+                state.last_run_channels = channels
+                state.last_run_new_posts = new_posts
+                state.last_run_duration_sec = duration_sec
+                state.last_error = None if errors == 0 else f"{errors} errors"
+
+                if self._rate_limiter:
+                    state.total_api_calls = self._rate_limiter.total_calls
+                    state.total_flood_waits = self._rate_limiter.total_flood_waits
+
+                if self._circuit and self._circuit.is_global_open():
+                    state.global_cooldown_until = datetime.fromtimestamp(
+                        self._circuit._global_opened_at +
+                        self._circuit.GLOBAL_COOLDOWN_MINUTES * 60,
+                        tz=timezone.utc,
                     )
-                except Exception as e:
-                    logger.exception("Ошибка в цикле парсинга: %s", e)
+                else:
+                    state.global_cooldown_until = None
 
-                logger.info("Сон %d сек до следующего запуска", settings.INTERVAL_SEC)
-                await asyncio.sleep(settings.INTERVAL_SEC)
-
-        finally:
-            logger.info("Завершение run_scheduled")
-            await self._disconnect_client()
+                await session.commit()
+        except Exception as e:
+            logger.warning("Не удалось сохранить ParseState: %s", e)
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
+# ─── CLI Entry Point ────────────────────────────────────────
 
 async def main() -> None:
     """Точка входа CLI."""
+    cfg = _get_config()
+
+    # Logging
+    logging.basicConfig(
+        level=getattr(logging, cfg.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     parser = MultiChannelParser()
 
-    if settings.SCHEDULE_MODE:
+    if getattr(cfg, "SCHEDULE_MODE", False):
         await parser.run_scheduled()
     else:
         results = await parser.run_once()
 
-        # Краткая сводка
-        print("\n" + "=" * 60)
-        print("РЕЗУЛЬТАТЫ ПАРСИНГА")
-        print("=" * 60)
-        total_parsed = 0
-        total_new = 0
-        for username, res in results.items():
-            status = "OK" if not res.error_message else "ERR"
-            print(
-                f"  [{status}] {username:25s} "
-                f"parsed={res.posts_parsed:4d}  "
-                f"new={res.posts_new:4d}  "
-                f"time={res.duration_ms}ms"
-            )
-            if res.error_message:
-                print(f"       → {res.error_message}")
-            total_parsed += res.posts_parsed
-            total_new += res.posts_new
-        print("-" * 60)
-        print(f"  ИТОГО: parsed={total_parsed}, new={total_new}")
-        print("=" * 60 + "\n")
+        # Таблица результатов
+        print("\n" + "=" * 70)
+        print(f"{'Канал':<30} {'Обработано':>10} {'Новых':>8} {'Статус':>15}")
+        print("-" * 70)
+
+        for ch_id, res in sorted(results.items()):
+            status = "OK" if not res.error else f"ERR: {res.error[:30]}"
+            # Получаем название канала
+            name = f"ID:{ch_id}"
+            print(f"{name:<30} {res.parsed:>10} {res.new:>8} {status:>15}")
+
+        total_parsed = sum(r.parsed for r in results.values())
+        total_new = sum(r.new for r in results.values())
+        total_errs = sum(1 for r in results.values() if r.error)
+
+        print("-" * 70)
+        print(f"{'ИТОГО':<30} {total_parsed:>10} {total_new:>8} {total_errs:>15} ошибок")
+        print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
