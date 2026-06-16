@@ -2275,13 +2275,28 @@ async function deleteChannel(id){
 
 async function clearAll(){
   if(!confirm('ВНИМАНИЕ: Это удалит ВСЕ каналы, посты, логи и ошибки из базы. Продолжить?')) return;
-  $('parse-status').textContent='Очистка базы...';
+  // Блокируем кнопку на время запроса (фикс 1: двойное нажатие)
+  var btn=$('clear-btn');
+  if(btn.disabled) return;
+  btn.disabled=true;
+  btn.textContent='⏳ Очищаем...';
+  $('parse-status').textContent='Проверка...';
   try{
+    // Проверяем — не идёт ли парсинг (фикс 2: race condition)
+    var statusR=await fetch('/api/parse/status',{cache:'no-store',credentials:'include'});
+    var statusData=await statusR.json();
+    if(statusData.state && statusData.state.running){
+      $('parse-status').textContent='❌ Нельзя очистить — идёт парсинг. Дождитесь завершения.';
+      btn.disabled=false;
+      btn.textContent='🗑 Очистить все';
+      return;
+    }
+    $('parse-status').textContent='Очистка базы...';
     var r=await fetch('/api/channel/clear-all',{method:'POST',cache:'no-store',credentials:'include'});
     var data=await r.json();
     if(data.success){$('parse-status').textContent='✅ База очищена. Страница перезагрузится...'; setTimeout(function(){location.reload();}, 2000);}
-    else{$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown');}
-  }catch(e){$('parse-status').textContent='❌ Ошибка сети: '+e; console.error(e);}
+    else{$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown'); btn.disabled=false; btn.textContent='🗑 Очистить все';}
+  }catch(e){$('parse-status').textContent='❌ Ошибка сети: '+e; console.error(e); btn.disabled=false; btn.textContent='🗑 Очистить все';}
 }
 
 // Export functions for onclick handlers
@@ -3101,6 +3116,10 @@ async def api_channels_delete(channel_id: int):
 @app.post("/api/channel/clear-all", dependencies=[Depends(_get_auth_user)])
 async def api_channel_clear_all():
     """Очистить ВСЕ данные: каналы, посты, логи, ошибки, группы. Сохраняет users."""
+    global _parse_state
+    # Фикс 2: проверяем — не идёт ли парсинг
+    if _parse_state.get("running"):
+        return json_response({"success": False, "error": "Parsing in progress — cannot clear data"}, 409)
     try:
         async with async_session() as session:
             result = await session.execute(text("""
