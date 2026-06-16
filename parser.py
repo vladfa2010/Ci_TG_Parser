@@ -399,34 +399,39 @@ class ChannelResolver:
         self.db_factory = db_session_factory
 
     async def sync_dialogs(self) -> list[dict[str, Any]]:
-        """Обновить access_hash для СУЩЕСТВУЮЩИХ каналов через get_dialogs().
+        """Обновить access_hash для СУЩЕСТВУЮЩИХ каналов/чатов через get_dialogs().
 
-        ВАЖНО: НЕ создаёт новые каналы — только обновляет access_hash
-        для тех что уже есть в БД (is_active). Это предотвращает
-        парсинг всех 2446+ каналов аккаунта.
+        НЕ создаёт новые каналы — только обновляет access_hash.
+        Поддерживает Chat (basic group, без access_hash) и Channel (с access_hash).
 
         Returns:
-            Список каналов у которых обновлён access_hash.
+            Пустой список (результат не нужен, изменения в БД).
         """
         logger.info("[resolver] Получаем диалоги через get_dialogs()...")
         dialogs = await self.client.get_dialogs(limit=None)
         logger.info("[resolver] Получено %d диалогов", len(dialogs))
 
-        # Строим маппинг: telegram_id → (access_hash, title, username)
-        tg_channels: dict[int, dict[str, Any]] = {}
+        # Строим маппинг: id → {type, access_hash, title, username}
+        from telethon.tl.types import Chat as TlChat
+        tg_map: dict[int, dict[str, Any]] = {}
         for dialog in dialogs:
             entity = dialog.entity
-            if not isinstance(entity, TlChannel):
-                continue
-            if not entity.broadcast:
-                continue
-            tg_channels[entity.id] = {
-                "access_hash": entity.access_hash,
-                "title": entity.title or "",
-                "username": entity.username,
-            }
+            if isinstance(entity, TlChannel):
+                tg_map[entity.id] = {
+                    "type": "channel",
+                    "access_hash": entity.access_hash,
+                    "title": entity.title or "",
+                    "username": entity.username,
+                }
+            elif isinstance(entity, TlChat):
+                tg_map[entity.id] = {
+                    "type": "chat",
+                    "access_hash": None,
+                    "title": entity.title or "",
+                    "username": None,
+                }
 
-        # Обновляем access_hash для существующих каналов/чатов в БД
+        # Обновляем существующие каналы/чаты в БД
         updated = 0
         skipped = 0
         try:
@@ -443,6 +448,7 @@ class ChannelResolver:
             for db_ch in db_channels:
                 # Ищем по telegram_id, abs(telegram_id), numeric_id
                 found_id = None
+                info = None
                 search_ids = [db_ch.telegram_id]
                 if db_ch.telegram_id and db_ch.telegram_id < 0:
                     search_ids.append(abs(db_ch.telegram_id))
@@ -450,77 +456,33 @@ class ChannelResolver:
                     search_ids.append(db_ch.numeric_id)
 
                 for sid in search_ids:
-                    if sid in tg_entities:
+                    if sid in tg_map:
                         found_id = sid
+                        info = tg_map[sid]
                         break
 
                 if not found_id:
                     skipped += 1
-                    logger.warning("[resolver] '%s' NOT found (searched: %s)", 
+                    logger.warning("[resolver] '%s' NOT found (searched: %s)",
                                   db_ch.title, search_ids)
                     continue
 
-                info = tg_entities[found_id]
+                # Обновляем поля
                 db_ch.access_hash = info["access_hash"]  # None для Chat
                 db_ch.entity_resolved_at = utc_now()
                 db_ch.title = info["title"]
-                # Обновляем тип если нужно
                 if info["type"] == "chat":
                     db_ch.channel_type = "chat"
                 elif info.get("username"):
                     db_ch.channel_type = "public"
+                    db_ch.username = info["username"]
                 else:
                     db_ch.channel_type = "private"
-                logger.info("[resolver] Обновлён '%s': type=%s, id=%d", 
-                           db_ch.title, info["type"], found_id)
-                if info["username"]:
-                    db_ch.username = info["username"]
-                    db_ch.channel_type = "public"
                 updated += 1
 
             await session.commit()
 
-        # Fallback: для пропущенных каналов — пробуем get_entity напрямую
-        if skipped > 0:
-            logger.info("[resolver] Fallback get_entity для %d пропущенных каналов...", skipped)
-            for db_ch in db_channels:
-                if db_ch.access_hash:
-                    continue  # Уже обновлён
-                try:
-                    from telethon.tl.types import PeerChannel
-                    # Пробуем PeerChannel с numeric_id
-                    test_ids = []
-                    if db_ch.numeric_id:
-                        test_ids.append(db_ch.numeric_id)
-                    if db_ch.telegram_id:
-                        test_ids.append(abs(db_ch.telegram_id))
-
-                    for test_id in test_ids:
-                        try:
-                            entity = await self.client.get_entity(PeerChannel(test_id))
-                            if isinstance(entity, TlChannel):
-                                db_ch.access_hash = entity.access_hash
-                                db_ch.entity_resolved_at = utc_now()
-                                db_ch.telegram_id = entity.id  # обновляем на правильный ID
-                                updated += 1
-                                skipped -= 1
-                                logger.info("[resolver] Fallback OK: '%s' id=%d access_hash=%d",
-                                           db_ch.title, entity.id, entity.access_hash)
-                                break
-                        except Exception:
-                            continue
-                    if db_ch.access_hash:
-                        break  # Нашли — сохраняем
-                except Exception as e:
-                    logger.debug("[resolver] Fallback failed for '%s': %s", db_ch.title, e)
-
-            async with self.db_factory() as session:
-                await session.commit()
-
-        logger.info(
-            "[resolver] Обновлено access_hash: %d каналов (пропущено: %d)",
-            updated, skipped,
-        )
+        logger.info("[resolver] Обновлено: %d (пропущено: %d)", updated, skipped)
         return []
 
     async def get_active_channels(self) -> list[Any]:
