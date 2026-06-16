@@ -828,6 +828,7 @@ class MultiChannelParser:
         self._circuit: Optional[CircuitBreaker] = None
         self._resolver: Optional[ChannelResolver] = None
         self._parser: Optional[ChannelParser] = None
+        self._progress_callback: Optional[Callable[..., None]] = None
 
     # ─── Lifecycle ──────────────────────────────────────────
 
@@ -986,6 +987,15 @@ class MultiChannelParser:
                     else:
                         self._circuit.on_channel_success(channel.id)
                         self._rate_limiter.on_success()
+                    
+                    # Callback: прогресс после каждого канала
+                    if self._progress_callback:
+                        self._progress_callback(
+                            increment_channels_done=1,
+                            increment_posts_new=result.new,
+                            increment_posts_parsed=result.parsed,
+                            current_channel=channel.title or str(channel.id),
+                        )
 
                 except GlobalCooldownError as e:
                     # Глобальный cooldown — останавливаем весь прогон
@@ -1042,6 +1052,18 @@ class MultiChannelParser:
         await self._save_run_state(len(results), total_new, duration_sec, total_errors)
 
         return results
+
+    async def parse_all(self, history: bool = False) -> dict[int, ParseResult]:
+        """API для web.py: запускает run_once() с прогресс-колбэком.
+
+        Args:
+            history: Если True — игнорируется (v3 всегда инкрементальный).
+
+        Returns:
+            dict[int, ParseResult]: результаты по каналам.
+        """
+        logger.info("[parse_all] Запуск из web.py (history=%s)", history)
+        return await self.run_once()
 
     async def run_scheduled(self) -> None:
         """Периодический запуск парсера."""
