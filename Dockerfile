@@ -30,7 +30,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Cache bust to force fresh code copy on Render
-ARG CACHE_BUST=69
+ARG CACHE_BUST=70
 
 # Copy application source code
 COPY . .
