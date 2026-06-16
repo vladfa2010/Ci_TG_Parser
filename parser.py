@@ -505,6 +505,7 @@ class MultiChannelParser:
         channel: Channel,
         limit: Optional[int] = None,
         history: bool = False,
+        entity_cache: dict = None,
     ) -> ParseResult:
         """Парсит один канал с retry logic и rate limiting.
 
@@ -547,45 +548,28 @@ class MultiChannelParser:
             # --- Rate limit перед началом iter_messages ---
             await asyncio.sleep(0.5)
 
-            # --- Preload dialogs to cache all channel entities ---
-            # CRITICAL: Telethon needs access_hash for private channels.
-            # get_dialogs() loads ALL channels user is member of (1 API call).
-            # After this, get_entity(PeerChannel(id)) works without extra API calls.
-            if not getattr(self, '_dialogs_loaded', False):
-                try:
-                    logger.info("[preload] Loading dialogs to cache entities...")
-                    dialogs = await client.get_dialogs(limit=200)
-                    logger.info("[preload] Cached %d dialogs", len(dialogs))
-                    self._dialogs_loaded = True
-                except Exception as e:
-                    logger.warning("[preload] get_dialogs failed: %s", e)
-
             msg_counter = 0
             total_messages = 0
             api_calls = 0  # Track API calls for this channel
             
-            # --- Определяем entity_id ---
+            # --- Get entity: public=username, private=from entity_cache ---
             if channel.username:
                 entity_id = channel.username
                 logger.info("[%s] Public → @%s", username, channel.username)
             else:
-                # Private channel — use PeerChannel (dialogs provided access_hash)
+                # Private channel — entity_cache from get_dialogs in parse_all()
                 if channel.telegram_id > 0:
                     bare_id = channel.telegram_id
                 else:
                     bare_id = abs(channel.telegram_id) % 1_000_000_000_000
-                from telethon.tl.types import PeerChannel
-                entity_id = PeerChannel(bare_id)
-                logger.info("[%s] Private → PeerChannel(%s)", username, bare_id)
-            
-            # Verify entity is cached
-            try:
-                resolved = await client.get_entity(entity_id)
-                logger.info("[%s] Entity OK: %s", username, resolved.title)
-            except Exception as e:
-                logger.error("[%s] Entity NOT in dialogs cache: %s", username, e)
-                result.error_message = f"Not in dialogs (no access): {e}"
-                return result
+                
+                if bare_id in (entity_cache or {}):
+                    entity_id = entity_cache[bare_id]
+                    logger.info("[%s] Private → entity from cache (id=%s)", username, bare_id)
+                else:
+                    logger.error("[%s] Private channel %s NOT in member list — skipping", username, bare_id)
+                    result.error_message = f"Not a member (id={bare_id})"
+                    return result
             logger.info("[%s] Starting iter_messages with min_id=%s, limit=%s", username, min_id, limit)
             
             async for message in client.iter_messages(
@@ -817,9 +801,11 @@ class MultiChannelParser:
         username: str,
         limit: Optional[int] = None,
         history: bool = False,
+        entity_cache: dict = None,
     ) -> tuple[str, ParseResult]:
         """Парсит один канал. При ошибке — rollback сессии, лог, идем дальше."""
         start_ts = time.monotonic()
+        entity_cache = entity_cache or {}
 
         # Report: starting this channel
         if self._progress_callback:
@@ -839,9 +825,10 @@ class MultiChannelParser:
                 if not channel.is_active:
                     return username, ParseResult(error_message="Канал деактивирован")
 
-                # 2. Парсим
+                # 2. Парсим (pass entity_cache for private channels)
                 result = await self.parse_single_channel(
-                    db_session, channel, limit=limit, history=history
+                    db_session, channel, limit=limit, history=history,
+                    entity_cache=entity_cache,
                 )
 
                 # 3. Лог
@@ -934,8 +921,24 @@ class MultiChannelParser:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
 
-        # Reset dialogs cache — reload on each parse run
-        self._dialogs_loaded = False
+        # --- Preload all dialogs to cache channel entities ---
+        # ONE API call gets access_hash for ALL channels.
+        # Private channels CANNOT be resolved without access_hash.
+        entity_cache = {}
+        try:
+            client = await self._ensure_client()
+            dialogs = await client.get_dialogs(limit=200)
+            for d in dialogs:
+                ent = d.entity
+                if hasattr(ent, 'id'):
+                    # Store by bare channel_id (strip -100 prefix)
+                    cid = ent.id
+                    if cid < 0:
+                        cid = abs(cid) % 1_000_000_000_000
+                    entity_cache[cid] = ent
+            logger.info("[preload] Cached %d channel entities", len(entity_cache))
+        except Exception as e:
+            logger.warning("[preload] get_dialogs failed: %s", e)
 
         total_start = time.monotonic()
         logger.info(
