@@ -850,9 +850,18 @@ class MultiChannelParser:
                     channel = await self._lookup_channel(db_session, username)
                     if channel:
                         logger.debug("[%s] Канал найден в БД: tid=%s", username, channel.telegram_id)
+                        # Обновляем метаданные (title, subscriber_count) — быстрый get_entity
+                        try:
+                            await self._with_retry(
+                                lambda: self.sync_channel(db_session, username),
+                                channel_name=username,
+                                operation="sync_channel_update",
+                            )
+                        except Exception as sync_err:
+                            logger.warning("[%s] sync_channel не удался (не критично): %s", username, sync_err)
                     else:
                         # 2. Канал не в БД — пропускаем чтобы избежать FloodWait
-                        logger.error("[%s] Канал не найден в БД — ПРОПУСКАЕМ (чтобы избежать FloodWait). Добавьте канал через веб.", username)
+                        logger.error("[%s] Канал не найден в БД — ПРОПУСКАЕМ. Добавьте канал через веб.", username)
                         return username, ParseResult(
                             error_message="Канал не найден в БД — добавьте через веб-интерфейс"
                         )
