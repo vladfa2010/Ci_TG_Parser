@@ -39,6 +39,8 @@ from sqlalchemy.ext.asyncio import (
 )
 from telethon import TelegramClient
 from telethon.errors import (
+    ChannelInvalidError,
+    ChannelPrivateError,
     FloodWaitError,
     SessionPasswordNeededError,
     SessionRevokedError,
@@ -566,13 +568,27 @@ class MultiChannelParser:
                 entity_id = PeerChannel(channel_id)
                 logger.info("[%s] Private → PeerChannel(%s) [DB tid=%s]", username, channel_id, channel.telegram_id)
             
-            # Resolve entity — this caches it in Telethon session
+            # Resolve entity — caches in Telethon session.
+            # Wrapped in _with_retry to handle FloodWait gracefully.
             try:
-                resolved = await client.get_entity(entity_id)
+                resolved = await self._with_retry(
+                    lambda: client.get_entity(entity_id),
+                    channel_name=username,
+                    operation="get_entity",
+                )
                 api_calls += 1
                 logger.info("[%s] Entity cached: %s (API call #%d)", username, resolved.title, api_calls)
+            except FloodWaitError as e:
+                # Cannot cache entity — skip this channel entirely
+                logger.error("[%s] FloodWait on get_entity (%ds) — skipping channel", username, e.seconds)
+                return result
+            except (ValueError, ChannelPrivateError, ChannelInvalidError) as e:
+                # Channel inaccessible — skip
+                logger.error("[%s] Channel inaccessible: %s — skipping", username, e)
+                result.error_message = f"Channel inaccessible: {e}"
+                return result
             except Exception as resolve_err:
-                logger.warning("[%s] get_entity failed: %s", username, resolve_err)
+                logger.warning("[%s] get_entity failed: %s — trying iter_messages anyway", username, resolve_err)
 
             msg_counter = 0
             total_messages = 0
