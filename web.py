@@ -2291,19 +2291,14 @@ async function clearAll(){
       btn.textContent='🗑 Очистить все';
       return;
     }
-    $('parse-status').textContent='Очистка базы...';
+    $('parse-status').textContent='⏳ Очищаем базу (ждите)...';
     var r=await fetch('/api/channel/clear-all',{method:'POST',cache:'no-store',credentials:'include'});
     var data=await r.json();
-    if(!data.success){$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown'); btn.disabled=false; btn.textContent='🗑 Очистить все'; return;}
-    // Poll status every 2 seconds
-    var poll=setInterval(async function(){
-      try{var s=await fetch('/api/clear-all/status',{cache:'no-store',credentials:'include'});
-        var st=await s.json();
-        if(st.state.error){clearInterval(poll); $('parse-status').textContent='❌ Ошибка: '+st.state.error; btn.disabled=false; btn.textContent='🗑 Очистить все'; return;}
-        if(!st.state.running){clearInterval(poll); $('parse-status').textContent='✅ База очищена. Перезагрузка...'; setTimeout(function(){location.reload();}, 1500);}
-        else{$('parse-status').textContent='⏳ Очищаем...';}
-      }catch(e){clearInterval(poll); $('parse-status').textContent='❌ Ошибка проверки статуса'; btn.disabled=false; btn.textContent='🗑 Очистить все';}
-    }, 2000);
+    btn.disabled=false;
+    btn.textContent='🗑 Очистить все';
+    if(!data.success){$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown'); return;}
+    $('parse-status').textContent='✅ База очищена. Перезагрузка...';
+    setTimeout(function(){location.reload();}, 1500);
   }catch(e){$('parse-status').textContent='❌ Ошибка сети: '+e; console.error(e); btn.disabled=false; btn.textContent='🗑 Очистить все';}
 }
 
@@ -3150,19 +3145,36 @@ async def _run_clear_all():
         _parse_state["clearing"] = False
 
 @app.post("/api/channel/clear-all", dependencies=[Depends(_get_auth_user)])
-async def api_channel_clear_all(background_tasks: BackgroundTasks):
-    """Запустить очистку всех данных в фоне. Возвращает сразу."""
+async def api_channel_clear_all():
+    """Очистить ВСЕ данные синхронно (ждём завершения). Макс 60 сек."""
+    global _clear_all_state
     if _parse_state.get("running"):
         return json_response({"success": False, "error": "Parsing in progress — cannot clear"}, 409)
     if _clear_all_state.get("running"):
         return json_response({"success": False, "error": "Clear already running"}, 409)
-    background_tasks.add_task(_run_clear_all)
-    return {"success": True, "message": "Очистка запущена...", "check_status": "/api/clear-all/status"}
 
-@app.get("/api/clear-all/status")
-async def api_clear_all_status():
-    """Статус фоновой очистки."""
-    return {"state": _clear_all_state}
+    _clear_all_state = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "error": None}
+    logger.info("[clear-all] Starting synchronous clear...")
+
+    try:
+        # Выполняем очистку прямо тут, не в фоне — надёжнее
+        tables = ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]
+        for table in tables:
+            try:
+                async with engine.begin() as conn:
+                    result = await conn.execute(text(f"DELETE FROM {table}"))
+                logger.info("[clear-all] Deleted from %s", table)
+            except Exception as e:
+                logger.warning("[clear-all] Skipped %s: %s", table, e)
+
+        logger.info("[clear-all] Complete!")
+        _clear_all_state["running"] = False
+        return {"success": True, "message": "✅ База очищена", "reload": True}
+    except Exception as e:
+        logger.error(f"[clear-all] Error: {e}")
+        _clear_all_state["running"] = False
+        _clear_all_state["error"] = str(e)
+        return json_response({"success": False, "error": str(e)}, 500)
 
 
 # ─── API: Cross-Channel comparison (v2) ──────────────────────
