@@ -443,9 +443,11 @@ class ChannelResolver:
 
             for db_ch in db_channels:
                 tg_id = db_ch.telegram_id
+                logger.debug("[resolver] Checking channel '%s' tid=%d in dialogs", db_ch.title, tg_id)
                 if tg_id not in tg_channels:
                     skipped += 1
-                    continue  # Канал из списка не найден в Telegram — skip
+                    logger.warning("[resolver] Channel '%s' tid=%d NOT found in get_dialogs()", db_ch.title, tg_id)
+                    continue
 
                 info = tg_channels[tg_id]
                 db_ch.access_hash = info["access_hash"]
@@ -501,22 +503,33 @@ class ChannelResolver:
             return channels
 
     async def build_input_peer(self, channel: Any) -> InputPeerChannel:
-        """Построить InputPeerChannel из кэша БД — БЕЗ API call.
-
-        Args:
-            channel: Экземпляр модели Channel из БД.
-
-        Returns:
-            InputPeerChannel готовый для iter_messages().
-
-        Raises:
-            ValueError: Если access_hash отсутствует.
-        """
+        """Построить InputPeerChannel из кэша БД — с fallback на get_entity()."""
         if not channel.access_hash:
-            raise ValueError(
-                f"Канал {channel.id} ({channel.title}) не имеет access_hash. "
-                f"Запустите sync_dialogs() сначала."
-            )
+            # Fallback: попытаться получить access_hash через get_entity
+            logger.warning("[resolver] Channel '%s' tid=%d нет access_hash, fallback get_entity...", 
+                          channel.title, channel.telegram_id)
+            try:
+                entity = await self.client.get_entity(channel.telegram_id)
+                if isinstance(entity, TlChannel):
+                    channel.access_hash = entity.access_hash
+                    channel.entity_resolved_at = utc_now()
+                    # Сохраняем в БД
+                    async with self.db_factory() as session:
+                        result = await session.execute(
+                            select(type(channel)).where(type(channel).id == channel.id)
+                        )
+                        db_ch = result.scalar_one()
+                        db_ch.access_hash = entity.access_hash
+                        db_ch.entity_resolved_at = utc_now()
+                        await session.commit()
+                    logger.info("[resolver] Got access_hash for '%s' via fallback", channel.title)
+                else:
+                    raise ValueError(f"Entity is not a Channel: {type(entity)}")
+            except Exception as e:
+                raise ValueError(
+                    f"Канал {channel.id} ({channel.title}) не имеет access_hash "
+                    f"и fallback get_entity() тоже не сработал: {e}"
+                )
 
         channel_id = normalize_channel_id(channel.telegram_id)
         return InputPeerChannel(channel_id, channel.access_hash)
