@@ -3125,20 +3125,45 @@ _clear_all_state = {"running": False, "started_at": None, "error": None}
 
 async def _run_clear_all():
     """Background task: clear all data."""
-    global _clear_all_state
+    global _clear_all_state, _parse_state
     _clear_all_state = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "error": None}
-    logger.info("[clear-all] Starting background clear...")
+    # Блокируем крон-парсер
+    _parse_state["clearing"] = True
+    logger.info("[clear-all] Starting background clear (cron locked)...")
     try:
+        # Устанавливаем флаг в БД для надежности
+        try:
+            async with async_session() as session:
+                result = await session.execute(text("UPDATE parse_state SET global_lock = TRUE"))
+                await session.commit()
+        except Exception:
+            pass
         async with engine.begin() as conn:
             for table in ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]:
                 result = await conn.execute(text(f"DELETE FROM {table}"))
                 logger.info("[clear-all] Deleted from %s", table)
-        logger.info("[clear-all] Complete!")
+        logger.info("[clear-all] Complete! Unlocking cron...")
         _clear_all_state["running"] = False
+        _parse_state["clearing"] = False
+        # Снимаем блокировку в БД
+        try:
+            async with async_session() as session:
+                await session.execute(text("UPDATE parse_state SET global_lock = FALSE"))
+                await session.commit()
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[clear-all] Error: {e}")
         _clear_all_state["running"] = False
+        _parse_state["clearing"] = False
         _clear_all_state["error"] = str(e)
+        # Снимаем блокировку даже при ошибке
+        try:
+            async with async_session() as session:
+                await session.execute(text("UPDATE parse_state SET global_lock = FALSE"))
+                await session.commit()
+        except Exception:
+            pass
 
 @app.post("/api/channel/clear-all", dependencies=[Depends(_get_auth_user)])
 async def api_channel_clear_all(background_tasks: BackgroundTasks):

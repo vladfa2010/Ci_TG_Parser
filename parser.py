@@ -906,6 +906,20 @@ class MultiChannelParser:
 
     # ─── Core: parse all channels ───────────────────────────
 
+    async def _check_global_lock(self) -> bool:
+        """Проверить — не идёт ли очистка из веба."""
+        try:
+            from models import ParseState
+            async with self._db_factory() as session:
+                result = await session.execute(select(ParseState))
+                state = result.scalar_one_or_none()
+                if state and state.global_lock:
+                    logger.warning("[lock] Парсинг пропущен — идёт очистка из веба")
+                    return False
+        except Exception:
+            pass
+        return True
+
     async def run_once(self) -> dict[int, ParseResult]:
         """Один прогон парсера по всем активным каналам.
 
