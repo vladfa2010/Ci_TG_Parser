@@ -2299,6 +2299,7 @@ async function clearAll(){
     var poll=setInterval(async function(){
       try{var s=await fetch('/api/clear-all/status',{cache:'no-store',credentials:'include'});
         var st=await s.json();
+        if(st.state.error){clearInterval(poll); $('parse-status').textContent='❌ Ошибка: '+st.state.error; btn.disabled=false; btn.textContent='🗑 Очистить все'; return;}
         if(!st.state.running){clearInterval(poll); $('parse-status').textContent='✅ База очищена. Перезагрузка...'; setTimeout(function(){location.reload();}, 1500);}
         else{$('parse-status').textContent='⏳ Очищаем...';}
       }catch(e){clearInterval(poll); $('parse-status').textContent='❌ Ошибка проверки статуса'; btn.disabled=false; btn.textContent='🗑 Очистить все';}
@@ -3127,43 +3128,26 @@ async def _run_clear_all():
     """Background task: clear all data."""
     global _clear_all_state, _parse_state
     _clear_all_state = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "error": None}
-    # Блокируем крон-парсер
     _parse_state["clearing"] = True
-    logger.info("[clear-all] Starting background clear (cron locked)...")
+    logger.info("[clear-all] Starting background clear...")
     try:
-        # Устанавливаем флаг в БД для надежности
-        try:
-            async with async_session() as session:
-                result = await session.execute(text("UPDATE parse_state SET global_lock = TRUE"))
-                await session.commit()
-        except Exception:
-            pass
-        async with engine.begin() as conn:
-            for table in ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]:
-                result = await conn.execute(text(f"DELETE FROM {table}"))
+        # Каждая таблица — отдельная транзакция (не откатываем всё из-за одной ошибки)
+        tables = ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]
+        for table in tables:
+            try:
+                async with engine.begin() as conn:
+                    result = await conn.execute(text(f"DELETE FROM {table}"))
                 logger.info("[clear-all] Deleted from %s", table)
-        logger.info("[clear-all] Complete! Unlocking cron...")
+            except Exception as e:
+                logger.warning("[clear-all] Skipped %s: %s", table, e)
+        logger.info("[clear-all] Complete!")
         _clear_all_state["running"] = False
         _parse_state["clearing"] = False
-        # Снимаем блокировку в БД
-        try:
-            async with async_session() as session:
-                await session.execute(text("UPDATE parse_state SET global_lock = FALSE"))
-                await session.commit()
-        except Exception:
-            pass
     except Exception as e:
-        logger.error(f"[clear-all] Error: {e}")
+        logger.error(f"[clear-all] Fatal error: {e}")
+        _clear_all_state["error"] = str(e)
         _clear_all_state["running"] = False
         _parse_state["clearing"] = False
-        _clear_all_state["error"] = str(e)
-        # Снимаем блокировку даже при ошибке
-        try:
-            async with async_session() as session:
-                await session.execute(text("UPDATE parse_state SET global_lock = FALSE"))
-                await session.commit()
-        except Exception:
-            pass
 
 @app.post("/api/channel/clear-all", dependencies=[Depends(_get_auth_user)])
 async def api_channel_clear_all(background_tasks: BackgroundTasks):
