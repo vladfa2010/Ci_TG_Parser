@@ -470,21 +470,9 @@ class ChannelResolver:
                 db_ch = result.scalar_one_or_none()
 
         if db_ch is None:
-            db_ch = DbChannel(
-                telegram_id=telegram_id,
-                numeric_id=channel_id,
-                channel_type="private" if not username else "public",
-                username=username,
-                title=title,
-                is_active=True,
-                access_hash=access_hash,
-                entity_resolved_at=utc_now(),
-            )
-            session.add(db_ch)
-            logger.info(
-                "[resolver] Новый канал: %s (tid=%d, access_hash=%d)",
-                title, telegram_id, access_hash,
-            )
+            # НЕ создаём новые каналы — только обновляем существующие
+            logger.debug("[resolver] Пропуск: %s (tid=%d) не в БД", title, telegram_id)
+            return  # ← ВАЖНО: не создаём!
         else:
             db_ch.title = title
             db_ch.username = username
