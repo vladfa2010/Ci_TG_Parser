@@ -3170,22 +3170,29 @@ async def api_channel_clear_all():
     return {"success": True, "message": "Очистка запущена...", "check_status": "/api/clear-all/status"}
 
 async def _do_clear_all():
-    """Actual clear logic running in event loop."""
+    """Clear all data: one session, commit per table, 1s pause, reconnect."""
     global _clear_all_state
-    try:
-        for table in ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]:
+    tables = ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]
+    for table in tables:
+        for attempt in range(3):
             try:
-                async with engine.begin() as conn:
-                    await conn.execute(text(f"DELETE FROM {table}"))
-                logger.info("[clear-all] Deleted from %s", table)
+                async with async_session() as session:
+                    await session.execute(text(f"DELETE FROM {table}"))
+                    await session.commit()
+                logger.info("[clear-all] Deleted from %s (attempt %d)", table, attempt + 1)
+                break
             except Exception as e:
-                logger.warning("[clear-all] Skipped %s: %s", table, e)
-        logger.info("[clear-all] Complete!")
-        _clear_all_state["running"] = False
-    except Exception as e:
-        logger.error(f"[clear-all] Error: {e}")
-        _clear_all_state["error"] = str(e)
-        _clear_all_state["running"] = False
+                err_msg = str(e).lower()
+                if "recovery" in err_msg or "closed" in err_msg or "does not exist" in err_msg:
+                    logger.warning("[clear-all] %s attempt %d failed, reconnecting...", table, attempt + 1)
+                    await asyncio.sleep(2)
+                    continue
+                else:
+                    logger.warning("[clear-all] Skipped %s: %s", table, e)
+                    break
+        await asyncio.sleep(1)
+    logger.info("[clear-all] Done!")
+    _clear_all_state["running"] = False
 
 @app.get("/api/clear-all/status")
 async def api_clear_all_status():
