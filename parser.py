@@ -564,6 +564,14 @@ class MultiChannelParser:
                 entity_id = channel.telegram_id
                 logger.info("[%s] Public → entity_id=%s", username, entity_id)
             
+            # Resolve entity for private channels (Telethon needs it in cache)
+            if not channel.username:
+                try:
+                    resolved = await client.get_entity(entity_id)
+                    logger.info("[%s] Entity resolved: %s", username, resolved.title)
+                except Exception as resolve_err:
+                    logger.warning("[%s] get_entity failed: %s — trying iter_messages anyway", username, resolve_err)
+
             msg_counter = 0
             total_messages = 0
             logger.info("[%s] Starting iter_messages with min_id=%s, limit=%s", username, min_id, limit)
