@@ -547,51 +547,45 @@ class MultiChannelParser:
             # --- Rate limit перед началом iter_messages ---
             await asyncio.sleep(0.5)
 
-            # --- Определяем entity_id ---
-            # CRITICAL: Telethon needs entity in session cache for iter_messages.
-            # We call get_entity() ONCE per channel, then it's cached in .session file.
-            #
-            # For public channels: use username (most reliable)
-            # For private channels: use full telegram_id with -100 prefix
-            
+            # --- Preload dialogs to cache all channel entities ---
+            # CRITICAL: Telethon needs access_hash for private channels.
+            # get_dialogs() loads ALL channels user is member of (1 API call).
+            # After this, get_entity(PeerChannel(id)) works without extra API calls.
+            if not getattr(self, '_dialogs_loaded', False):
+                try:
+                    logger.info("[preload] Loading dialogs to cache entities...")
+                    dialogs = await client.get_dialogs(limit=200)
+                    logger.info("[preload] Cached %d dialogs", len(dialogs))
+                    self._dialogs_loaded = True
+                except Exception as e:
+                    logger.warning("[preload] get_dialogs failed: %s", e)
+
             msg_counter = 0
             total_messages = 0
             api_calls = 0  # Track API calls for this channel
             
+            # --- Определяем entity_id ---
             if channel.username:
-                # Public channel — username is most reliable identifier
                 entity_id = channel.username
-                logger.info("[%s] Public → entity by username: @%s", username, channel.username)
+                logger.info("[%s] Public → @%s", username, channel.username)
             else:
-                # Private channel — use full telegram_id (negative with -100 prefix)
-                # Telethon auto-detects PeerChannel from negative ID
+                # Private channel — use PeerChannel (dialogs provided access_hash)
                 if channel.telegram_id > 0:
-                    # Bare positive ID in DB — prepend -100
-                    entity_id = int(f"-100{channel.telegram_id}")
+                    bare_id = channel.telegram_id
                 else:
-                    # Already has -100 prefix
-                    entity_id = channel.telegram_id
-                logger.info("[%s] Private → entity_id=%s [DB tid=%s]", username, entity_id, channel.telegram_id)
+                    bare_id = abs(channel.telegram_id) % 1_000_000_000_000
+                from telethon.tl.types import PeerChannel
+                entity_id = PeerChannel(bare_id)
+                logger.info("[%s] Private → PeerChannel(%s)", username, bare_id)
             
-            # Resolve entity — caches in Telethon session.
-            # Wrapped in _with_retry to handle FloodWait gracefully.
+            # Verify entity is cached
             try:
-                resolved = await self._with_retry(
-                    lambda: client.get_entity(entity_id),
-                    channel_name=username,
-                    operation="get_entity",
-                )
-                api_calls += 1
-                logger.info("[%s] Entity cached: %s (API call #%d)", username, resolved.title, api_calls)
-            except FloodWaitError as e:
-                logger.error("[%s] FloodWait on get_entity (%ds) — skipping channel", username, e.seconds)
+                resolved = await client.get_entity(entity_id)
+                logger.info("[%s] Entity OK: %s", username, resolved.title)
+            except Exception as e:
+                logger.error("[%s] Entity NOT in dialogs cache: %s", username, e)
+                result.error_message = f"Not in dialogs (no access): {e}"
                 return result
-            except (ValueError, ChannelPrivateError, ChannelInvalidError) as e:
-                logger.error("[%s] Channel inaccessible: %s — skipping", username, e)
-                result.error_message = f"Channel inaccessible: {e}"
-                return result
-            except Exception as resolve_err:
-                logger.warning("[%s] get_entity failed: %s — trying iter_messages anyway", username, resolve_err)
             logger.info("[%s] Starting iter_messages with min_id=%s, limit=%s", username, min_id, limit)
             
             async for message in client.iter_messages(
@@ -939,6 +933,9 @@ class MultiChannelParser:
         if not channel_list:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
+
+        # Reset dialogs cache — reload on each parse run
+        self._dialogs_loaded = False
 
         total_start = time.monotonic()
         logger.info(
