@@ -821,11 +821,11 @@ class MultiChannelParser:
         Возвращает (username, ParseResult).
         """
         async with self._semaphore:
-            # Пауза между каналами — прерывается по SIGTERM
-            # 5 секунд: баланс между FloodWait защитой и Render 30-sec timeout
-            await self._shutdown_event.wait(5)
-            if self._is_shutting_down:
-                return username, ParseResult(error_message="Shutdown before start")
+            # Пауза между каналами — проверяем shutdown каждые 0.5 сек
+            for _ in range(10):  # 5 секунд total
+                if self._is_shutting_down:
+                    return username, ParseResult(error_message="Shutdown before start")
+                await asyncio.sleep(0.5)
             
             if self._is_shutting_down:
                 return username, ParseResult(
