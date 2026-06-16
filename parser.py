@@ -346,7 +346,13 @@ class MultiChannelParser:
             logger.debug("[sync_channel] bare negative ID → %s", entity_id)
 
         try:
-            entity = await client.get_entity(entity_id)
+            # Use PeerChannel for negative IDs to ensure correct entity type
+            if isinstance(entity_id, int) and entity_id < 0:
+                from telethon.tl.types import PeerChannel
+                entity = await client.get_entity(PeerChannel(abs(entity_id)))
+                logger.debug("[sync_channel] Used PeerChannel(%s) for %s", abs(entity_id), identifier)
+            else:
+                entity = await client.get_entity(entity_id)
         except FloodWaitError as e:
             logger.warning("[sync_channel] FloodWait %d сек для %s — пропускаем", e.seconds, identifier)
             raise ValueError(f"FloodWait: {e.seconds} сек — канал временно недоступен")
