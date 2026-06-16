@@ -1,12 +1,18 @@
 """
-SQLAlchemy 2.0 async ORM models for Telegram Parser (citg_v2).
+SQLAlchemy 2.0 async ORM models for Telegram Parser (citg_v3).
 
-Contains all database models for storing Telegram channels, posts,
-parsing logs, error tracking, and channel grouping.
+Содержит все модели БД: каналы, посты, логи парсинга, ошибки,
+группы каналов, пользователи — а также **singleton-таблицу parse_state**
+для отслеживания глобального состояния парсера (v3).
 
-Usage::
+Новое в v3:
+    - Channel.access_hash — кэш Telegram access_hash для InputPeerChannel
+    - Channel.entity_resolved_at — когда access_hash был получен
+    - ParseState — глобальное состояние парсера (1 строка)
 
-    from models import Base, Channel, Post, ParseLog, ChannelError, ChannelGroup
+Использование::
+
+    from models import Base, Channel, Post, ParseLog, ChannelError, ChannelGroup, ParseState
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -89,6 +95,11 @@ class Channel(Base):
         metadata_json: Flexible JSON field for extra channel data.
         last_parsed_at: When the channel was last successfully parsed.
         created_at: Record creation timestamp (UTC).
+
+    **v3 — новые поля:**
+        access_hash: Telegram access_hash для построения InputPeerChannel
+                     без дополнительного API call (get_entity).
+        entity_resolved_at: Когда access_hash был получен через get_dialogs().
     """
 
     __tablename__ = "channels"
@@ -180,6 +191,18 @@ class Channel(Base):
         comment="Record creation timestamp (UTC)",
     )
 
+    # --- v3: access_hash cache для InputPeerChannel ---
+    access_hash: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="Telegram access_hash для построения InputPeerChannel без get_entity()",
+    )
+    entity_resolved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Когда access_hash был получен через get_dialogs()",
+    )
+
     # Relationships
     posts: Mapped[List["Post"]] = relationship(
         "Post",
@@ -213,6 +236,10 @@ class Channel(Base):
         Index("ix_channels_is_active", "is_active"),
         # Fast ordering by parse time
         Index("ix_channels_last_parsed_at", "last_parsed_at"),
+        # v3: lookup by access_hash
+        Index("ix_channels_access_hash", "access_hash"),
+        # v3: channels resolved via get_dialogs
+        Index("ix_channels_entity_resolved", "entity_resolved_at"),
     )
 
     def __repr__(self) -> str:
@@ -227,7 +254,7 @@ class Post(Base):
 
     Attributes:
         id: Internal surrogate primary key.
-        channel_id: FK → channels.id.
+        channel_id: FK -> channels.id.
         telegram_message_id: Telegram's message ID within the channel.
         text: Post text content.
         text_hash: SHA-256 hash of the text for deduplication.
@@ -238,6 +265,7 @@ class Post(Base):
         mentions: List of @mentions extracted from the text.
         urls: List of URLs extracted from the text.
         forward_from: Original source if this post is a forward.
+        sender_name: Name of the sender (post_author from Telegram).
         has_media: Whether the post contains media.
         media_type: Type of media (photo, video, document, etc.).
         published_at: When the post was published (UTC).
@@ -370,7 +398,7 @@ class ParseLog(Base):
 
     Attributes:
         id: Internal surrogate primary key.
-        channel_id: FK → channels.id.
+        channel_id: FK -> channels.id.
         posts_parsed: Total posts processed during this run.
         posts_new: New posts actually inserted.
         duration_ms: Parsing duration in milliseconds.
@@ -440,12 +468,103 @@ class ParseLog(Base):
         )
 
 
+# ============================================================================
+# v3: ParseState — глобальное состояние парсера (singleton, 1 строка)
+# ============================================================================
+
+
+class ParseState(Base):
+    """Глобальное состояние парсера (singleton-таблица, всегда 1 строка).
+
+    Используется для отслеживания:
+        - Когда был последний запуск парсера
+        - Сколько каналов и постов обработано
+        - Глобальный cooldown при FloodWait
+        - Общая статистика API calls и flood wait-ов
+
+    Attributes:
+        id: Всегда 1 (singleton pattern).
+        last_run_at: Время последнего запуска парсера.
+        last_run_channels: Количество обработанных каналов.
+        last_run_new_posts: Количество новых постов.
+        last_run_duration_sec: Длительность прогона (сек).
+        last_error: Текст последней ошибки.
+        global_cooldown_until: До какого времени действует глобальная пауза.
+        total_api_calls: Общий счётчик API вызовов.
+        total_flood_waits: Общий счётчик FloodWait ошибок.
+    """
+
+    __tablename__ = "parse_state"
+    __table_args__: tuple[Index, ...] = (
+        Index("ix_parse_state_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        default=1,
+        comment="Всегда 1 — singleton pattern",
+    )
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Время последнего запуска парсера (UTC)",
+    )
+    last_run_channels: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Количество каналов в последнем прогоне",
+    )
+    last_run_new_posts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Количество новых постов в последнем прогоне",
+    )
+    last_run_duration_sec: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Длительность последнего прогона (секунды)",
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Текст последней ошибки",
+    )
+    global_cooldown_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Глобальная пауза активна до (UTC)",
+    )
+    total_api_calls: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        comment="Общий счётчик API вызовов",
+    )
+    total_flood_waits: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Общий счётчик FloodWait ошибок",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ParseState(id={self.id}, last_run_at={self.last_run_at}, "
+            f"channels={self.last_run_channels}, new_posts={self.last_run_new_posts}, "
+            f"cooldown_until={self.global_cooldown_until})>"
+        )
+
+
 class ChannelError(Base):
     """Individual error record for a channel parsing attempt.
 
     Attributes:
         id: Internal surrogate primary key.
-        channel_id: FK → channels.id.
+        channel_id: FK -> channels.id.
         error_message: Full error text.
         error_type: Short error category (e.g., "timeout", "flood_wait").
         created_at: Error timestamp (UTC).
@@ -553,8 +672,8 @@ class ChannelGroupMember(Base):
     """Association table linking channels to groups (many-to-many).
 
     Attributes:
-        channel_id: FK → channels.id (part of composite PK).
-        group_id: FK → channel_groups.id (part of composite PK).
+        channel_id: FK -> channels.id (part of composite PK).
+        group_id: FK -> channel_groups.id (part of composite PK).
         added_at: When the channel was added to the group (UTC).
     """
 
@@ -591,6 +710,7 @@ class ChannelGroupMember(Base):
 # ---------------------------------------------------------------------------
 # User
 # ---------------------------------------------------------------------------
+
 
 class User(Base):
     """User account for dashboard authentication.
