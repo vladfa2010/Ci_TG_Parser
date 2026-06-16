@@ -36,6 +36,61 @@
 
 ---
 
+## Как мы решали проблему Chat vs Channel (подробно)
+
+### Проблема
+
+`CIFRA WORLD` — закрытый чат из Telegram Web (`https://web.telegram.org/a/#-740684703`). Парсер v2 работал только с каналами (`Channel`), а чаты (`Chat`) — нет. После добавления чата парсинг падал с ошибкой `no access_hash`.
+
+### Почему падало
+
+**Ошибка 1:** `sync_dialogs()` фильтровал только `isinstance(entity, Channel)` — чаты пропускались:
+```python
+# Было — Chat игнорировались
+if not isinstance(entity, Channel):
+    continue
+```
+
+**Ошибка 2:** `build_input_peer()` пытался создать `InputPeerChannel` для чатов — требовал `access_hash`, которого у `Chat` нет:
+```python
+# Было — Chat падали здесь
+if not channel.access_hash:
+    raise ValueError("no access_hash")  # Chat не имеет access_hash!
+return InputPeerChannel(id, access_hash)
+```
+
+**Ошибка 3:** Проверка `channel_type == 'chat'` через SQLAlchemy `getattr()` не работала — атрибут не загружался в новой сессии.
+
+**Ошибка 4:** `_upsert_channel()` создавал ВСЕ 2446 каналов из `get_dialogs()` в БД пользователя.
+
+**Ошибка 5:** `channel_add` для отрицательных ID пробовал `-100` префикс сначала, что для `Chat` вызывало `Invalid object ID for a chat`.
+
+### Решение
+
+| Компонент | Что изменили | Почему |
+|-----------|-------------|--------|
+| `sync_dialogs()` | Принимает и `Chat`, и `Channel` | Чаты тоже нужно обновлять |
+| `sync_dialogs()` | Не создаёт новые каналы (`return` вместо `session.add`) | Предотвращает 2446 лишних каналов |
+| `build_input_peer()` | `if tid > 0: return InputPeerChat(tid)` | Chat — положительный ID, не нужен access_hash |
+| `build_input_peer()` | `if tid < 0: return InputPeerChannel(...)` | Только для Channel |
+| `channel_add` | `isinstance(entity, Chat)` → `channel_type='chat'` | Определяем тип при добавлении |
+| `channel_add` | `get_entity(-740684703)` для Chat (без `-100`) | `-100` только для Channel |
+| `web.py` | `import asyncio` (был потерян) | `asyncio.create_task()` требует импорт |
+
+### Ключевой инсайт
+
+```python
+# Определение типа — только по знаку telegram_id:
+if telegram_id > 0:
+    # Chat: 740684703 → InputPeerChat(740684703) — access_hash не нужен
+    return InputPeerChat(telegram_id)
+else:
+    # Channel: -100740684703 → InputPeerChannel(id, access_hash)
+    return InputPeerChannel(channel_id, access_hash)
+```
+
+---
+
 ## Как добавить канал/чат
 
 ### Поддерживаемые форматы
