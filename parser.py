@@ -550,15 +550,21 @@ class MultiChannelParser:
             if channel.telegram_id < 0 and not channel.username:
                 from telethon.tl.types import PeerChannel
                 entity_id = PeerChannel(abs(channel.telegram_id))
-                logger.debug("[%s] Using PeerChannel(%s)", username, abs(channel.telegram_id))
+                logger.info("[%s] Using PeerChannel(%s) for iter_messages", username, abs(channel.telegram_id))
             else:
                 entity_id = channel.telegram_id
+                logger.info("[%s] Using entity_id=%s for iter_messages", username, entity_id)
+            
             msg_counter = 0
+            total_messages = 0
+            logger.info("[%s] Starting iter_messages with min_id=%s, limit=%s", username, min_id, limit)
+            
             async for message in client.iter_messages(
                 entity_id,
                 limit=limit,
                 min_id=min_id if not history else 0,
             ):
+                total_messages += 1
                 # Rate limit: sleep каждые 50 сообщений
 
                 # Пропускаем посты без текста и без медиа
@@ -651,6 +657,8 @@ class MultiChannelParser:
                         username,
                         new_count,
                     )
+
+            logger.info("[%s] iter_messages done: total=%d, parsed=%d, new=%d", username, total_messages, parsed_count, new_count)
 
             # --- Финальный коммит ---
             await db_session.commit()
