@@ -2955,7 +2955,7 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
     try:
         from telethon import TelegramClient
         from telethon.sessions import StringSession
-        from telethon.tl.types import PeerChannel, Channel
+        from telethon.tl.types import PeerChannel, Channel as TlChannel
         from telethon.errors import FloodWaitError
 
         async with async_session() as session:
@@ -3037,7 +3037,7 @@ async def api_channel_add(identifier: str = Query(..., description="Username, nu
                 telegram_id = entity.id
 
                 # Ensure channel IDs have -100 prefix (Telegram format)
-                if isinstance(entity, Channel) and telegram_id > 0:
+                if isinstance(entity, TlChannel) and telegram_id > 0:
                     telegram_id = int(f"-100{telegram_id}")
                 # Compute numeric_id (without -100 prefix)
                 if telegram_id < 0:
