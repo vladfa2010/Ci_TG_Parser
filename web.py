@@ -3117,25 +3117,25 @@ async def api_channels_delete(channel_id: int):
 async def api_channel_clear_all():
     """Очистить ВСЕ данные: каналы, посты, логи, ошибки, группы. Сохраняет users."""
     global _parse_state
-    # Фикс 2: проверяем — не идёт ли парсинг
     if _parse_state.get("running"):
         return json_response({"success": False, "error": "Parsing in progress — cannot clear data"}, 409)
     try:
-        async with async_session() as session:
-            result = await session.execute(text("""
-                TRUNCATE TABLE 
-                    channel_group_members,
-                    channel_groups,
-                    channel_errors,
-                    parse_logs,
-                    parse_state,
-                    posts,
-                    channels
-                CASCADE
-            """))
-            await session.commit()
-            logger.info("[clear-all] База полностью очищена (кроме users)")
-            return {"success": True, "message": "Все данные удалены. Добавьте каналы заново."}
+        async with engine.begin() as conn:
+            # Удаляем данные из всех таблиц (кроме users)
+            # Порядок важен: сначала дочерние, потом родительские
+            for table in [
+                "channel_group_members",
+                "channel_errors",
+                "parse_logs",
+                "parse_state",
+                "posts",
+                "channels",
+                "channel_groups",
+            ]:
+                await conn.execute(text(f"DELETE FROM {table}"))
+                logger.info("[clear-all] Удалены записи из %s", table)
+        logger.info("[clear-all] База полностью очищена (кроме users)")
+        return {"success": True, "message": "Все данные удалены. Добавьте каналы заново."}
     except Exception as e:
         logger.error(f"[clear-all] Error: {e}"); traceback.print_exc()
         return json_response({"success": False, "error": str(e)}, 500)
