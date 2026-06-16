@@ -975,8 +975,9 @@ class MultiChannelParser:
             logger.warning("Список каналов пуст — нечего парсить")
             return {}
 
-        # Reset shutdown event — parser is reusable (singleton)
-        # Previous SIGTERM may have set it; we clear it for fresh run
+        # Reset shutdown state — parser is reusable (singleton)
+        # Previous SIGTERM may have set these; we clear them for fresh run
+        self._is_shutting_down = False
         self._shutdown_event.clear()
 
         # Check for shutdown before starting
