@@ -13,7 +13,7 @@
 | **Управление каналами через веб** | Добавление / включение / выключение / удаление через UI на `/channels` |
 | **Авторизация** | Cookie-сессии для браузера + Basic Auth для API. Предустановленный юзер `vlad` |
 | **Фильтрация по каналу** | Вкладка Posts: dropdown фильтр по каналу (публичные + приватные) |
-| **Парсер** | Последовательный парсинг, изоляция ошибок (fresh DB session), FloodWait защита |
+| **Парсер** | Последовательный парсинг, PeerChannel для приватных каналов, изоляция ошибок, FloodWait защита |
 | **Карточки постов** | Название канала, отправитель, компактные просмотры (K/M), хэштеги |
 | **Глобальная дедупликация** | Посты дедуплицируются по хэшу текста между всеми каналами |
 | **Cross-channel аналитика** | Сравнение каналов по активности, просмотрам, хэштегам |
@@ -346,9 +346,14 @@ curl -u "vlad:!1234567890" -X DELETE \
 ```
 parse_single_channel(channel):
     │
-    ├── 1. Определяет entity_id:
-    │      - Приватный канал: PeerChannel(abs(telegram_id))
-    │      - Публичный канал: telegram_id напрямую
+    ├── 1. Определяет entity_id (КРИТИЧНО):
+    │      - Приватный канал (нет username):
+    │         * telegram_id > 0 (старые данные):
+    │           entity_id = PeerChannel(-100{telegram_id})
+    │         * telegram_id < 0 (новые данные):
+    │           entity_id = PeerChannel(telegram_id)
+    │      - Публичный канал (есть username):
+    │         entity_id = telegram_id напрямую
     │
     ├── 2. Итерирует сообщения:
     │      client.iter_messages(entity_id, min_id=...)
@@ -371,7 +376,27 @@ parse_single_channel(channel):
 | **Пауза между каналами** | 5 секунд | После каждого канала — sleep |
 | **Пауза между сообщениями** | 0.5 сек / 50 msg | Rate limiting |
 | **Нет get_entity()** | — | Используем telegram_id из БД |
-| **PeerChannel** | abs(tid) | Правильный entity type |
+
+### Entity ID — приватные vs публичные каналы
+
+Telegram API требует правильный entity type для каждого типа чата:
+
+```
+Приватный канал (t.me/c/3147415698):
+  Без username → PeerChannel
+  
+  DB telegram_id=3147415698 (positive, old data):
+    → entity_id = PeerChannel(-1003147415698)
+    
+  DB telegram_id=-1003147415698 (negative, new data):
+    → entity_id = PeerChannel(-1003147415698)
+
+Публичный канал (@channel):
+  С username → username или telegram_id напрямую
+  → entity_id = channel.telegram_id
+```
+
+Код автоматически определяет тип и создаёт правильный PeerChannel для всех приватных каналов.
 
 ### Изоляция ошибок (fresh DB session)
 
