@@ -1,6 +1,6 @@
-# CITG v3 — Telegram Parser для 20+ приватных каналов
+# CITG v3 — Telegram Parser для каналов и чатов
 
-> Сбор сообщений из закрытых Telegram-каналов в единую ленту. Безопасный парсинг с защитой от FloodWait.
+> Сбор сообщений из закрытых Telegram-каналов и чатов в единую ленту. Безопасный парсинг с защитой от FloodWait.
 
 ---
 
@@ -8,14 +8,50 @@
 
 | Функция | Описание |
 |---------|----------|
-| **20 приватных каналов** | Парсинг закрытых каналов через `access_hash` кэш в БД |
-| **Zero `get_entity()`** | `InputPeerChannel` строится из БД — нет лишних API-вызовов |
-| **Adaptive Rate Limiter** | Динамическая задержка: ускоряется при успехе, замедляется при ошибках |
-| **Circuit Breaker** | 3 ошибки → канал пропускается 30 минут. FloodWait > 60сек → глобальная пауза |
-| **Auto-migration** | Парсер сам добавляет недостающие колонки в БД — не нужен ручной SQL |
-| **🗑 Очистить все** | Кнопка в вебе — мгновенная очистка базы (с защитой от двойного нажатия) |
-| **Web ↔ Cron lock** | Крон не парсит во время очистки из веба |
-| **Jitter** | Случайные задержки 0-10 сек — имитация human-like поведения |
+| **Каналы + чаты** | Парсинг и каналов (broadcast), и чатов/групп (megagroup) |
+| **access_hash кэш** | `InputPeerChannel` / `InputPeerChat` из БД — минимум API-вызовов |
+| **Fallback get_entity** | Если access_hash нет в БД — автоматический resolve через `get_entity(PeerChannel())` |
+| **Adaptive Rate Limiter** | Динамическая задержка: 0.5–30 сек по реакции Telegram |
+| **Circuit Breaker** | 3 ошибки → канал пропускается 30 минут |
+| **🗑 Очистить все** | Кнопка в вебе — очистка базы с защитой от двойного нажатия и крона |
+| **Auto-migration** | Парсер сам добавляет колонки в БД при старте |
+
+---
+
+## Как добавить канал (важно!)
+
+### Поддерживаемые форматы
+
+| Формат | Пример | Результат |
+|--------|--------|-----------|
+| Telegram Web | `https://web.telegram.org/a/#-740684703` | ✅ Канал `-100740684703` |
+| t.me ссылка | `https://t.me/c/3147415698` | ✅ Канал `-1003147415698` |
+| Username | `@markettwits` или `markettwits` | ✅ Публичный канал |
+| Numeric ID | `3147415698` | ✅ Канал `-1003147415698` |
+
+### Пошагово
+
+1. Открой **/channels** в вебе
+2. Вставь ссылку или ID в поле
+3. Нажми **"+ Добавить канал"**
+4. Нажми **"🔄 Запустить парсинг"**
+
+### ⚠️ Если парсинг не работает
+
+**Симптом:** `Канал не имеет access_hash` или `NOT found in get_dialogs()`
+
+**Решение:**
+```
+1. Удалите канал (🗑 напротив канала в списке)
+2. Добавьте заново по ссылке из Telegram Web
+3. Запустите парсинг 🔄
+```
+
+**Почему:** Telegram ID каналов должен быть в формате `-100XXXXXXX`. 
+Если ID без `-100` (например просто `-740684703`), `get_dialogs()` 
+не находит канал — нужен правильный формат.
+
+---
 
 ## Архитектура
 
@@ -29,27 +65,34 @@
               │              │              │
      ┌────────▼──────┐ ┌────▼──────┐ ┌────▼──────┐
      │   citg-web    │ │ citg-cron │ │  cleanup  │
-     │   FastAPI     │ │  parser   │ │  (ручная) │
-     │   :10000      │ │ */20 min  │ │  🗑 btn   │
+     │   FastAPI     │ │  parser   │ │  🗑 btn   │
+     │   :10000      │ │ */20 min  │ │           │
      │               │ │           │ │           │
-     │  Dashboard    │ │ 20 ch     │ │ TRUNCATE  │
-     │  Auth         │ │ sequential│ │  all data │
+     │  Dashboard    │ │ 20 ch     │ │ DELETE    │
+     │  Auth         │ │ seqential │ │  per tbl  │
      └───────────────┘ └───────────┘ └───────────┘
 ```
 
-## Безопасность парсинга (почему не банит)
+**Важно:** веб и крон — **разные процессы**. Оба подключаются к одной БД.
+
+---
+
+## Безопасность парсинга
 
 | Защита | Как работает |
 |--------|-------------|
-| `get_dialogs()` → кэш | Один bulk call на старте, потом 0 `get_entity()` |
-| `InputPeerChannel` из БД | `access_hash` кэшируется между запусками |
-| `message.post_author` | Имя автора без API-вызова (не `message.sender`) |
+| `get_dialogs()` → кэш | Один bulk call, потом 0 `get_entity()` для известных каналов |
+| `access_hash` в БД | Кэшируется между запусками, не теряется при рестарте |
+| `InputPeerChannel` из БД | Без `get_entity()` — напрямую из кэша |
+| `message.post_author` | Имя автора поста без API-вызова |
+| `message.sender_id` | Для чатов — ID без resolve |
 | Cron `*/20 * * * *` | Не чаще раза в 20 минут |
-| Sequential (1 канал) | Не параллельно — последовательно |
-| Jitter 0-10 сек | Случайные задержки между каналами |
-| Adaptive delay | 0.5-30 сек адаптивно по реакции Telegram |
-| Circuit breaker | 3 ошибки → 30 мин паузы для канала |
-| Global cooldown | FloodWait > 60сек → остановка 30 мин |
+| Sequential | 1 канал за раз, не параллельно |
+| Jitter 0–10 сек | Случайные задержки между каналами |
+| Adaptive delay | 0.5–30 сек по реакции Telegram |
+| FloodWait → cooldown | При >60 сек — глобальная пауза 30 мин |
+
+---
 
 ## Deploy на Render
 
@@ -60,14 +103,13 @@
 - Plan: **Starter**
 - Скопируй Internal Database URL
 
-### 2. Web Service (дашборд)
+### 2. Web Service
 
 **New → Web Service**
-- Source: GitHub → `Ci_TG_Parser`
+- GitHub → `Ci_TG_Parser`
 - Branch: **`v2-citg-rebrand`**
 - Runtime: **Docker**
 - Name: `citg-web`
-- Plan: **Starter**
 
 **Env vars:**
 ```
@@ -83,10 +125,10 @@ TG_API_HASH=<твой API hash>
 TG_STRING_SESSION=<строка сессии>
 ```
 
-### 3. Cron Job (парсер)
+### 3. Cron Job
 
 **New → Cron Job**
-- Source: GitHub → `Ci_TG_Parser`
+- GitHub → `Ci_TG_Parser`
 - Branch: `v2-citg-rebrand`
 - Runtime: **Docker**
 - Name: `citg-cron`
@@ -102,12 +144,7 @@ BATCH_COMMIT_SIZE=50
 JITTER_SEC=10
 ```
 
-**Secrets:**
-```
-TG_API_ID=<твой API ID>
-TG_API_HASH=<твой API hash>
-TG_STRING_SESSION=<строка сессии>
-```
+**Secrets:** (те же что и для веба)
 
 ### 4. Генерация TG_STRING_SESSION
 
@@ -117,92 +154,53 @@ python generate_session.py
 # Введи номер → код из Telegram → скопируй строку
 ```
 
-### 5. Миграция БД (автоматическая)
+### 5. Миграция БД
 
-Парсер сам добавляет недостающие колонки при старте:
-- `channels.access_hash` — кэш для `InputPeerChannel`
-- `channels.entity_resolved_at` — когда обновлён кэш
-- `parse_state` — таблица состояния парсера
+Парсер сам добавляет колонки при старте. Ручной SQL не нужен.
 
-Не нужен ручной SQL!
+---
 
-### 6. Добавление каналов
+## FAQ
 
-1. Открой `/channels` в вебе
-2. Введи username или numeric ID канала
-3. Нажми **"+ Добавить канал"**
-4. Нажми **"🔄 Запустить парсинг"**
+### Парсинг долго ждёт на `get_dialogs()`
 
-## Управление каналами
+**Нормально.** Telegram возвращает `FloodWait` на `get_dialogs()` при частых запросах. Парсер ждёт автоматически (видно в логах: `Sleeping for 23s on GetDialogsRequest flood wait`).
 
-### Через веб (/channels)
+### `Entity is not a Channel` или `Could not find the input entity`
 
-| Кнопка | Действие |
-|--------|----------|
-| **+ Добавить канал** | Добавить по username/numeric ID |
-| **🔄 Запустить парсинг** | Запустить парсер вручную |
-| **🗑 Очистить все** | Удалить ВСЕ каналы, посты, логи (конфирм) |
+Канал добавлен с неправильным ID. Удалите и добавьте заново по ссылке из Telegram Web.
 
-### Очистка базы
+### Кнопка 🗑 не очищает базу
 
-**🗑 Очистить все:**
-1. `confirm()` диалог — подтверждение
-2. Проверка — не идёт ли парсинг (крон заблокирован)
-3. Фоновая очистка через `DELETE FROM`
-4. Крон пропускает прогон пока идёт очистка
-5. Страница перезагружается автоматически
+Проверьте логи. Очистка идёт по одной таблице за раз с паузой 1 секунда. Если PostgreSQL ушёл в recovery — подождите 30 секунд и попробуйте снова.
 
-## API Endpoints
+### Крон и 🗑 одновременно
+
+Кнопка 🗑 блокирует крон через `parse_state.global_lock`. Крон пропустит прогон если идёт очистка.
+
+---
+
+## API
 
 ```bash
 # Добавить канал
-curl -u "vlad:!1234567890" \
-  "https://your-app.onrender.com/api/channel/add?identifier=3147415698"
+curl -u "vlad:pass" "https://.../api/channel/add?identifier=-740684703"
 
 # Список каналов
-curl -u "vlad:!1234567890" \
-  "https://your-app.onrender.com/api/channels"
+curl -u "vlad:pass" "https://.../api/channels"
 
 # Запустить парсинг
-curl -u "vlad:!1234567890" \
-  "https://your-app.onrender.com/api/parse/trigger"
+curl -u "vlad:pass" "https://.../api/parse/trigger"
 
 # Статус парсинга
-curl -u "vlad:!1234567890" \
-  "https://your-app.onrender.com/api/parse/status"
+curl -u "vlad:pass" "https://.../api/parse/status"
 
 # Очистить все данные
-curl -u "vlad:!1234567890" -X POST \
-  "https://your-app.onrender.com/api/channel/clear-all"
+curl -u "vlad:pass" -X POST "https://.../api/channel/clear-all"
 ```
 
-## Мониторинг
-
-### Веб-статус
-- `/api/parse/status` — текущий прогресс парсинга
-- `/api/clear-all/status` — статус очистки
-- `/api/stats` — общая статистика
-
-### Логи Render
-```
-[citg-cron] Каналов к парсингу: 20
-[citg-cron] Обработано=150, Новых=12, Ошибок=0
-[citg-cron] RateLimiter: delay=1.2s, flood_waits=0
-[citg-cron] CircuitBreaker: global_cooldown=False
-```
-
-### SQL (если нужно)
-```sql
--- Сколько каналов
-SELECT COUNT(*) FROM channels WHERE is_active = TRUE;
-
--- Сколько постов
-SELECT COUNT(*) FROM posts;
-
--- Когда последний прогон
-SELECT * FROM parse_state;
-```
+---
 
 ## Стек
 
-Python 3.11, FastAPI, SQLAlchemy 2.0 async, Telethon (MTProto), PostgreSQL 16, ECharts 5.5, Docker
+Python 3.11, FastAPI, SQLAlchemy 2.0 async, Telethon (MTProto), PostgreSQL 16, Docker
