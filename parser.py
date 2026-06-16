@@ -546,31 +546,32 @@ class MultiChannelParser:
             await asyncio.sleep(0.5)
 
             # --- Итерируем сообщения (по ID канала, без повторного get_entity) ---
-            # Private channels (no username) MUST use PeerChannel.
-            # PeerChannel expects bare channel_id (without -100 prefix).
-            # DB may store telegram_id as positive (old) or negative (new).
-            if not channel.username:
-                from telethon.tl.types import PeerChannel
+            # CRITICAL: Telethon needs entity in session cache for iter_messages.
+            # We call get_entity() ONCE per channel, then it's cached in .session file.
+            #
+            # For public channels: use username (most reliable)
+            # For private channels: use PeerChannel with bare channel_id
+            from telethon.tl.types import PeerChannel
+            
+            if channel.username:
+                # Public channel — username is most reliable identifier
+                entity_id = channel.username
+                logger.info("[%s] Public → entity by username: @%s", username, channel.username)
+            else:
+                # Private channel — use PeerChannel with bare channel_id
                 if channel.telegram_id > 0:
-                    # Bare positive ID in DB → use directly as channel_id
                     channel_id = channel.telegram_id
                 else:
-                    # Negative ID (-100...) → strip to get bare channel_id
                     channel_id = abs(channel.telegram_id) % 1_000_000_000_000
                 entity_id = PeerChannel(channel_id)
                 logger.info("[%s] Private → PeerChannel(%s) [DB tid=%s]", username, channel_id, channel.telegram_id)
-            else:
-                # Public channel — use username/telegram_id directly
-                entity_id = channel.telegram_id
-                logger.info("[%s] Public → entity_id=%s", username, entity_id)
             
-            # Resolve entity for private channels (Telethon needs it in cache)
-            if not channel.username:
-                try:
-                    resolved = await client.get_entity(entity_id)
-                    logger.info("[%s] Entity resolved: %s", username, resolved.title)
-                except Exception as resolve_err:
-                    logger.warning("[%s] get_entity failed: %s — trying iter_messages anyway", username, resolve_err)
+            # Resolve entity — this caches it in Telethon session
+            try:
+                resolved = await client.get_entity(entity_id)
+                logger.info("[%s] Entity cached: %s", username, resolved.title)
+            except Exception as resolve_err:
+                logger.warning("[%s] get_entity failed: %s", username, resolve_err)
 
             msg_counter = 0
             total_messages = 0
