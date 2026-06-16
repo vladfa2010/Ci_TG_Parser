@@ -553,7 +553,11 @@ class ChannelResolver:
             )
             return channels
 
-    async def build_input_peer(self, channel: Any) -> InputPeerChannel:
+    async def build_input_peer(self, channel: Any):
+        """Построить input peer для канала или чата.""
+
+        Returns InputPeerChannel для каналов, InputPeerChat для чатов."""
+        from telethon.tl.types import InputPeerChat
         """Построить InputPeerChannel из кэша БД — с fallback на get_entity()."""
         if not channel.access_hash:
             # Fallback: попытаться получить access_hash через get_entity
@@ -583,6 +587,13 @@ class ChannelResolver:
                     f"Канал {channel.id} ({channel.title}) не имеет access_hash "
                     f"и fallback get_entity() тоже не сработал: {e}"
                 )
+
+        # Чаты (не каналы) — используем InputPeerChat
+        if getattr(channel, 'channel_type', None) == 'chat' or not channel.access_hash:
+            # Для чатов: telegram_id это chat_id (обычно отрицательный)
+            chat_id = abs(channel.telegram_id) if channel.telegram_id < 0 else channel.telegram_id
+            # Для чатов access_hash не нужен
+            return InputPeerChat(chat_id)
 
         channel_id = normalize_channel_id(channel.telegram_id)
         return InputPeerChannel(channel_id, channel.access_hash)
