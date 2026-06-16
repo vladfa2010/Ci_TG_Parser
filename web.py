@@ -2291,14 +2291,22 @@ async function clearAll(){
       btn.textContent='🗑 Очистить все';
       return;
     }
-    $('parse-status').textContent='⏳ Очищаем базу (ждите)...';
+    $('parse-status').textContent='⏳ Очищаем базу...';
     var r=await fetch('/api/channel/clear-all',{method:'POST',cache:'no-store',credentials:'include'});
     var data=await r.json();
-    btn.disabled=false;
-    btn.textContent='🗑 Очистить все';
-    if(!data.success){$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown'); return;}
-    $('parse-status').textContent='✅ База очищена. Перезагрузка...';
-    setTimeout(function(){location.reload();}, 1500);
+    if(!data.success){$('parse-status').textContent='❌ Ошибка: '+(data.error||'unknown'); btn.disabled=false; btn.textContent='🗑 Очистить все'; return;}
+    // Limited polling: max 15 attempts (30 sec)
+    var attempts=0;
+    var poll=setInterval(async function(){
+      attempts++;
+      if(attempts>15){clearInterval(poll); $('parse-status').textContent='⌛ Таймаут. Проверьте /api/clear-all/status'; btn.disabled=false; btn.textContent='🗑 Очистить все'; return;}
+      try{var s=await fetch('/api/clear-all/status',{cache:'no-store',credentials:'include'});
+        var st=await s.json();
+        if(st.state.error){clearInterval(poll); $('parse-status').textContent='❌ Ошибка: '+st.state.error; btn.disabled=false; btn.textContent='🗑 Очистить все';}
+        else if(!st.state.running){clearInterval(poll); $('parse-status').textContent='✅ База очищена. Перезагрузка...'; setTimeout(function(){location.reload();}, 1500);}
+        else{$('parse-status').textContent='⏳ Очищаем... ('+attempts+'/15)';}
+      }catch(e){clearInterval(poll); $('parse-status').textContent='❌ Ошибка сети'; btn.disabled=false; btn.textContent='🗑 Очистить все';}
+    }, 2000);
   }catch(e){$('parse-status').textContent='❌ Ошибка сети: '+e; console.error(e); btn.disabled=false; btn.textContent='🗑 Очистить все';}
 }
 
@@ -3146,7 +3154,7 @@ async def _run_clear_all():
 
 @app.post("/api/channel/clear-all", dependencies=[Depends(_get_auth_user)])
 async def api_channel_clear_all():
-    """Очистить ВСЕ данные синхронно (ждём завершения). Макс 60 сек."""
+    """Запустить очистку в фоне через asyncio.create_task."""
     global _clear_all_state
     if _parse_state.get("running"):
         return json_response({"success": False, "error": "Parsing in progress — cannot clear"}, 409)
@@ -3154,27 +3162,34 @@ async def api_channel_clear_all():
         return json_response({"success": False, "error": "Clear already running"}, 409)
 
     _clear_all_state = {"running": True, "started_at": datetime.now(timezone.utc).isoformat(), "error": None}
-    logger.info("[clear-all] Starting synchronous clear...")
+    logger.info("[clear-all] Starting async clear via create_task...")
 
+    # Запускаем в event loop, но не через BackgroundTasks
+    asyncio.create_task(_do_clear_all())
+    return {"success": True, "message": "Очистка запущена...", "check_status": "/api/clear-all/status"}
+
+async def _do_clear_all():
+    """Actual clear logic running in event loop."""
+    global _clear_all_state
     try:
-        # Выполняем очистку прямо тут, не в фоне — надёжнее
-        tables = ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]
-        for table in tables:
+        for table in ["channel_group_members", "channel_errors", "parse_logs", "parse_state", "posts", "channels", "channel_groups"]:
             try:
                 async with engine.begin() as conn:
-                    result = await conn.execute(text(f"DELETE FROM {table}"))
+                    await conn.execute(text(f"DELETE FROM {table}"))
                 logger.info("[clear-all] Deleted from %s", table)
             except Exception as e:
                 logger.warning("[clear-all] Skipped %s: %s", table, e)
-
         logger.info("[clear-all] Complete!")
         _clear_all_state["running"] = False
-        return {"success": True, "message": "✅ База очищена", "reload": True}
     except Exception as e:
         logger.error(f"[clear-all] Error: {e}")
-        _clear_all_state["running"] = False
         _clear_all_state["error"] = str(e)
-        return json_response({"success": False, "error": str(e)}, 500)
+        _clear_all_state["running"] = False
+
+@app.get("/api/clear-all/status")
+async def api_clear_all_status():
+    """Статус очистки."""
+    return {"state": _clear_all_state}
 
 
 # ─── API: Cross-Channel comparison (v2) ──────────────────────
