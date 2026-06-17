@@ -377,6 +377,117 @@ class CircuitBreaker:
         }
 
 
+# ─── SenderResolver ─────────────────────────────────────────
+
+class SenderResolver:
+    """Resolve sender names via PostgreSQL cache + get_entity() fallback.
+
+    Priority:
+      1. msg.post_author (channels — already have author name)
+      2. Memory cache (already resolved in this run)
+      3. DB cache (resolved in previous runs)
+      4. get_entity() API call → save to DB + memory cache
+
+    All API calls go through AdaptiveRateLimiter to avoid FloodWait.
+    """
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        db_session_factory: async_sessionmaker,
+        rate_limiter: AdaptiveRateLimiter,
+    ) -> None:
+        self.client = client
+        self.db_factory = db_session_factory
+        self.rate_limiter = rate_limiter
+        self._memory_cache: dict[int, str] = {}  # Local cache per run
+
+    async def get_sender_name(self, msg: Message) -> Optional[str]:
+        """Get sender name for a message using the 4-tier cache."""
+        # Tier 1: Channels have post_author directly
+        if msg.post_author:
+            return msg.post_author
+
+        sender_id = msg.sender_id
+        if not sender_id:
+            return None
+
+        # Tier 2: Memory cache (fastest, per-run)
+        if sender_id in self._memory_cache:
+            return self._memory_cache[sender_id]
+
+        # Lazy import models to avoid circular deps
+        try:
+            from models import Sender as DbSender
+        except ImportError:
+            return str(sender_id)  # Fallback: just the ID
+
+        try:
+            async with self.db_factory() as session:
+                # Tier 3: DB cache (survives container restarts)
+                result = await session.execute(
+                    select(DbSender).where(DbSender.telegram_user_id == sender_id)
+                )
+                db_sender = result.scalar_one_or_none()
+
+                if db_sender:
+                    name = db_sender.display_name
+                    self._memory_cache[sender_id] = name
+                    return name
+
+                # Tier 4: API call — resolve via get_entity with rate limit
+                try:
+                    await self.rate_limiter.before_call()
+                    entity = await self.client.get_entity(sender_id)
+                    self.rate_limiter.on_success()
+
+                    db_sender = DbSender(
+                        telegram_user_id=sender_id,
+                        first_name=getattr(entity, "first_name", None),
+                        last_name=getattr(entity, "last_name", None),
+                        username=getattr(entity, "username", None),
+                    )
+                    session.add(db_sender)
+                    await session.commit()
+
+                    name = db_sender.display_name
+                    self._memory_cache[sender_id] = name
+                    logger.info(
+                        "[sender] Resolved %d → '%s' (@%s)",
+                        sender_id,
+                        name,
+                        db_sender.username or "n/a",
+                    )
+                    return name
+
+                except FloodWaitError as e:
+                    self.rate_limiter.on_flood_wait(e.seconds)
+                    logger.warning(
+                        "[sender] FloodWait %d сек при resolve %d",
+                        e.seconds,
+                        sender_id,
+                    )
+                    return str(sender_id)
+
+                except Exception as e:
+                    logger.warning(
+                        "[sender] Failed to resolve %d: %s",
+                        sender_id,
+                        e,
+                    )
+                    return str(sender_id)
+
+        except Exception as e:
+            logger.warning("[sender] DB error for %d: %s", sender_id, e)
+            return str(sender_id)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return cache statistics."""
+        return {
+            "memory_cache_size": len(self._memory_cache),
+        }
+
+
 # ─── ChannelResolver ────────────────────────────────────────
 
 class ChannelResolver:
@@ -553,11 +664,13 @@ class ChannelParser:
         db_session_factory: async_sessionmaker,
         rate_limiter: AdaptiveRateLimiter,
         batch_size: int = 50,
+        sender_resolver: Optional["SenderResolver"] = None,
     ) -> None:
         self.client = client
         self.db_factory = db_session_factory
         self.rate_limiter = rate_limiter
         self.batch_size = batch_size
+        self.sender_resolver = sender_resolver
 
     async def parse(
         self,
@@ -648,6 +761,17 @@ class ChannelParser:
                 if msg.id in existing_msg_ids:
                     continue
 
+                # Resolve sender name (channels: post_author, chats: cache/API)
+                sender_name = msg.post_author
+                sender_telegram_id = None
+                if not sender_name and self.sender_resolver:
+                    try:
+                        sender_name = await self.sender_resolver.get_sender_name(msg)
+                        sender_telegram_id = msg.sender_id
+                    except Exception as e:
+                        logger.debug("[parse] Sender resolve error: %s", e)
+                        sender_name = None
+
                 # Собираем данные (не создаём SQLAlchemy объект — просто dict)
                 raw_posts.append({
                     "telegram_message_id": msg.id,
@@ -667,7 +791,8 @@ class ChannelParser:
                         msg.forward.chat.username or msg.forward.chat.title
                         if msg.forward and msg.forward.chat else None
                     ),
-                    "sender_name": msg.post_author,
+                    "sender_name": sender_name,
+                    "sender_telegram_id": sender_telegram_id,
                     "has_media": msg.media is not None,
                     "media_type": get_media_type(msg),
                     "published_at": msg.date,
@@ -906,9 +1031,11 @@ class MultiChannelParser:
 
         # Компоненты
         self._resolver = ChannelResolver(client, self._db_factory)
+        sender_resolver = SenderResolver(client, self._db_factory, self._rate_limiter)
         self._parser = ChannelParser(
             client, self._db_factory,
             self._rate_limiter, self.batch_size,
+            sender_resolver=sender_resolver,
         )
 
         results: dict[int, ParseResult] = {}
