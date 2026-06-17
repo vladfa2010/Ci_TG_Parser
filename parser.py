@@ -377,6 +377,117 @@ class CircuitBreaker:
         }
 
 
+# ─── SenderResolver ─────────────────────────────────────────
+
+class SenderResolver:
+    """Resolve sender names via PostgreSQL cache + get_entity() fallback.
+
+    Priority:
+      1. msg.post_author (channels — already have author name)
+      2. Memory cache (already resolved in this run)
+      3. DB cache (resolved in previous runs)
+      4. get_entity() API call → save to DB + memory cache
+
+    All API calls go through AdaptiveRateLimiter to avoid FloodWait.
+    """
+
+    def __init__(
+        self,
+        client: TelegramClient,
+        db_session_factory: async_sessionmaker,
+        rate_limiter: AdaptiveRateLimiter,
+    ) -> None:
+        self.client = client
+        self.db_factory = db_session_factory
+        self.rate_limiter = rate_limiter
+        self._memory_cache: dict[int, str] = {}  # Local cache per run
+
+    async def get_sender_name(self, msg: Message) -> Optional[str]:
+        """Get sender name for a message using the 4-tier cache."""
+        # Tier 1: Channels have post_author directly
+        if msg.post_author:
+            return msg.post_author
+
+        sender_id = msg.sender_id
+        if not sender_id:
+            return None
+
+        # Tier 2: Memory cache (fastest, per-run)
+        if sender_id in self._memory_cache:
+            return self._memory_cache[sender_id]
+
+        # Lazy import models to avoid circular deps
+        try:
+            from models import Sender as DbSender
+        except ImportError:
+            return str(sender_id)  # Fallback: just the ID
+
+        try:
+            async with self.db_factory() as session:
+                # Tier 3: DB cache (survives container restarts)
+                result = await session.execute(
+                    select(DbSender).where(DbSender.telegram_user_id == sender_id)
+                )
+                db_sender = result.scalar_one_or_none()
+
+                if db_sender:
+                    name = db_sender.display_name
+                    self._memory_cache[sender_id] = name
+                    return name
+
+                # Tier 4: API call — resolve via get_entity with rate limit
+                try:
+                    await self.rate_limiter.before_call()
+                    entity = await self.client.get_entity(sender_id)
+                    self.rate_limiter.on_success()
+
+                    db_sender = DbSender(
+                        telegram_user_id=sender_id,
+                        first_name=getattr(entity, "first_name", None),
+                        last_name=getattr(entity, "last_name", None),
+                        username=getattr(entity, "username", None),
+                    )
+                    session.add(db_sender)
+                    await session.commit()
+
+                    name = db_sender.display_name
+                    self._memory_cache[sender_id] = name
+                    logger.info(
+                        "[sender] Resolved %d → '%s' (@%s)",
+                        sender_id,
+                        name,
+                        db_sender.username or "n/a",
+                    )
+                    return name
+
+                except FloodWaitError as e:
+                    self.rate_limiter.on_flood_wait(e.seconds)
+                    logger.warning(
+                        "[sender] FloodWait %d сек при resolve %d",
+                        e.seconds,
+                        sender_id,
+                    )
+                    return str(sender_id)
+
+                except Exception as e:
+                    logger.warning(
+                        "[sender] Failed to resolve %d: %s",
+                        sender_id,
+                        e,
+                    )
+                    return str(sender_id)
+
+        except Exception as e:
+            logger.warning("[sender] DB error for %d: %s", sender_id, e)
+            return str(sender_id)
+
+    def get_stats(self) -> dict[str, Any]:
+        """Return cache statistics."""
+        return {
+            "memory_cache_size": len(self._memory_cache),
+        }
+
+
 # ─── ChannelResolver ────────────────────────────────────────
 
 class ChannelResolver:
@@ -470,21 +581,9 @@ class ChannelResolver:
                 db_ch = result.scalar_one_or_none()
 
         if db_ch is None:
-            db_ch = DbChannel(
-                telegram_id=telegram_id,
-                numeric_id=channel_id,
-                channel_type="private" if not username else "public",
-                username=username,
-                title=title,
-                is_active=True,
-                access_hash=access_hash,
-                entity_resolved_at=utc_now(),
-            )
-            session.add(db_ch)
-            logger.info(
-                "[resolver] Новый канал: %s (tid=%d, access_hash=%d)",
-                title, telegram_id, access_hash,
-            )
+            # НЕ создаём новые каналы — только обновляем существующие
+            logger.debug("[resolver] Пропуск: %s (tid=%d) не в БД", title, telegram_id)
+            return  # ← ВАЖНО: не создаём!
         else:
             db_ch.title = title
             db_ch.username = username
@@ -511,25 +610,46 @@ class ChannelResolver:
             )
             return list(result.scalars().all())
 
-    async def build_input_peer(self, channel: Any) -> InputPeerChannel:
-        """Построить InputPeerChannel из кэша БД — БЕЗ API call.
-
-        Args:
-            channel: Экземпляр модели Channel из БД.
-
-        Returns:
-            InputPeerChannel готовый для iter_messages().
-
-        Raises:
-            ValueError: Если access_hash отсутствует.
+    async def build_input_peer(self, channel: Any):
+        """Построить input peer. Chat первым — порядок ВАЖЕН.
+        
+        Chat (basic group): telegram_id > 0 → InputPeerChat (no access_hash)
+        Channel: telegram_id < 0 → InputPeerChannel (needs access_hash)
         """
+        from telethon.tl.types import InputPeerChat
+        
+        tid = channel.telegram_id
+        
+        # === 1. Chat (basic group) — telegram_id is positive ===
+        if tid is not None and tid > 0:
+            logger.info("[resolver] InputPeerChat(chat_id=%d) для '%s' [Chat]", tid, channel.title)
+            return InputPeerChat(tid)
+        
+        # === 2. Channel — needs access_hash ===
         if not channel.access_hash:
-            raise ValueError(
-                f"Канал {channel.id} ({channel.title}) не имеет access_hash. "
-                f"Запустите sync_dialogs() сначала."
-            )
-
-        channel_id = normalize_channel_id(channel.telegram_id)
+            logger.warning("[resolver] '%s' tid=%d: нет access_hash, fallback...", channel.title, tid)
+            try:
+                from telethon.tl.types import PeerChannel
+                entity = await self.client.get_entity(PeerChannel(abs(tid) % 1_000_000_000_000))
+                if isinstance(entity, TlChannel):
+                    channel.access_hash = entity.access_hash
+                    channel.entity_resolved_at = utc_now()
+                    async with self.db_factory() as session:
+                        result = await session.execute(
+                            select(type(channel)).where(type(channel).id == channel.id)
+                        )
+                        db_ch = result.scalar_one()
+                        db_ch.access_hash = entity.access_hash
+                        db_ch.entity_resolved_at = utc_now()
+                        await session.commit()
+                    logger.info("[resolver] Got access_hash для '%s'", channel.title)
+                else:
+                    raise ValueError(f"Entity is {type(entity).__name__}, not Channel")
+            except Exception as e:
+                raise ValueError(f"'{channel.title}' (tid={tid}): нет access_hash, ошибка: {e}")
+        
+        channel_id = normalize_channel_id(tid)
+        logger.debug("[resolver] InputPeerChannel(id=%d) для '%s'", channel_id, channel.title)
         return InputPeerChannel(channel_id, channel.access_hash)
 
 
@@ -544,16 +664,18 @@ class ChannelParser:
         db_session_factory: async_sessionmaker,
         rate_limiter: AdaptiveRateLimiter,
         batch_size: int = 50,
+        sender_resolver: Optional["SenderResolver"] = None,
     ) -> None:
         self.client = client
         self.db_factory = db_session_factory
         self.rate_limiter = rate_limiter
         self.batch_size = batch_size
+        self.sender_resolver = sender_resolver
 
     async def parse(
         self,
         channel: Any,
-        input_peer: InputPeerChannel,
+        input_peer: Any,  # InputPeerChannel | InputPeerChat
     ) -> ParseResult:
         """Парсит один канал инкрементально.
 
@@ -639,6 +761,17 @@ class ChannelParser:
                 if msg.id in existing_msg_ids:
                     continue
 
+                # Resolve sender name (channels: post_author, chats: cache/API)
+                sender_name = msg.post_author
+                sender_telegram_id = None
+                if not sender_name and self.sender_resolver:
+                    try:
+                        sender_name = await self.sender_resolver.get_sender_name(msg)
+                        sender_telegram_id = msg.sender_id
+                    except Exception as e:
+                        logger.debug("[parse] Sender resolve error: %s", e)
+                        sender_name = None
+
                 # Собираем данные (не создаём SQLAlchemy объект — просто dict)
                 raw_posts.append({
                     "telegram_message_id": msg.id,
@@ -658,7 +791,8 @@ class ChannelParser:
                         msg.forward.chat.username or msg.forward.chat.title
                         if msg.forward and msg.forward.chat else None
                     ),
-                    "sender_name": msg.post_author,
+                    "sender_name": sender_name,
+                    "sender_telegram_id": sender_telegram_id,
                     "has_media": msg.media is not None,
                     "media_type": get_media_type(msg),
                     "published_at": msg.date,
@@ -807,6 +941,7 @@ class MultiChannelParser:
         self._circuit: Optional[CircuitBreaker] = None
         self._resolver: Optional[ChannelResolver] = None
         self._parser: Optional[ChannelParser] = None
+        self._progress_callback: Optional[Callable[..., None]] = None
 
     # ─── Lifecycle ──────────────────────────────────────────
 
@@ -896,9 +1031,11 @@ class MultiChannelParser:
 
         # Компоненты
         self._resolver = ChannelResolver(client, self._db_factory)
+        sender_resolver = SenderResolver(client, self._db_factory, self._rate_limiter)
         self._parser = ChannelParser(
             client, self._db_factory,
             self._rate_limiter, self.batch_size,
+            sender_resolver=sender_resolver,
         )
 
         results: dict[int, ParseResult] = {}
@@ -965,6 +1102,15 @@ class MultiChannelParser:
                     else:
                         self._circuit.on_channel_success(channel.id)
                         self._rate_limiter.on_success()
+                    
+                    # Callback: прогресс после каждого канала
+                    if self._progress_callback:
+                        self._progress_callback(
+                            increment_channels_done=1,
+                            increment_posts_new=result.new,
+                            increment_posts_parsed=result.parsed,
+                            current_channel=channel.title or str(channel.id),
+                        )
 
                 except GlobalCooldownError as e:
                     # Глобальный cooldown — останавливаем весь прогон
@@ -1021,6 +1167,18 @@ class MultiChannelParser:
         await self._save_run_state(len(results), total_new, duration_sec, total_errors)
 
         return results
+
+    async def parse_all(self, history: bool = False) -> dict[int, ParseResult]:
+        """API для web.py: запускает run_once() с прогресс-колбэком.
+
+        Args:
+            history: Если True — игнорируется (v3 всегда инкрементальный).
+
+        Returns:
+            dict[int, ParseResult]: результаты по каналам.
+        """
+        logger.info("[parse_all] Запуск из web.py (history=%s)", history)
+        return await self.run_once()
 
     async def run_scheduled(self) -> None:
         """Периодический запуск парсера."""
