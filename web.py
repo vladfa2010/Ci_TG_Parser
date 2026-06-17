@@ -183,6 +183,21 @@ async def _ensure_db():
                 _sender_name_ok = False
                 logger.warning("[migrate] posts.sender_name check failed, will use NULL")
 
+            # Migration: add sender_telegram_id to posts if missing
+            try:
+                result = await conn.execute(text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'posts' AND column_name = 'sender_telegram_id'
+                """))
+                if not result.fetchone():
+                    await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                    await conn.execute(text(
+                        "ALTER TABLE posts ADD COLUMN sender_telegram_id BIGINT"
+                    ))
+                    logger.info("[migrate] posts.sender_telegram_id column added")
+            except Exception:
+                logger.warning("[migrate] posts.sender_telegram_id check failed")
+
         async with async_session() as session:
             # Reactivate all channels once on startup (recovers from auto-deactivation bug)
             result = await session.execute(
@@ -573,7 +588,7 @@ setTimeout(hideLoader,6000);
 function showError(id,msg){$(id).innerHTML='<div class="err"><h3>Failed to load</h3><p>'+esc(msg)+'</p><button onclick="location.reload()">Reload Page</button></div>';hideLoader()}
 function esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function fmt(n){return(n||0).toLocaleString('en').replace(/,/g,' ')}
-function fmtViews(n){n=n||0;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
+function fmtViews(n){n=n||0;if(n===0)return'—';if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n)}
 
 var _postAbort=null;
 async function api(path,attempt){attempt=attempt||1;try{var r=await fetch('/api'+path,{cache:'no-store',credentials:'include'});if(!r.ok)throw new Error('HTTP '+r.status);var d=await r.json();if(d.error)throw new Error(d.error);return d}catch(e){if(attempt<3){await new Promise(function(r){setTimeout(r,1000*attempt)});return api(path,attempt+1)}throw e}}
@@ -632,7 +647,7 @@ window.loadPosts=loadPosts;
         var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');
         var chUrl=p.numeric_id?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';
         var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'channel';
-        return'<div class="post"><div class="post-head"><span style="color:#64748b">#'+p.id+'</span><a class="post-ch" href="'+chUrl+'" target="_blank" title="'+esc(chLabel)+'">'+esc(p.channel_title||chLabel)+'</a>'+(p.sender_name?'<span class="post-sender">by '+esc(p.sender_name)+'</span>':'')+'<span style="color:#00d4aa;font-weight:600">'+fmtViews(p.views)+'</span><span style="color:#64748b;font-size:12px">'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>';
+        return'<div class="post"><div class="post-head"><span style="color:#64748b">#'+p.id+'</span><a class="post-ch" href="'+chUrl+'" target="_blank" title="'+esc(chLabel)+'">'+esc(p.channel_title||chLabel)+'</a>'+(p.sender_name?'<span class="post-sender">by '+esc(p.sender_name)+'</span>':p.sender_telegram_id?'<span class="post-sender">User '+p.sender_telegram_id+'</span>':'')+'<span style="color:#00d4aa;font-weight:600">'+fmtViews(p.views)+'</span><span style="color:#64748b;font-size:12px">'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>';
       }).join('');
     }
     $('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+(chCount===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';
@@ -3384,7 +3399,7 @@ async def api_posts(
             
             result = await session.execute(text(f"""
                 SELECT p.telegram_message_id, p.text, p.views_count,
-                       p.hashtags, p.published_at,
+                       p.hashtags, p.published_at, p.sender_telegram_id,
                        {sql_sender},
                        c.username as channel_username, c.title as channel_title,
                        c.channel_type, c.numeric_id
@@ -3403,6 +3418,7 @@ async def api_posts(
                     "hashtags": r["hashtags"] or [],
                     "published": r["published_at"].isoformat() if r["published_at"] else None,
                     "sender_name": r["sender_name"],
+                    "sender_telegram_id": r["sender_telegram_id"],
                     "channel_username": r["channel_username"],
                     "channel_title": r["channel_title"],
                     "channel_type": r["channel_type"],
