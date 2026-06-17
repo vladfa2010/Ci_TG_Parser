@@ -249,6 +249,71 @@ class Channel(Base):
         )
 
 
+class Sender(Base):
+    """Cache of Telegram user names for resolving message senders.
+
+    For channels (Channel), sender_name comes from msg.post_author directly.
+    For chats (Chat), msg.post_author is None — we resolve the sender
+    via get_entity(sender_id) and cache the result here.
+
+    Attributes:
+        telegram_user_id: Telegram's numeric user ID (primary key).
+        first_name: User's first name.
+        last_name: User's last name.
+        username: Telegram @username.
+        resolved_at: When this record was created/updated (UTC).
+    """
+
+    __tablename__ = "senders"
+
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        comment="Telegram numeric user ID",
+    )
+    first_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="User first name",
+    )
+    last_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="User last name",
+    )
+    username: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="Telegram @username",
+    )
+    resolved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        comment="When this sender was resolved (UTC)",
+    )
+
+    @property
+    def display_name(self) -> str:
+        """Return a human-readable name for this sender.
+
+        Priority: full name > first name > @username > ID fallback.
+        """
+        if self.first_name and self.last_name:
+            return f"{self.first_name} {self.last_name}"
+        if self.first_name:
+            return self.first_name
+        if self.username:
+            return f"@{self.username}"
+        return f"ID:{self.telegram_user_id}"
+
+    def __repr__(self) -> str:
+        return (
+            f"<Sender(telegram_user_id={self.telegram_user_id}, "
+            f"display_name={self.display_name!r})>"
+        )
+
+
 class Post(Base):
     """Telegram post / message extracted from a channel.
 
@@ -266,6 +331,7 @@ class Post(Base):
         urls: List of URLs extracted from the text.
         forward_from: Original source if this post is a forward.
         sender_name: Name of the sender (post_author from Telegram).
+        sender_telegram_id: Numeric ID of the sender (for cache lookups).
         has_media: Whether the post contains media.
         media_type: Type of media (photo, video, document, etc.).
         published_at: When the post was published (UTC).
@@ -338,6 +404,11 @@ class Post(Base):
         String(255),
         nullable=True,
         comment="Name of the sender (user or channel that posted the message)",
+    )
+    sender_telegram_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="Telegram numeric user ID of the sender (for sender cache)",
     )
     has_media: Mapped[bool] = mapped_column(
         Boolean,
