@@ -1,5 +1,7 @@
 # CITG v3 — Telegram Parser для каналов и чатов
 
+[![GitHub](https://img.shields.io/badge/GitHub-vladfa2010%2FCi__TG__Parser-181717?logo=github)](https://github.com/vladfa2010/Ci_TG_Parser) [![Branch](https://img.shields.io/badge/branch-v2--citg--rebrand-blue)](https://github.com/vladfa2010/Ci_TG_Parser/tree/v2-citg-rebrand)
+
 > Сбор сообщений из Telegram-каналов и чатов в единую ленту. Безопасный парсинг с защитой от FloodWait.
 
 ---
@@ -170,12 +172,66 @@ else:
 | `access_hash` в БД | Кэшируется между запусками (только Channel) |
 | `InputPeerChat` | Для чатов — `access_hash` не нужен |
 | `InputPeerChannel` из БД | Без `get_entity()` для известных каналов |
-| `message.post_author` | Имя автора без API-вызова |
+| `SenderResolver` | Кэш имён отправителей в PostgreSQL (чаты) |
 | Cron `*/20 * * * *` | Не чаще раза в 20 минут |
 | Sequential | 1 канал за раз |
 | Jitter 0–10 сек | Случайные задержки |
 | Adaptive delay | 0.5–30 сек |
 | Circuit breaker | 3 ошибки → 30 мин |
+
+## Sender Name — кто отправил сообщение
+
+| Источник | Каналы (Channel) | Чаты (Chat) |
+|----------|-----------------|-------------|
+| **Механизм** | `message.post_author` | `SenderResolver` (4-уровневый кэш) |
+| **API calls** | 0 | 1 на нового отправителя, 0 на известных |
+| **Где хранится** | `Post.sender_name` | `Post.sender_name` + `senders` таблица |
+
+### 4-уровневый кэш (SenderResolver)
+
+```
+1. msg.post_author ? ──да──→ return (каналы)
+        │
+        нет (чаты)
+        ▼
+2. Memory cache[sender_id] ? ──да──→ return
+        │
+        нет
+        ▼
+3. БД: SELECT senders WHERE telegram_user_id=? ──да──→ кэшируем в memory, return
+        │
+        нет
+        ▼
+4. rate_limiter.before_call()
+   get_entity(sender_id) ──→ INSERT senders ──→ кэшируем, return
+```
+
+### Таблица `senders`
+
+| Колонка | Тип | Описание |
+|---------|-----|----------|
+| `telegram_user_id` | `BIGINT PK` | Telegram ID пользователя |
+| `first_name` | `VARCHAR(255)` | Имя |
+| `last_name` | `VARCHAR(255)` | Фамилия |
+| `username` | `VARCHAR(100)` | @username |
+| `resolved_at` | `TIMESTAMPTZ` | Когда резолвили |
+
+### Почему это важно
+
+В чатах (`Chat`) `message.post_author` всегда `None` — Telegram не передаёт имя автора. Раньше использовался `message.sender` (API call на каждое сообщение) — это вызывал `FloodWait`.
+
+Новый `SenderResolver`:
+- **Первый прогон**: резолвит новых отправителей через `get_entity()` (с rate limiter)
+- **Второй прогон**: **0 API calls** — все имена из memory cache + PostgreSQL
+- **Кэш переживает рестарт** контейнера на Render
+
+### Views (просмотры)
+
+| Тип | Views |
+|-----|-------|
+| Каналы (Channel) | Реальное число из Telegram |
+| Чаты (Chat) | `0` → в вебе отображается как `—` |
+
 
 ---
 
