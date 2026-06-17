@@ -492,14 +492,19 @@ nav a:hover{color:#e2e8f0;background:#1e293b}
 
 /* Posts */
 .posts{display:flex;flex-direction:column;gap:12px}
-.post{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px}
-.post:hover{border-color:#334155}
-.post-head{display:flex;gap:12px;margin-bottom:8px;font-size:13px;color:#64748b;flex-wrap:wrap;align-items:center}
-.post-ch{color:#00d4aa;font-weight:600;text-decoration:none;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.post-ch:hover{text-decoration:underline}
-.post-sender{color:#94a3b8;font-size:12px}
-.post-body{color:#e2e8f0;white-space:pre-wrap;word-break:break-word;line-height:1.6}
-.post-tags{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.post{background:#0f172a;border:1px solid #1e293b;border-radius:14px;padding:18px;transition:border-color .15s,box-shadow .15s}
+.post:hover{border-color:#334155;box-shadow:0 4px 20px rgba(0,212,170,.08)}
+.post-header{margin-bottom:14px}
+.post-meta-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px}
+.post-meta-sub{display:flex;gap:14px;align-items:center;flex-wrap:wrap;color:#64748b;font-size:13px}
+.post-ch{color:#00d4aa;font-weight:700;text-decoration:none;font-size:18px;line-height:1.3;max-width:75%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.post-ch:hover{text-decoration:underline;color:#5eead4}
+.post-sender{color:#cbd5e1;font-size:15px;font-weight:500}
+.post-views{color:#00d4aa;font-weight:700;font-size:16px;white-space:nowrap}
+.post-date{color:#64748b;font-size:13px}
+.post-id{color:#475569;font-size:12px}
+.post-body{color:#e2e8f0;white-space:pre-wrap;word-break:break-word;line-height:1.6;font-size:15px}
+.post-tags{display:flex;gap:6px;margin-top:12px;flex-wrap:wrap}
 .tag{background:#1e293b;color:#00d4aa;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500}
 
 /* Period selector */
@@ -647,7 +652,27 @@ window.loadPosts=loadPosts;
         var tags=(p.hashtags||[]).map(function(t){return'<span class="tag">'+esc(t)+'</span>'}).join('');
         var chUrl=p.numeric_id?'https://t.me/c/'+p.numeric_id+'/'+p.id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.id:'#';
         var chLabel=p.channel_username?'@'+esc(p.channel_username):p.numeric_id?'c/'+p.numeric_id:'channel';
-        return'<div class="post"><div class="post-head"><span style="color:#64748b">#'+p.id+'</span><a class="post-ch" href="'+chUrl+'" target="_blank" title="'+esc(chLabel)+'">'+esc(p.channel_title||chLabel)+'</a>'+(p.sender_name?'<span class="post-sender">by '+esc(p.sender_name)+'</span>':p.sender_telegram_id?'<span class="post-sender">User '+p.sender_telegram_id+'</span>':'')+'<span style="color:#00d4aa;font-weight:600">'+fmtViews(p.views)+'</span><span style="color:#64748b;font-size:12px">'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span></div><div class="post-body">'+esc(p.text||'(no text)')+'</div>'+(tags?'<div class="post-tags">'+tags+'</div>':'')+'</div>';
+        var senderHtml='';
+        if(p.sender_name){
+          senderHtml='<span class="post-sender">'+esc(p.sender_name)+'</span>';
+        }else if(p.sender_telegram_id){
+          senderHtml='<span class="post-sender">User '+p.sender_telegram_id+'</span>';
+        }
+        return'<div class="post">'+
+          '<div class="post-header">'+
+            '<div class="post-meta-top">'+
+              '<a class="post-ch" href="'+chUrl+'" target="_blank" title="'+esc(chLabel)+'">'+esc(p.channel_title||chLabel)+'</a>'+
+              '<span class="post-views">'+fmtViews(p.views)+'</span>'+
+            '</div>'+
+            '<div class="post-meta-sub">'+
+              (senderHtml?'<span>'+senderHtml+'</span>':'')+
+              '<span class="post-date">'+(p.published?p.published.slice(0,16).replace('T',' '):'')+'</span>'+
+              '<span class="post-id">#'+p.id+'</span>'+
+            '</div>'+
+          '</div>'+
+          '<div class="post-body">'+esc(p.text||'(no text)')+'</div>'+
+          (tags?'<div class="post-tags">'+tags+'</div>':'')+
+        '</div>';
       }).join('');
     }
     $('p-page').innerHTML='<button '+(page>1?'onclick="goPage('+(page-1)+')"':'disabled')+'>&larr; Prev</button><span>Page '+page+'</span><button '+(chCount===20?'onclick="goPage('+(page+1)+')"':'disabled')+'>Next &rarr;</button>';
