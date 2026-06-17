@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select, text, BigInteger, Integer, DateTime, Text, String, Boolean, ForeignKey, Index, PrimaryKeyConstraint
+from sqlalchemy import select, text, insert, BigInteger, Integer, DateTime, Text, String, Boolean, ForeignKey, Index, PrimaryKeyConstraint
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -76,6 +76,9 @@ def _get_config():
                 LOG_LEVEL = __import__('os').getenv('LOG_LEVEL', 'INFO')
                 LIMIT = None
                 HISTORY = False
+                HISTORY_BATCH_SIZE = int(__import__('os').getenv('HISTORY_BATCH_SIZE', 5000))
+                HISTORY_MAX_BATCHES_PER_RUN = int(__import__('os').getenv('HISTORY_MAX_BATCHES_PER_RUN', 5))
+                HISTORY_MAX_SECONDS_PER_CHANNEL = int(__import__('os').getenv('HISTORY_MAX_SECONDS_PER_CHANNEL', 900))
                 database_url_async = property(lambda self: self.DATABASE_URL)
                 @property
                 def channels_list(self): return []
@@ -145,6 +148,9 @@ class ParseResult:
     error: Optional[str] = None
     duration_ms: int = 0
     flood_wait_sec: int = 0
+    batches: int = 0
+    oldest_id: Optional[int] = None
+    history_complete: bool = False
 
 
 # ─── AdaptiveRateLimiter ────────────────────────────────────
@@ -665,28 +671,32 @@ class ChannelParser:
         rate_limiter: AdaptiveRateLimiter,
         batch_size: int = 50,
         sender_resolver: Optional["SenderResolver"] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
     ) -> None:
         self.client = client
         self.db_factory = db_session_factory
         self.rate_limiter = rate_limiter
         self.batch_size = batch_size
         self.sender_resolver = sender_resolver
+        self.progress_callback = progress_callback
 
     async def parse(
         self,
         channel: Any,
         input_peer: Any,  # InputPeerChannel | InputPeerChat
+        *,
+        history_batch_size: int = 5000,
+        max_history_batches: Optional[int] = None,
+        max_channel_seconds: Optional[int] = None,
     ) -> ParseResult:
-        """Парсит один канал инкрементально.
-
-        Архитектура (исправление C1, C2, C4):
-          1. Короткая сессия БД: получаем last_msg_id + загружаем text_hash'и в память
-          2. Читаем сообщения из Telegram в список (сессия БД ЗАКРЫТА)
-          3. Короткая сессия БД: dedup + insert batch
+        """Парсит один канал: инкрементально + постраничный backfill истории.
 
         Args:
             channel: Модель Channel из БД.
             input_peer: InputPeerChannel из кэша (без get_entity!).
+            history_batch_size: Размер одной исторической партии.
+            max_history_batches: Макс. число исторических партий за прогон.
+            max_channel_seconds: Макс. время на канал за прогон.
 
         Returns:
             ParseResult с количеством обработанных и новых постов.
@@ -695,12 +705,12 @@ class ChannelParser:
         result = ParseResult()
 
         try:
-            from models import Post as DbPost, ParseLog
+            from models import Post as DbPost, ParseLog, Channel as DbChannel
         except ImportError as e:
             result.error = f"Models import error: {e}"
             return result
 
-        # ─── Шаг 1: Короткая сессия — last_msg_id + text_hash'и в память ───
+        # ─── Шаг 1: Загружаем состояние канала ───
         last_msg_id: Optional[int] = None
         existing_hashes: set[str] = set()
         existing_msg_ids: set[int] = set()
@@ -708,190 +718,428 @@ class ChannelParser:
         try:
             async with self.db_factory() as session:
                 last_msg_id = await self._get_last_message_id(session, channel.id)
-
-                # Предзагружаем ВСЕ text_hash'и канала в память (фикс C2: N+1)
-                hash_result = await session.execute(
-                    select(DbPost.text_hash)
-                    .where(
-                        (DbPost.channel_id == channel.id)
-                        & (DbPost.text_hash.isnot(None))
-                    )
+                existing_hashes, existing_msg_ids = await self._load_existing_hashes(
+                    session, channel.id
                 )
-                existing_hashes = {row[0] for row in hash_result.all() if row[0]}
-
-                # Предзагружаем ВСЕ telegram_message_id канала
-                id_result = await session.execute(
-                    select(DbPost.telegram_message_id)
-                    .where(DbPost.channel_id == channel.id)
-                )
-                existing_msg_ids = {row[0] for row in id_result.all()}
 
                 logger.info(
-                    "[parse] Канал '%s' [%d]: min_id=%s, "
-                    "cached_hashes=%d, cached_msg_ids=%d",
+                    "[parse] Канал '%s' [%d]: last_msg_id=%s, "
+                    "cached_hashes=%d, cached_msg_ids=%d, "
+                    "history_complete=%s, cursor=%s",
                     channel.title, channel.id,
-                    last_msg_id if last_msg_id else "(вся история)",
+                    last_msg_id if last_msg_id else "(новый)",
                     len(existing_hashes), len(existing_msg_ids),
+                    channel.history_complete,
+                    channel.history_cursor,
                 )
         except Exception as e:
             logger.warning("[parse] Ошибка загрузки кэша: %s", e)
             existing_hashes = set()
             existing_msg_ids = set()
 
-        # ─── Шаг 2: Читаем из Telegram (сессия БД ЗАКРЫТА) ───
-        raw_posts: list[dict[str, Any]] = []
-        parsed = 0
+        total_parsed = 0
+        total_new = 0
+        history_batches = 0
+        channel_deadline: Optional[float] = None
+        if max_channel_seconds:
+            channel_deadline = time.monotonic() + max_channel_seconds
 
-        try:
-            kwargs = {"limit": None}
-            if last_msg_id:
-                kwargs["min_id"] = last_msg_id
+        # ─── Шаг 2: Инкрементальная подгрузка новых сообщений ───
+        if last_msg_id is not None:
+            try:
+                inc_posts, inc_parsed = await self._fetch_batch(
+                    input_peer,
+                    min_id=last_msg_id,
+                    existing_hashes=existing_hashes,
+                    existing_msg_ids=existing_msg_ids,
+                    limit=None,
+                )
+                if inc_posts:
+                    inc_new = await self._save_posts(channel.id, inc_posts)
+                    total_parsed += inc_parsed
+                    total_new += inc_new
+                    for p in inc_posts:
+                        if p["text_hash"]:
+                            existing_hashes.add(p["text_hash"])
+                        existing_msg_ids.add(p["telegram_message_id"])
 
-            await self.rate_limiter.before_call()
-
-            async for msg in self.client.iter_messages(input_peer, **kwargs):
-                parsed += 1
-
-                text = msg.text or ""
-                text_hash = hash_text(text)
-
-                # Дедупликация в памяти (O(1), без БД)
-                if text_hash and text_hash in existing_hashes:
-                    continue
-                if msg.id in existing_msg_ids:
-                    continue
-
-                # Resolve sender name (channels: post_author, chats: cache/API)
-                sender_name = msg.post_author
-                sender_telegram_id = None
-                if not sender_name and self.sender_resolver:
-                    try:
-                        sender_name = await self.sender_resolver.get_sender_name(msg)
-                        sender_telegram_id = msg.sender_id
-                    except Exception as e:
-                        logger.debug("[parse] Sender resolve error: %s", e)
-                        sender_name = None
-
-                # Собираем данные (не создаём SQLAlchemy объект — просто dict)
-                raw_posts.append({
-                    "telegram_message_id": msg.id,
-                    "text": text,
-                    "text_hash": text_hash,
-                    "views_count": msg.views or 0,
-                    "forwards_count": msg.forwards or 0,
-                    "replies_count": (
-                        msg.replies.replies
-                        if msg.replies and hasattr(msg.replies, "replies")
-                        else 0
-                    ),
-                    "hashtags": extract_hashtags(text),
-                    "mentions": extract_mentions(text),
-                    "urls": extract_urls(text),
-                    "forward_from": (
-                        msg.forward.chat.username or msg.forward.chat.title
-                        if msg.forward and msg.forward.chat else None
-                    ),
-                    "sender_name": sender_name,
-                    "sender_telegram_id": sender_telegram_id,
-                    "has_media": msg.media is not None,
-                    "media_type": get_media_type(msg),
-                    "published_at": msg.date,
-                    "edited_at": msg.edit_date,
-                })
-
-                # Rate limit каждые 100 сообщений (фикс C4)
-                if parsed % 100 == 0:
-                    await self.rate_limiter.before_call()
-                    self.rate_limiter.on_success()
-
-                # Safety limit: не более 5000 сообщений за раз
-                if len(raw_posts) >= 5000:
-                    logger.warning(
-                        "[parse] Канал '%s': достигнут лимит 5000 сообщений",
-                        channel.title,
+                    logger.info(
+                        "[parse] Канал '%s': инкрементально "
+                        "обработано=%d, новых=%d",
+                        channel.title, inc_parsed, inc_new,
                     )
-                    break
 
-        except FloodWaitError as e:
-            result.error = f"FloodWait: {e.seconds} сек"
-            result.flood_wait_sec = e.seconds
-            self.rate_limiter.on_flood_wait(e.seconds)
-            logger.warning(
-                "[parse] Канал '%s' [%d]: FloodWait %d сек",
-                channel.title, channel.id, e.seconds,
-            )
-            return result
+                    if self.progress_callback:
+                        self.progress_callback(
+                            current_channel=channel.title or str(channel.id),
+                            current_operation="Инкрементальная подгрузка",
+                            increment_posts_parsed=inc_parsed,
+                            increment_posts_new=inc_new,
+                        )
+            except (FloodWaitError, ChannelInvalidError, ChannelPrivateError) as e:
+                return self._handle_telegram_error(e, channel, result)
+            except Exception as e:
+                result.error = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    "[parse] Канал '%s' [%d]: Ошибка инкрементальной загрузки",
+                    channel.title, channel.id,
+                )
+                return result
 
-        except (ChannelInvalidError, ChannelPrivateError) as e:
-            result.error = f"Channel inaccessible: {type(e).__name__}"
-            logger.error(
-                "[parse] Канал '%s' [%d]: Недоступен — %s",
-                channel.title, channel.id, e,
-            )
-            return result
+        # ─── Шаг 3: Backfill истории ───
+        if not channel.history_complete:
+            try:
+                history_batches = await self._backfill_history(
+                    channel=channel,
+                    input_peer=input_peer,
+                    existing_hashes=existing_hashes,
+                    existing_msg_ids=existing_msg_ids,
+                    history_batch_size=history_batch_size,
+                    max_history_batches=max_history_batches,
+                    channel_deadline=channel_deadline,
+                )
+            except (FloodWaitError, ChannelInvalidError, ChannelPrivateError) as e:
+                return self._handle_telegram_error(e, channel, result)
+            except Exception as e:
+                result.error = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    "[parse] Канал '%s' [%d]: Ошибка загрузки истории",
+                    channel.title, channel.id,
+                )
+                return result
 
-        except Exception as e:
-            result.error = f"{type(e).__name__}: {e}"
-            logger.exception(
-                "[parse] Канал '%s' [%d]: Ошибка чтения из Telegram",
-                channel.title, channel.id,
-            )
-            return result
-
-        # ─── Шаг 3: Короткая сессия БД — insert batch ───
+        # ─── Шаг 4: Финальное обновление канала и лог ───
         try:
-            new_posts = 0
             async with self.db_factory() as session:
-                for i in range(0, len(raw_posts), self.batch_size):
-                    batch = raw_posts[i:i + self.batch_size]
-                    db_posts = [
-                        DbPost(channel_id=channel.id, **item)
-                        for item in batch
-                    ]
-                    session.add_all(db_posts)
-                    await session.commit()
-                    new_posts += len(batch)
-                    logger.debug(
-                        "[parse] Канал '%s': коммит %d/%d",
-                        channel.title, new_posts, len(raw_posts),
-                    )
+                db_channel = await session.get(DbChannel, channel.id)
+                if db_channel is None:
+                    result.error = f"Channel {channel.id} not found in DB"
+                    return result
 
-                # Обновляем канал
-                channel.total_posts_parsed = (channel.total_posts_parsed or 0) + new_posts
-                channel.last_parsed_at = utc_now()
-                channel.parse_error_count = 0
-                channel.last_error_message = None
-                channel.last_error_at = None
+                db_channel.total_posts_parsed = (db_channel.total_posts_parsed or 0) + total_new
+                db_channel.last_parsed_at = utc_now()
+                db_channel.parse_error_count = 0
+                db_channel.last_error_message = None
+                db_channel.last_error_at = None
+                db_channel.metadata_json = channel.metadata_json
                 await session.commit()
 
-                # Логируем прогон
                 duration_ms = int((time.monotonic() - start_ts) * 1000)
                 session.add(ParseLog(
                     channel_id=channel.id,
-                    posts_parsed=parsed,
-                    posts_new=new_posts,
+                    posts_parsed=total_parsed,
+                    posts_new=total_new,
                     duration_ms=duration_ms,
                     started_at=datetime.fromtimestamp(start_ts, tz=timezone.utc),
                     finished_at=utc_now(),
                 ))
                 await session.commit()
 
-                result.parsed = parsed
-                result.new = new_posts
+                result.parsed = total_parsed
+                result.new = total_new
                 result.duration_ms = duration_ms
+                result.batches = history_batches
+                result.oldest_id = channel.history_cursor
+                result.history_complete = channel.history_complete
 
                 logger.info(
-                    "[parse] Канал '%s' [%d]: обработано=%d, новых=%d, за %d мс",
-                    channel.title, channel.id, parsed, new_posts, duration_ms,
+                    "[parse] Канал '%s' [%d]: обработано=%d, новых=%d, "
+                    "партий истории=%d, история_завершена=%s, за %d мс",
+                    channel.title, channel.id, total_parsed, total_new,
+                    history_batches, channel.history_complete, duration_ms,
                 )
 
         except Exception as e:
-            result.error = f"Insert error: {type(e).__name__}: {e}"
+            result.error = f"Insert/state error: {type(e).__name__}: {e}"
             logger.exception(
                 "[parse] Канал '%s' [%d]: Ошибка записи в БД",
                 channel.title, channel.id,
             )
 
+        return result
+
+    async def _load_existing_hashes(
+        self,
+        session: AsyncSession,
+        channel_id: int,
+    ) -> tuple[set[str], set[int]]:
+        """Предзагружает text_hash и telegram_message_id канала в память."""
+        try:
+            from models import Post as DbPost
+        except ImportError:
+            return set(), set()
+
+        hash_result = await session.execute(
+            select(DbPost.text_hash)
+            .where(
+                (DbPost.channel_id == channel_id)
+                & (DbPost.text_hash.isnot(None))
+            )
+        )
+        existing_hashes = {row[0] for row in hash_result.all() if row[0]}
+
+        id_result = await session.execute(
+            select(DbPost.telegram_message_id)
+            .where(DbPost.channel_id == channel_id)
+        )
+        existing_msg_ids = {row[0] for row in id_result.all()}
+        return existing_hashes, existing_msg_ids
+
+    async def _fetch_batch(
+        self,
+        input_peer: Any,
+        *,
+        existing_hashes: set[str],
+        existing_msg_ids: set[int],
+        min_id: Optional[int] = None,
+        offset_id: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Читает одну партию сообщений из Telegram.
+
+        Args:
+            input_peer: InputPeer канала/чата.
+            existing_hashes: Уже известные хэши текста (для дедупликации).
+            existing_msg_ids: Уже известные ID сообщений.
+            min_id: Если задан — читаем сообщения с id > min_id (инкремент).
+            offset_id: Если задан — читаем сообщения старше offset_id (backfill).
+            limit: Максимальное количество сообщений.
+
+        Returns:
+            (список raw_posts, количество обработанных сообщений).
+        """
+        kwargs: dict[str, Any] = {"limit": limit}
+        if min_id is not None:
+            kwargs["min_id"] = min_id
+        if offset_id is not None:
+            kwargs["offset_id"] = offset_id
+
+        await self.rate_limiter.before_call()
+
+        raw_posts: list[dict[str, Any]] = []
+        parsed = 0
+
+        async for msg in self.client.iter_messages(input_peer, **kwargs):
+            parsed += 1
+
+            text = msg.text or ""
+            text_hash = hash_text(text)
+
+            # Дедупликация в памяти (O(1), без БД)
+            if text_hash and text_hash in existing_hashes:
+                continue
+            if msg.id in existing_msg_ids:
+                continue
+
+            # Resolve sender name (channels: post_author, chats: cache/API)
+            sender_name = msg.post_author
+            sender_telegram_id = None
+            if not sender_name and self.sender_resolver:
+                try:
+                    sender_name = await self.sender_resolver.get_sender_name(msg)
+                    sender_telegram_id = msg.sender_id
+                except Exception as e:
+                    logger.debug("[parse] Sender resolve error: %s", e)
+                    sender_name = None
+
+            raw_posts.append({
+                "telegram_message_id": msg.id,
+                "text": text,
+                "text_hash": text_hash,
+                "views_count": msg.views or 0,
+                "forwards_count": msg.forwards or 0,
+                "replies_count": (
+                    msg.replies.replies
+                    if msg.replies and hasattr(msg.replies, "replies")
+                    else 0
+                ),
+                "hashtags": extract_hashtags(text),
+                "mentions": extract_mentions(text),
+                "urls": extract_urls(text),
+                "forward_from": (
+                    msg.forward.chat.username or msg.forward.chat.title
+                    if msg.forward and msg.forward.chat else None
+                ),
+                "sender_name": sender_name,
+                "sender_telegram_id": sender_telegram_id,
+                "has_media": msg.media is not None,
+                "media_type": get_media_type(msg),
+                "published_at": msg.date,
+                "edited_at": msg.edit_date,
+            })
+
+            # Rate limit каждые 100 сообщений (фикс C4)
+            if parsed % 100 == 0:
+                await self.rate_limiter.before_call()
+                self.rate_limiter.on_success()
+
+        return raw_posts, parsed
+
+    async def _save_posts(
+        self,
+        channel_id: int,
+        raw_posts: list[dict[str, Any]],
+    ) -> int:
+        """Сохраняет список постов в БД пачками с ON CONFLICT DO NOTHING."""
+        if not raw_posts:
+            return 0
+
+        try:
+            from models import Post as DbPost
+        except ImportError:
+            return 0
+
+        new_posts = 0
+        async with self.db_factory() as session:
+            for i in range(0, len(raw_posts), self.batch_size):
+                batch = raw_posts[i:i + self.batch_size]
+                values = [
+                    {"channel_id": channel_id, **item}
+                    for item in batch
+                ]
+                stmt = (
+                    insert(DbPost)
+                    .values(values)
+                    .on_conflict_do_nothing(
+                        index_elements=["channel_id", "telegram_message_id"]
+                    )
+                )
+                res = await session.execute(stmt)
+                await session.commit()
+                batch_new = res.rowcount or 0
+                new_posts += batch_new
+                logger.debug(
+                    "[parse] Канал %d: коммит %d/%d (новых %d)",
+                    channel_id, i + len(batch), len(raw_posts), batch_new,
+                )
+
+        return new_posts
+
+    async def _backfill_history(
+        self,
+        channel: Any,
+        input_peer: Any,
+        existing_hashes: set[str],
+        existing_msg_ids: set[int],
+        history_batch_size: int,
+        max_history_batches: Optional[int],
+        channel_deadline: Optional[float],
+    ) -> int:
+        """Постранично догружает историю канала от новых к старым."""
+        from models import Channel as DbChannel
+
+        batches = 0
+
+        while True:
+            if max_history_batches is not None and batches >= max_history_batches:
+                logger.info(
+                    "[backfill] Канал '%s': достигнут лимит партий за прогон (%d)",
+                    channel.title, max_history_batches,
+                )
+                break
+
+            if channel_deadline and time.monotonic() >= channel_deadline:
+                logger.info(
+                    "[backfill] Канал '%s': достигнут лимит времени на канал",
+                    channel.title,
+                )
+                break
+
+            offset_id = channel.history_cursor
+            posts, parsed = await self._fetch_batch(
+                input_peer,
+                offset_id=offset_id,
+                existing_hashes=existing_hashes,
+                existing_msg_ids=existing_msg_ids,
+                limit=history_batch_size,
+            )
+
+            batches += 1
+
+            if not posts:
+                channel.history_complete = True
+                channel.history_cursor = None
+                logger.info(
+                    "[backfill] Канал '%s': история полностью догружена",
+                    channel.title,
+                )
+                break
+
+            new = await self._save_posts(channel.id, posts)
+
+            # Обновляем in-memory кэши
+            for p in posts:
+                if p["text_hash"]:
+                    existing_hashes.add(p["text_hash"])
+                existing_msg_ids.add(p["telegram_message_id"])
+
+            # Следующая партия старше min_id текущей
+            min_id = min(p["telegram_message_id"] for p in posts)
+            channel.history_cursor = min_id
+
+            # Сохраняем cursor после каждой партии, чтобы можно было продолжить
+            async with self.db_factory() as session:
+                db_channel = await session.get(DbChannel, channel.id)
+                if db_channel:
+                    db_channel.metadata_json = channel.metadata_json
+                    await session.commit()
+
+            logger.info(
+                "[backfill] Канал '%s': партия %d, "
+                "обработано=%d, новых=%d, cursor=%d",
+                channel.title, batches, parsed, new, min_id,
+            )
+
+            if self.progress_callback:
+                self.progress_callback(
+                    current_channel=channel.title or str(channel.id),
+                    current_operation=f"История: партия {batches}, cursor={min_id}",
+                    increment_posts_parsed=parsed,
+                    increment_posts_new=new,
+                )
+
+            if len(posts) < history_batch_size:
+                channel.history_complete = True
+                channel.history_cursor = None
+                logger.info(
+                    "[backfill] Канал '%s': история полностью догружена "
+                    "(последняя партия неполная)",
+                    channel.title,
+                )
+                break
+
+            # Короткая пауза между историческими партиями
+            await asyncio.sleep(self.rate_limiter.current_delay)
+
+        return batches
+
+    def _handle_telegram_error(
+        self,
+        error: Exception,
+        channel: Any,
+        result: ParseResult,
+    ) -> ParseResult:
+        """Обрабатывает ошибки Telegram и возвращает ParseResult."""
+        if isinstance(error, FloodWaitError):
+            result.error = f"FloodWait: {error.seconds} сек"
+            result.flood_wait_sec = error.seconds
+            self.rate_limiter.on_flood_wait(error.seconds)
+            logger.warning(
+                "[parse] Канал '%s' [%d]: FloodWait %d сек",
+                channel.title, channel.id, error.seconds,
+            )
+        elif isinstance(error, (ChannelInvalidError, ChannelPrivateError)):
+            result.error = f"Channel inaccessible: {type(error).__name__}"
+            logger.error(
+                "[parse] Канал '%s' [%d]: Недоступен — %s",
+                channel.title, channel.id, error,
+            )
+        else:
+            result.error = f"{type(error).__name__}: {error}"
+            logger.exception(
+                "[parse] Канал '%s' [%d]: Ошибка чтения из Telegram",
+                channel.title, channel.id,
+            )
         return result
 
     async def _get_last_message_id(self, session: AsyncSession, channel_id: int) -> Optional[int]:
@@ -932,6 +1180,11 @@ class MultiChannelParser:
         self.batch_size = getattr(cfg, "BATCH_COMMIT_SIZE", 50)
         self.jitter_sec = getattr(cfg, "JITTER_SEC", 10.0)
         self.schedule_interval_sec = getattr(cfg, "INTERVAL_SEC", 1200)
+
+        # Backfill (history) settings
+        self.history_batch_size = getattr(cfg, "HISTORY_BATCH_SIZE", 5000)
+        self.history_max_batches_per_run = getattr(cfg, "HISTORY_MAX_BATCHES_PER_RUN", 5)
+        self.history_max_seconds_per_channel = getattr(cfg, "HISTORY_MAX_SECONDS_PER_CHANNEL", 900)
 
         # Components (initialized in init_db)
         self._engine: Any = None
@@ -1036,6 +1289,7 @@ class MultiChannelParser:
             client, self._db_factory,
             self._rate_limiter, self.batch_size,
             sender_resolver=sender_resolver,
+            progress_callback=self._progress_callback,
         )
 
         results: dict[int, ParseResult] = {}
@@ -1053,6 +1307,14 @@ class MultiChannelParser:
             if not channels:
                 logger.warning("Нет активных каналов для парсинга")
                 return results
+
+            # Сначала догружаем историю для недогруженных каналов
+            channels.sort(
+                key=lambda ch: (
+                    ch.history_complete,
+                    ch.last_parsed_at or datetime.min.replace(tzinfo=timezone.utc),
+                )
+            )
 
             logger.info("Каналов к парсингу: %d", len(channels))
 
@@ -1090,7 +1352,12 @@ class MultiChannelParser:
 
                 try:
                     input_peer = await self._resolver.build_input_peer(channel)
-                    result = await self._parser.parse(channel, input_peer)
+                    result = await self._parser.parse(
+                        channel, input_peer,
+                        history_batch_size=self.history_batch_size,
+                        max_history_batches=self.history_max_batches_per_run,
+                        max_channel_seconds=self.history_max_seconds_per_channel,
+                    )
                     results[channel.id] = result
 
                     if result.error:

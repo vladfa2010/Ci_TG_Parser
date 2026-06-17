@@ -181,6 +181,23 @@ class Settings(BaseSettings):
         ge=0,
     )
 
+    # --- Backfill (история) settings ---
+    HISTORY_BATCH_SIZE: int = Field(
+        default=5000,
+        description="Размер одной партии при загрузке истории (количество сообщений)",
+        ge=1,
+    )
+    HISTORY_MAX_BATCHES_PER_RUN: int = Field(
+        default=5,
+        description="Максимальное количество исторических партий за один прогон на канал",
+        ge=1,
+    )
+    HISTORY_MAX_SECONDS_PER_CHANNEL: int = Field(
+        default=900,
+        description="Максимальное время на один канал при бэкфилле (секунды)",
+        ge=0,
+    )
+
     # --- Валидаторы ---
 
     @field_validator("DATABASE_URL", mode="before")

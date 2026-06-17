@@ -248,6 +248,26 @@ class Channel(Base):
             f"username={self.username!r}, is_active={self.is_active})>"
         )
 
+    # --- Backfill helpers: постраничная загрузка истории ---
+    @property
+    def history_cursor(self) -> Optional[int]:
+        """ID самого старого загруженного сообщения; следующая партия
+        будет загружена сообщения старше этого ID."""
+        return self.metadata_json.get("history_cursor")
+
+    @history_cursor.setter
+    def history_cursor(self, value: Optional[int]) -> None:
+        self.metadata_json["history_cursor"] = value
+
+    @property
+    def history_complete(self) -> bool:
+        """True, если вся история канала уже догружена."""
+        return self.metadata_json.get("history_complete", False)
+
+    @history_complete.setter
+    def history_complete(self, value: bool) -> None:
+        self.metadata_json["history_complete"] = value
+
 
 class Sender(Base):
     """Cache of Telegram user names for resolving message senders.
