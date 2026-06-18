@@ -21,7 +21,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, Query, Depends, Request, Form, status, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, Query, Depends, Request, Form, status, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy import func, select, text
@@ -2954,90 +2954,6 @@ async def api_admin_reactivate_all():
     except Exception as e:
         logger.error("[reactivate-all] Error: %s", e)
         return json_response({"error": str(e)}, 500)
-
-
-# ─── TEMP API: Deactivate channels auto-created by sync_dialogs() ──
-@app.post("/api/admin/deactivate-recent-channels")
-async def api_admin_deactivate_recent_channels(
-    x_admin_secret: str = Header(..., alias="X-Admin-Secret"),
-):
-    """Deactivate channels created on 2026-06-18 or later.
-
-    One-time cleanup for channels auto-created by an older sync_dialogs().
-    Protected by a temporary secret header.
-    """
-    expected = "RjHBPiHOIrPWCQ8jtnd7gSEy-Qnu-5QCFZN8V4R2b60"
-    if not secrets.compare_digest(x_admin_secret, expected):
-        raise HTTPException(status_code=403, detail="Invalid admin secret")
-
-    # Debug: which DB host are we connected to?
-    from urllib.parse import urlparse
-    db_url_parsed = urlparse(cfg.database_url_async)
-    db_host = db_url_parsed.hostname
-    db_name = db_url_parsed.path.lstrip('/') if db_url_parsed.path else None
-
-    try:
-        await _ensure_db()
-        async with async_session() as session:
-            # Diagnostics: show channel counts
-            tables = await session.execute(
-                text("SELECT table_schema, table_name FROM information_schema.tables WHERE table_name = 'channels'")
-            )
-            tables_rows = tables.mappings().all()
-            logger.info("[deactivate-recent-channels] channels tables: %s", tables_rows)
-
-            diag = await session.execute(
-                text("""
-                    SELECT
-                        COUNT(*) as total,
-                        COUNT(*) FILTER (WHERE is_active = TRUE) as active,
-                        COUNT(*) FILTER (WHERE is_active = FALSE) as inactive,
-                        COUNT(*) FILTER (WHERE is_active = TRUE AND created_at >= '2026-06-18 00:00:00+00') as recent_active,
-                        MIN(created_at) as oldest,
-                        MAX(created_at) as newest
-                    FROM channels
-                """)
-            )
-            diag_row = diag.mappings().one()
-            logger.info(
-                "[deactivate-recent-channels] total=%s active=%s inactive=%s recent_active=%s oldest=%s newest=%s",
-                diag_row["total"], diag_row["active"], diag_row["inactive"],
-                diag_row["recent_active"], diag_row["oldest"], diag_row["newest"]
-            )
-
-            result = await session.execute(
-                text("""
-                    UPDATE channels
-                    SET is_active = FALSE
-                    WHERE created_at >= '2026-06-18 00:00:00+00'
-                      AND is_active = TRUE
-                    RETURNING id, telegram_id, title
-                """)
-            )
-            updated = result.mappings().all()
-            await session.commit()
-            return {
-                "success": True,
-                "deactivated": len(updated),
-                "db_host": db_host,
-                "db_name": db_name,
-                "diagnostics": {
-                    "total": diag_row["total"],
-                    "active": diag_row["active"],
-                    "inactive": diag_row["inactive"],
-                    "recent_active": diag_row["recent_active"],
-                    "oldest": str(diag_row["oldest"]) if diag_row["oldest"] else None,
-                    "newest": str(diag_row["newest"]) if diag_row["newest"] else None,
-                    "channels_tables": [dict(r) for r in tables_rows],
-                },
-                "channels": [
-                    {"id": r["id"], "telegram_id": r["telegram_id"], "title": r["title"]}
-                    for r in updated
-                ],
-            }
-    except Exception as e:
-        logger.error("[deactivate-recent-channels] Error: %s", e)
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
 
 # ─── API: Add channel ────────────────────────────────────────
