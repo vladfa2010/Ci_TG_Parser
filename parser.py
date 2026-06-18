@@ -547,12 +547,13 @@ class ChannelResolver:
                     "broadcast": entity.broadcast,
                 })
 
-                # Обновляем access_hash для всех существующих каналов/групп,
-                # но создаём новые записи только для broadcast-каналов.
+                # Обновляем access_hash для всех существующих каналов/групп.
+                # Новые каналы НЕ создаём — список для парсинга строго
+                # контролируется через web UI (/channels).
                 await self._upsert_channel(
                     session, telegram_id, channel_id,
                     entity.title, entity.username, access_hash,
-                    allow_create=entity.broadcast,
+                    allow_create=False,
                 )
 
             await session.commit()

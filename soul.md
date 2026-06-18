@@ -53,6 +53,7 @@ parser.py (v3)
 ```
 
 **Ключевые решения:**
+- **Список каналов контролируется строго через Web UI.** `sync_dialogs()` обновляет `access_hash` только для каналов, уже добавленных в БД; новые каналы не создаёт.
 - `access_hash` кэшируется в БД (обход get_entity())
 - `message.post_author` вместо `message.sender` (zero API calls)
 - Сессия БД изолирована от чтения Telegram
