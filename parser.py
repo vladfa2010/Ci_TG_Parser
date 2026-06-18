@@ -532,8 +532,6 @@ class ChannelResolver:
                 entity = dialog.entity
                 if not isinstance(entity, TlChannel):
                     continue
-                if not entity.broadcast:
-                    continue  # Пропускаем группы, берём только каналы
 
                 channel_id = normalize_channel_id(entity.id)
                 access_hash = entity.access_hash
@@ -544,17 +542,23 @@ class ChannelResolver:
                     "title": entity.title or "",
                     "username": entity.username,
                     "access_hash": access_hash,
+                    "broadcast": entity.broadcast,
                 })
 
-                # Обновляем/создаём запись в БД
-                await self._upsert_channel(session, entity.id, channel_id,
-                                           entity.title, entity.username, access_hash)
+                # Обновляем access_hash для всех существующих каналов/групп,
+                # но создаём новые записи только для broadcast-каналов.
+                await self._upsert_channel(
+                    session, entity.id, channel_id,
+                    entity.title, entity.username, access_hash,
+                    allow_create=entity.broadcast,
+                )
 
             await session.commit()
 
         logger.info(
-            "[resolver] Синхронизировано %d каналов (broadcast)",
+            "[resolver] Синхронизировано %d каналов/групп (%d broadcast)",
             len(channels),
+            sum(1 for c in channels if c.get("broadcast")),
         )
         return channels
 
@@ -566,6 +570,7 @@ class ChannelResolver:
         title: str,
         username: Optional[str],
         access_hash: int,
+        allow_create: bool = True,
     ) -> None:
         """Обновить или создать канал в БД."""
         # Lazy import models to avoid circular deps
@@ -588,9 +593,24 @@ class ChannelResolver:
                 db_ch = result.scalar_one_or_none()
 
         if db_ch is None:
-            # НЕ создаём новые каналы — только обновляем существующие
-            logger.debug("[resolver] Пропуск: %s (tid=%d) не в БД", title, telegram_id)
-            return  # ← ВАЖНО: не создаём!
+            if not allow_create:
+                logger.debug(
+                    "[resolver] Пропуск: %s (tid=%d) не в БД (create disabled)",
+                    title, telegram_id,
+                )
+                return
+            # Создаём новый канал только если разрешено
+            db_ch = DbChannel(
+                telegram_id=telegram_id,
+                numeric_id=channel_id,
+                title=title,
+                username=username,
+                channel_type="public" if username else "private",
+                access_hash=access_hash,
+                entity_resolved_at=utc_now(),
+            )
+            session.add(db_ch)
+            logger.info("[resolver] Создан новый канал: %s (tid=%d)", title, telegram_id)
         else:
             db_ch.title = title
             db_ch.username = username
@@ -652,6 +672,15 @@ class ChannelResolver:
                     logger.info("[resolver] Got access_hash для '%s'", channel.title)
                 else:
                     raise ValueError(f"Entity is {type(entity).__name__}, not Channel")
+            except ChannelPrivateError:
+                raise ValueError(
+                    f"'{channel.title}' (tid={tid}): недоступен. "
+                    f"Убедитесь, что аккаунт состоит в этом private-канале/группе."
+                )
+            except ChannelInvalidError:
+                raise ValueError(
+                    f"'{channel.title}' (tid={tid}): не существует или удалён."
+                )
             except Exception as e:
                 raise ValueError(f"'{channel.title}' (tid={tid}): нет access_hash, ошибка: {e}")
         
@@ -1133,11 +1162,23 @@ class ChannelParser:
                 "[parse] Канал '%s' [%d]: FloodWait %d сек",
                 channel.title, channel.id, error.seconds,
             )
-        elif isinstance(error, (ChannelInvalidError, ChannelPrivateError)):
-            result.error = f"Channel inaccessible: {type(error).__name__}"
+        elif isinstance(error, ChannelPrivateError):
+            result.error = (
+                f"Канал/чат недоступен: убедитесь, что аккаунт состоит в "
+                f"'{channel.title}' (tid={channel.telegram_id})"
+            )
             logger.error(
-                "[parse] Канал '%s' [%d]: Недоступен — %s",
-                channel.title, channel.id, error,
+                "[parse] Канал '%s' [%d]: недоступен — аккаунт не состоит в канале/чате",
+                channel.title, channel.id,
+            )
+        elif isinstance(error, ChannelInvalidError):
+            result.error = (
+                f"Канал/чат не существует или удалён: '{channel.title}' "
+                f"(tid={channel.telegram_id})"
+            )
+            logger.error(
+                "[parse] Канал '%s' [%d]: не существует или удалён",
+                channel.title, channel.id,
             )
         else:
             result.error = f"{type(error).__name__}: {error}"
