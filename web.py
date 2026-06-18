@@ -2973,6 +2973,21 @@ async def api_admin_deactivate_recent_channels(
     try:
         await _ensure_db()
         async with async_session() as session:
+            # Diagnostics: show active channel date range
+            diag = await session.execute(
+                text("""
+                    SELECT COUNT(*) as total_active,
+                           MIN(created_at) as oldest,
+                           MAX(created_at) as newest
+                    FROM channels WHERE is_active = TRUE
+                """)
+            )
+            diag_row = diag.mappings().one()
+            logger.info(
+                "[deactivate-recent-channels] active=%s oldest=%s newest=%s",
+                diag_row["total_active"], diag_row["oldest"], diag_row["newest"]
+            )
+
             result = await session.execute(
                 text("""
                     UPDATE channels
@@ -2987,6 +3002,11 @@ async def api_admin_deactivate_recent_channels(
             return {
                 "success": True,
                 "deactivated": len(updated),
+                "diagnostics": {
+                    "total_active": diag_row["total_active"],
+                    "oldest_active": str(diag_row["oldest"]) if diag_row["oldest"] else None,
+                    "newest_active": str(diag_row["newest"]) if diag_row["newest"] else None,
+                },
                 "channels": [
                     {"id": r["id"], "telegram_id": r["telegram_id"], "title": r["title"]}
                     for r in updated
