@@ -2970,6 +2970,12 @@ async def api_admin_deactivate_recent_channels(
     if not secrets.compare_digest(x_admin_secret, expected):
         raise HTTPException(status_code=403, detail="Invalid admin secret")
 
+    # Debug: which DB host are we connected to?
+    from urllib.parse import urlparse
+    db_url_parsed = urlparse(cfg.database_url_async)
+    db_host = db_url_parsed.hostname
+    db_name = db_url_parsed.path.lstrip('/') if db_url_parsed.path else None
+
     try:
         await _ensure_db()
         async with async_session() as session:
@@ -3007,6 +3013,8 @@ async def api_admin_deactivate_recent_channels(
             return {
                 "success": True,
                 "deactivated": len(updated),
+                "db_host": db_host,
+                "db_name": db_name,
                 "diagnostics": {
                     "total": diag_row["total"],
                     "active": diag_row["active"],
