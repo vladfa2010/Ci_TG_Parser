@@ -2980,6 +2980,12 @@ async def api_admin_deactivate_recent_channels(
         await _ensure_db()
         async with async_session() as session:
             # Diagnostics: show channel counts
+            tables = await session.execute(
+                text("SELECT table_schema, table_name FROM information_schema.tables WHERE table_name = 'channels'")
+            )
+            tables_rows = tables.mappings().all()
+            logger.info("[deactivate-recent-channels] channels tables: %s", tables_rows)
+
             diag = await session.execute(
                 text("""
                     SELECT
@@ -3022,6 +3028,7 @@ async def api_admin_deactivate_recent_channels(
                     "recent_active": diag_row["recent_active"],
                     "oldest": str(diag_row["oldest"]) if diag_row["oldest"] else None,
                     "newest": str(diag_row["newest"]) if diag_row["newest"] else None,
+                    "channels_tables": [dict(r) for r in tables_rows],
                 },
                 "channels": [
                     {"id": r["id"], "telegram_id": r["telegram_id"], "title": r["title"]}
