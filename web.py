@@ -2973,19 +2973,24 @@ async def api_admin_deactivate_recent_channels(
     try:
         await _ensure_db()
         async with async_session() as session:
-            # Diagnostics: show active channel date range
+            # Diagnostics: show channel counts
             diag = await session.execute(
                 text("""
-                    SELECT COUNT(*) as total_active,
-                           MIN(created_at) as oldest,
-                           MAX(created_at) as newest
-                    FROM channels WHERE is_active = TRUE
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE is_active = TRUE) as active,
+                        COUNT(*) FILTER (WHERE is_active = FALSE) as inactive,
+                        COUNT(*) FILTER (WHERE is_active = TRUE AND created_at >= '2026-06-18 00:00:00+00') as recent_active,
+                        MIN(created_at) as oldest,
+                        MAX(created_at) as newest
+                    FROM channels
                 """)
             )
             diag_row = diag.mappings().one()
             logger.info(
-                "[deactivate-recent-channels] active=%s oldest=%s newest=%s",
-                diag_row["total_active"], diag_row["oldest"], diag_row["newest"]
+                "[deactivate-recent-channels] total=%s active=%s inactive=%s recent_active=%s oldest=%s newest=%s",
+                diag_row["total"], diag_row["active"], diag_row["inactive"],
+                diag_row["recent_active"], diag_row["oldest"], diag_row["newest"]
             )
 
             result = await session.execute(
@@ -3003,9 +3008,12 @@ async def api_admin_deactivate_recent_channels(
                 "success": True,
                 "deactivated": len(updated),
                 "diagnostics": {
-                    "total_active": diag_row["total_active"],
-                    "oldest_active": str(diag_row["oldest"]) if diag_row["oldest"] else None,
-                    "newest_active": str(diag_row["newest"]) if diag_row["newest"] else None,
+                    "total": diag_row["total"],
+                    "active": diag_row["active"],
+                    "inactive": diag_row["inactive"],
+                    "recent_active": diag_row["recent_active"],
+                    "oldest": str(diag_row["oldest"]) if diag_row["oldest"] else None,
+                    "newest": str(diag_row["newest"]) if diag_row["newest"] else None,
                 },
                 "channels": [
                     {"id": r["id"], "telegram_id": r["telegram_id"], "title": r["title"]}
