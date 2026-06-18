@@ -534,10 +534,12 @@ class ChannelResolver:
                     continue
 
                 channel_id = normalize_channel_id(entity.id)
+                # Telegram хранит ID каналов/супергрупп как -100<numeric_id>.
+                telegram_id = int(f"-100{entity.id}")
                 access_hash = entity.access_hash
 
                 channels.append({
-                    "telegram_id": entity.id,
+                    "telegram_id": telegram_id,
                     "channel_id": channel_id,
                     "title": entity.title or "",
                     "username": entity.username,
@@ -548,7 +550,7 @@ class ChannelResolver:
                 # Обновляем access_hash для всех существующих каналов/групп,
                 # но создаём новые записи только для broadcast-каналов.
                 await self._upsert_channel(
-                    session, entity.id, channel_id,
+                    session, telegram_id, channel_id,
                     entity.title, entity.username, access_hash,
                     allow_create=entity.broadcast,
                 )
