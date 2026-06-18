@@ -626,7 +626,12 @@ $('ch-info').textContent=stats.channel_title?'('+esc(stats.channel_title)+')':''
 }
 
 // Nav
-document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListener('click',function(){var tab=btn.dataset.tab;document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');$('tab-posts').style.display=tab==='posts'?'':'none';$('tab-tags').style.display=tab==='tags'?'':'none';if(tab==='tags')loadTags()})});
+document.querySelectorAll('nav button').forEach(function(btn){btn.addEventListener('click',function(){var tab=btn.dataset.tab;document.querySelectorAll('nav button').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');$('tab-posts').style.display=tab==='posts'?'':'none';$('tab-tags').style.display=tab==='tags'?'':'none';if(tab==='tags'){stopPostsRefresh();loadTags()}else{startPostsRefresh()}})});
+
+// Auto-refresh posts when on Posts tab
+var _postsRefreshInterval=null,_postsRefreshMs=30000;
+function startPostsRefresh(){stopPostsRefresh();_postsRefreshInterval=setInterval(function(){if(document.hidden||_postBusy)return;loadPosts();loadChannelStats()},_postsRefreshMs)}
+function stopPostsRefresh(){if(_postsRefreshInterval){clearInterval(_postsRefreshInterval);_postsRefreshInterval=null}}
 
 // Posts
 var _postBusy=false;
@@ -686,6 +691,9 @@ window.loadPosts=loadPosts;
 }
 window.goPage=function(p){page=p;loadPosts()};
 
+// Pause refresh when user hides the tab to save resources
+document.addEventListener('visibilitychange',function(){if($('tab-posts').style.display!=='none'){document.hidden?stopPostsRefresh():startPostsRefresh()}});
+
 // Tags -- period selector state
 var tagHours=24;
 
@@ -697,6 +705,7 @@ document.querySelectorAll('#tag-period button').forEach(function(btn){btn.addEve
 loadChannels();
 loadChannelStats();
 loadPosts();
+startPostsRefresh();
 })();
 </script>
 </body>
