@@ -1006,6 +1006,23 @@ class ChannelParser:
                 await self.rate_limiter.before_call()
                 self.rate_limiter.on_success()
 
+        # AI sentiment analysis for the collected posts
+        if raw_posts:
+            try:
+                import sentiment_ai
+                texts = [p["text"] for p in raw_posts]
+                sentiments = await sentiment_ai.analyze_batch(texts)
+                for p, s in zip(raw_posts, sentiments):
+                    p["sentiment_label"] = s["label"]
+                    p["sentiment_score"] = s["score"]
+                    p["sentiment_source"] = s["source"]
+            except Exception as e:
+                logger.warning("[parse] Sentiment analysis failed: %s", e)
+                for p in raw_posts:
+                    p["sentiment_label"] = None
+                    p["sentiment_score"] = None
+                    p["sentiment_source"] = None
+
         return raw_posts, parsed
 
     async def _save_posts(

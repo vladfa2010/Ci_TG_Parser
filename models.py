@@ -29,6 +29,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -456,6 +457,21 @@ class Post(Base):
         nullable=False,
         default=utc_now,
         comment="Record creation timestamp (UTC)",
+    )
+    sentiment_label: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="AI/lexicon sentiment label: positive, negative, neutral",
+    )
+    sentiment_score: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Confidence score (AI probability or 1.0/0.0 for lexicon)",
+    )
+    sentiment_source: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="Source of sentiment: ai or lexicon",
     )
 
     # Relationships

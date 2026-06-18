@@ -43,35 +43,8 @@ def _get_parser():
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ─── Sentiment Lexicon (Russian) ─────────────────────────────
-SENTIMENT_POSITIVE = frozenset({
-    "рост", "прибыль", "прибыльный", "прибыльная", "прирост", "повышение", "подъем",
-    "подъём", "рали", "ралли", "бык", "бычий", "лонг", "покупка", "покупаем",
-    "покупать", "вход", "вошел", "вошёл", "цель", "тейк", "тейк-профит", " профит",
-    "доход", "доходность", "доходный", "окупаемость", "плюс", "позитив", "позитивный",
-    "оптимизм", "оптимистичный", "сильный", "укрепление", "восстановление", "отскок",
-    "прорыв", "breakout", "рванул", "взлетел", "взлет", "растет", "растёт", "расти",
-    "зеленый", "зелёный", "зелень", "buy", "long", "bull", "bullish", "profit",
-    "growth", "gain", "up", "rise", "rising", "rocket", "moon", " ATH", " ath",
-    " rekord", "рекорд", "максимум", "high", "higher", "strong", " outperform",
-    "перспектива", "потенциал", "увеличение", "расширение", "дивиденд", "купон",
-    "ивестиция", "вклад", "пассивный доход", "капитализация", "рост капитализации",
-})
-
-SENTIMENT_NEGATIVE = frozenset({
-    "падение", "убыток", "убыточный", "убыточная", "понижение", "снижение", "спад",
-    "медведь", "медвежий", "шорт", "продажа", "продаем", "продаж", "продать",
-    "выход", "вышел", "стоп", "стоп-лосс", "лосс", "потеря", "потери", "минус",
-    "негатив", "негативный", "пессимизм", "пессимистичный", "слабый", "ослабление",
-    "обвал", "кризис", "крах", "крах", "пузырь", "коррекция", "просадка", "просел",
-    "просел", "обвалился", "рухнул", "падает", "падать", "красный", "красные",
-    "sell", "short", "bear", "bearish", "loss", "losses", "down", "drop", "fall",
-    "falling", "crash", "dump", "crisis", "correction", "weak", "underperform",
-    "банкротство", "дефолт", "санкции", "штраф", "иск", "претензия", "спор",
-    "конфликт", "задержка", "отсрочка", "срыв", "невыполнение", "риск", "опасность",
-    "угроза", "нестабильность", "волатильность", "биржевой стресс", "ликвидация",
-    "маржин-колл", "форс-мажор", "паника", "истерия", "флуд", "fud",
-})
+# ─── Sentiment Lexicon (Russian + English finance/trading terms) ─────────────
+from sentiment_lexicon import SENTIMENT_NEGATIVE, SENTIMENT_POSITIVE
 
 # ─── Sector Mapping ──────────────────────────────────────────
 TICKER_TO_SECTOR = {
@@ -197,6 +170,26 @@ async def _ensure_db():
                     logger.info("[migrate] posts.sender_telegram_id column added")
             except Exception:
                 logger.warning("[migrate] posts.sender_telegram_id check failed")
+
+            # Migration: add AI sentiment columns to posts if missing
+            for col_name, col_type in (
+                ("sentiment_label", "VARCHAR(20)"),
+                ("sentiment_score", "FLOAT"),
+                ("sentiment_source", "VARCHAR(20)"),
+            ):
+                try:
+                    result = await conn.execute(text(f"""
+                        SELECT column_name FROM information_schema.columns
+                        WHERE table_name = 'posts' AND column_name = '{col_name}'
+                    """))
+                    if not result.fetchone():
+                        await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                        await conn.execute(text(
+                            f"ALTER TABLE posts ADD COLUMN {col_name} {col_type}"
+                        ))
+                        logger.info("[migrate] posts.%s column added", col_name)
+                except Exception:
+                    logger.warning("[migrate] posts.%s check failed", col_name)
 
         async with async_session() as session:
             # Reactivate all channels once on startup (recovers from auto-deactivation bug)
@@ -1337,6 +1330,16 @@ document.querySelectorAll('.period button').forEach(function(btn){
   });
 });
 
+// Mode selector (Lexicon / AI)
+document.querySelectorAll('#mode-toggle button').forEach(function(btn){
+  btn.addEventListener('click',function(){
+    document.querySelectorAll('#mode-toggle button').forEach(function(b){b.classList.remove('on')});
+    btn.classList.add('on');
+    mode=btn.dataset.mode;
+    loadAll();
+  });
+});
+
 function resetCharts(){
   Object.keys(charts).forEach(function(id){try{charts[id].dispose();}catch(e){}});
   charts={};
@@ -1564,11 +1567,17 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 <div class="wrap">
 <header>
 <h1>Sentiment & Intelligence</h1>
+<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
 <div class="period">
 <button class="on" data-d="1">1d</button>
 <button data-d="3">3d</button>
 <button data-d="7">7d</button>
 <button data-d="30">30d</button>
+</div>
+<div class="period" id="mode-toggle">
+<button class="on" data-mode="lexicon">Lexicon</button>
+<button data-mode="ai">AI</button>
+</div>
 </div>
 <a href="/" class="back">&larr; Back</a>
 </header>
@@ -1599,13 +1608,19 @@ h1{color:#00d4aa;font-size:28px;font-weight:700}
 <div class="chart-sub">MOEX: pre-market (before 10:00 MSK) / market hours / after-hours</div>
 <div class="chart" id="s-premarket"></div>
 </div>
+
+<div class="chart-box full" id="ai-posts-box" style="display:none">
+<div class="chart-title">AI Sentiment Posts</div>
+<div class="chart-sub">Newest negative posts (AI model rubert-tiny2)</div>
+<div id="s-ai-posts"></div>
+</div>
 </div>
 </div>
 
 <script>
 (function(){
 'use strict';
-var days=7;
+var days=7,mode='lexicon';
 var $=function(id){return document.getElementById(id)};
 
 function hideLoader(){var el=$('loader');if(el&&!el.classList.contains('done'))el.classList.add('done')}
@@ -1642,18 +1657,31 @@ document.querySelectorAll('.period button').forEach(function(btn){
 async function loadAll(){
   resetCharts();
   ['s-timeline','s-alerts','s-corr','s-premarket'].forEach(function(id){var el=$(id);if(el)el.innerHTML='';});
+  $('s-ai-posts').innerHTML='';
   try{
-    var st=await api('/sentiment/timeline?days='+days);
+    var st=await api(mode==='ai'?'/sentiment/ai-timeline?days='+days:'/sentiment/timeline?days='+days);
     var vel=await api('/velocity/alerts?days='+days);
     var corr=await api('/correlation/matrix?days='+days);
     var pre=await api('/premarket/intel?days='+days);
 
     var totalPos=st.positive.reduce(function(a,b){return a+b},0);
     var totalNeg=st.negative.reduce(function(a,b){return a+b},0);
-    $('top-stats').innerHTML=[
-      ['Positive',fmt(totalPos)],['Negative',fmt(totalNeg)],
-      ['Alerts',fmt(vel.alerts.length)],['Correlations',fmt(corr.tags.length)]
-    ].map(function(s){return'<div class="stat"><div class="stat-v">'+esc(s[1])+'</div><div class="stat-l">'+s[0]+'</div></div>'}).join('');
+
+    if(mode==='ai'){
+      var stats=await api('/sentiment/ai-stats');
+      var aiPosts=await api('/sentiment/ai-posts?sentiment=negative&days='+days+'&limit=10');
+      $('top-stats').innerHTML=[
+        ['Positive',fmt(totalPos)],['Negative',fmt(totalNeg)],
+        ['AI Cache',fmt(stats.cache_size)],[stats.model_loaded?'Model ON':'Model OFF','']
+      ].map(function(s){return'<div class="stat"><div class="stat-v">'+esc(s[1])+'</div><div class="stat-l">'+s[0]+'</div></div>'}).join('');
+      renderAiPosts(aiPosts.posts);
+    }else{
+      $('top-stats').innerHTML=[
+        ['Positive',fmt(totalPos)],['Negative',fmt(totalNeg)],
+        ['Alerts',fmt(vel.alerts.length)],['Correlations',fmt(corr.tags.length)]
+      ].map(function(s){return'<div class="stat"><div class="stat-v">'+esc(s[1])+'</div><div class="stat-l">'+s[0]+'</div></div>'}).join('');
+      $('ai-posts-box').style.display='none';
+    }
 
     renderSentiment(st);
     renderAlerts(vel.alerts);
@@ -1726,6 +1754,23 @@ function renderPremarket(data){
       {name:'After-hours',type:'bar',stack:'total',data:data.afterhours,itemStyle:{color:'#6c5ce7'}}
     ]
   },true);
+}
+
+function renderAiPosts(posts){
+  var box=$('ai-posts-box');
+  if(!posts||!posts.length){box.style.display='none';return;}
+  box.style.display='';
+  $('s-ai-posts').innerHTML=posts.map(function(p){
+    var chUrl=p.numeric_id?'https://t.me/c/'+p.numeric_id+'/'+p.telegram_message_id:p.channel_username?'https://t.me/'+esc(p.channel_username)+'/'+p.telegram_message_id:'#';
+    var labelClass=p.sentiment_label==='positive'?'#00d4aa':p.sentiment_label==='negative'?'#f87171':'#64748b';
+    return'<div style="padding:12px;background:#0a0a1a;border-radius:8px;margin-bottom:8px">'+
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;font-size:12px">'+
+        '<a href="'+chUrl+'" target="_blank" style="color:#00d4aa;font-weight:600">'+esc(p.channel_title||p.channel_username||'channel')+'</a>'+
+        '<span style="color:'+labelClass+';font-weight:700">'+esc(p.sentiment_label||'neutral')+' '+(p.sentiment_score?p.sentiment_score.toFixed(2):'')+'</span>'+
+      '</div>'+
+      '<div style="color:#e2e8f0;font-size:13px;white-space:pre-wrap;word-break:break-word;max-height:80px;overflow:hidden">'+esc(p.text||'(no text)')+'</div>'+
+    '</div>';
+  }).join('');
 }
 
 window.addEventListener('resize',function(){Object.values(charts).forEach(function(c){try{if(c)c.resize();}catch(e){}})});
@@ -4045,6 +4090,129 @@ async def sentiment_top_words(days: int = Query(7, ge=1, le=30), sentiment: str 
     except Exception as e:
         logger.error(f"/sentiment/top-words error: {e}"); traceback.print_exc()
         return json_response({"words": [], "error": str(e)}, 500)
+
+
+@app.get("/api/sentiment/ai", dependencies=[Depends(_get_auth_user)])
+async def sentiment_ai_analyze(text: str = Query(..., min_length=1)):
+    """Analyze a single text with AI model (rubert-tiny2) + lexicon fallback."""
+    try:
+        import sentiment_ai
+        result = await sentiment_ai.analyze(text)
+        return {"text": text[:200], "result": result}
+    except Exception as e:
+        logger.error("/sentiment/ai error: %s", e)
+        traceback.print_exc()
+        return json_response({"error": str(e)}, 500)
+
+
+@app.get("/api/sentiment/ai-timeline", dependencies=[Depends(_get_auth_user)])
+async def sentiment_ai_timeline(days: int = Query(7, ge=1, le=30), channel: Optional[str] = Query(None)):
+    """Daily AI sentiment aggregation from posts table (uses stored sentiment_label)."""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT
+                    ((p.published_at AT TIME ZONE 'UTC')::date)::text as d,
+                    COUNT(*) FILTER (WHERE p.sentiment_label = 'positive') as pos,
+                    COUNT(*) FILTER (WHERE p.sentiment_label = 'negative') as neg,
+                    COUNT(*) FILTER (WHERE p.sentiment_label = 'neutral' OR p.sentiment_label IS NULL) as neu,
+                    COUNT(*) as total
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                {ch_filter}
+                GROUP BY d
+                ORDER BY d
+            """), {"since": since, **ch_params})
+            rows = result.mappings().all()
+
+            daily = defaultdict(lambda: {"pos": 0, "neg": 0, "neu": 0, "total": 0})
+            for r in rows:
+                daily[r["d"]] = {
+                    "pos": r["pos"],
+                    "neg": r["neg"],
+                    "neu": r["neu"],
+                    "total": r["total"],
+                }
+
+            labels = []
+            pos_series = []
+            neg_series = []
+            neu_series = []
+            for i in range(days + 1):
+                dt = since + timedelta(days=i)
+                d_str = dt.strftime("%Y-%m-%d")
+                labels.append(dt.strftime("%m-%d"))
+                pos_series.append(daily[d_str]["pos"])
+                neg_series.append(daily[d_str]["neg"])
+                neu_series.append(daily[d_str]["neu"])
+
+            return {
+                "days": labels,
+                "positive": pos_series,
+                "negative": neg_series,
+                "neutral": neu_series,
+                "source": "ai",
+            }
+    except Exception as e:
+        logger.error("/sentiment/ai-timeline error: %s", e)
+        traceback.print_exc()
+        return json_response({"days": [], "positive": [], "negative": [], "neutral": [], "error": str(e)}, 500)
+
+
+@app.get("/api/sentiment/ai-posts", dependencies=[Depends(_get_auth_user)])
+async def sentiment_ai_posts(
+    sentiment: str = Query("negative"),
+    days: int = Query(1, ge=1, le=30),
+    limit: int = Query(20, ge=1, le=100),
+    channel: Optional[str] = Query(None),
+):
+    """Posts with a specific AI sentiment label, newest first."""
+    try:
+        async with async_session() as session:
+            since = await get_since(session, timedelta(days=days))
+            ch_filter, ch_params = _channel_where_clause(channel)
+            result = await session.execute(text(f"""
+                SELECT
+                    p.id,
+                    p.telegram_message_id,
+                    p.text,
+                    p.views_count as views,
+                    p.published_at as published,
+                    p.sentiment_label,
+                    p.sentiment_score,
+                    p.sentiment_source,
+                    c.title as channel_title,
+                    c.username as channel_username,
+                    c.numeric_id as numeric_id
+                FROM posts p
+                JOIN channels c ON p.channel_id = c.id
+                WHERE p.published_at > :since
+                  AND p.sentiment_label = :sentiment
+                {ch_filter}
+                ORDER BY p.published_at DESC
+                LIMIT :limit
+            """), {"since": since, "sentiment": sentiment, "limit": limit, **ch_params})
+            rows = result.mappings().all()
+            return {"posts": [dict(r) for r in rows], "sentiment": sentiment}
+    except Exception as e:
+        logger.error("/sentiment/ai-posts error: %s", e)
+        traceback.print_exc()
+        return json_response({"posts": [], "error": str(e)}, 500)
+
+
+@app.get("/api/sentiment/ai-stats", dependencies=[Depends(_get_auth_user)])
+async def sentiment_ai_stats():
+    """Status of the AI sentiment model and cache."""
+    try:
+        import sentiment_ai
+        return sentiment_ai.get_stats()
+    except Exception as e:
+        logger.error("/sentiment/ai-stats error: %s", e)
+        traceback.print_exc()
+        return json_response({"error": str(e)}, 500)
 
 
 @app.get("/api/velocity/alerts", dependencies=[Depends(_get_auth_user)])

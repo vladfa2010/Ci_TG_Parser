@@ -15,15 +15,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONFAULTHANDLER=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/app/.cache/huggingface
 
-# Install system dependencies required for compiling Python packages
+# Install system dependencies required for compiling Python packages and torch CPU
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Install CPU torch first (smaller image than default CUDA wheel)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 # Install Python dependencies separately for layer caching
 COPY requirements.txt .
@@ -35,8 +40,8 @@ ARG CACHE_BUST=78
 # Copy application source code
 COPY . .
 
-# Create sessions directory with proper permissions
-RUN mkdir -p /app/sessions && chmod +x entrypoint.sh
+# Create sessions and HuggingFace cache directories with proper permissions
+RUN mkdir -p /app/sessions /app/.cache/huggingface && chmod +x entrypoint.sh
 
 # Expose port (used in web mode)
 EXPOSE 8000
