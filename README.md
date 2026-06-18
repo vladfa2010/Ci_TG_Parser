@@ -167,6 +167,22 @@ else:
 
 Каналы добавляются **только через веб** (`/channels` → «+ Добавить канал»). Если в БД появились лишние активные каналы (например, из-за старой версии), отключите их переключателем в таблице или удалите.
 
+### Очистка лишних авто-созданных каналов
+
+Если `sync_dialogs()` ранее создал лишние активные каналы (например, все broadcast-каналы из диалогов), деактивируйте их:
+
+**Вариант A — через Render PostgreSQL Shell:**
+1. Render Dashboard → `citg-db` → вкладка **Shell**
+2. Выполните SQL из файла [`scripts/deactivate_auto_created_channels.sql`](scripts/deactivate_auto_created_channels.sql)
+
+**Вариант B — локально (если есть доступ к DATABASE_URL):**
+```bash
+export DATABASE_URL="postgresql://citg_db_user:..."
+python3 scripts/deactivate_auto_created_channels.py
+```
+
+По умолчанию деактивируются каналы, созданные **2026-06-18 и позже**.
+
 ---
 
 ## Безопасность парсинга
