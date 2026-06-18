@@ -28,7 +28,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select, text, insert, BigInteger, Integer, DateTime, Text, String, Boolean, ForeignKey, Index, PrimaryKeyConstraint
+from sqlalchemy import select, text, BigInteger, Integer, DateTime, Text, String, Boolean, ForeignKey, Index, PrimaryKeyConstraint
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -980,7 +981,7 @@ class ChannelParser:
         channel_id: int,
         raw_posts: list[dict[str, Any]],
     ) -> int:
-        """Сохраняет список постов в БД пачками с ON CONFLICT DO NOTHING."""
+        """Сохраняет список постов в БД пачками, игнорируя дубли."""
         if not raw_posts:
             return 0
 
@@ -993,24 +994,28 @@ class ChannelParser:
         async with self.db_factory() as session:
             for i in range(0, len(raw_posts), self.batch_size):
                 batch = raw_posts[i:i + self.batch_size]
-                values = [
-                    {"channel_id": channel_id, **item}
+                db_posts = [
+                    DbPost(channel_id=channel_id, **item)
                     for item in batch
                 ]
-                stmt = (
-                    insert(DbPost)
-                    .values(values)
-                    .on_conflict_do_nothing(
-                        index_elements=["channel_id", "telegram_message_id"]
-                    )
-                )
-                res = await session.execute(stmt)
-                await session.commit()
-                batch_new = res.rowcount or 0
-                new_posts += batch_new
+                session.add_all(db_posts)
+                try:
+                    await session.commit()
+                    new_posts += len(batch)
+                except IntegrityError:
+                    await session.rollback()
+                    # Fallback: коммитим по одному, игнорируя дубли
+                    for db_post in db_posts:
+                        session.add(db_post)
+                        try:
+                            await session.commit()
+                            new_posts += 1
+                        except IntegrityError:
+                            await session.rollback()
+
                 logger.debug(
                     "[parse] Канал %d: коммит %d/%d (новых %d)",
-                    channel_id, i + len(batch), len(raw_posts), batch_new,
+                    channel_id, i + len(batch), len(raw_posts), new_posts,
                 )
 
         return new_posts
